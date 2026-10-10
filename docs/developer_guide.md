@@ -62,6 +62,26 @@ cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Rele
 cmake --build build/cmake/ngx_shim/release
 ```
 
+## FSR frame generation
+
+BetterCaustica can generate frames with AMD FidelityFX as well as with DLSS. That
+path needs its own native shim, and Gradle bundles it only when `FFX_SDK` points
+at a FidelityFX SDK checkout:
+
+```powershell
+$env:FFX_SDK = "C:\path\to\ffx-vk-spike"
+.\native\_dev_build_ffx.bat shim
+.\gradlew.bat build
+```
+
+`_dev_build_ffx.bat` builds `build/native/ffx_shim/release/ffxshim.dll` with
+CMake and MSVC, the same way step 3 builds the NGX shim. It defaults `FFX_SDK` to
+`third_party\ffx-vk-spike` for its own compile, but the Gradle bundling step reads
+the environment variable, so export it or `bundleFfxNatives` skips silently.
+`bundleFfxNatives` then copies that shim plus `amd_fidelityfx_vk.dll` from the SDK
+into the jar. A jar built without it still works and offers only the DLSS
+frame-generation backends.
+
 ## Native Bundling
 
 Gradle bundles NGX natives for the current host platform by default:
