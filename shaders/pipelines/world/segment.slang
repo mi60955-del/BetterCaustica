@@ -58,6 +58,12 @@ public struct PackedPathSegment {
 
 public static const uint PATH_NO_NEXT = 0xffffffffu;
 
+// Set by the primary pass on a record whose pre-interface fog radiance it has already written into
+// outImage: the interface split resumes from the glass, so that stretch's in-scatter cannot ride
+// either Fresnel branch. The indirect pass accumulates on top of the stored value instead of
+// overwriting it. bit11 is free — bounce occupies 0..3, showCelestial 8, the water marks 9..10.
+public static const uint PATH_PREFIX_IN_IMAGE = 1u << 11u;
+
 public float2 octEncode(float3 direction) {
     float3 n = direction / max(abs(direction.x) + abs(direction.y) + abs(direction.z), 1.0e-20);
     float2 signNotZero = float2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
@@ -134,6 +140,13 @@ public PathSegment unpackPathSegment(PackedPathSegment p) {
     outer.ior = iors.y;
     outer.extinction = unpackRgb9e5(p.outerExtinction);
     outer.water = (p.pathFlags & (1u << 10u)) != 0u;
+    // The packed record carries ior and extinction only; scattering is derived, not packed: it is a
+    // pure function of the extinction and the per-frame turbidity global (see medium.waterScattering),
+    // so a resumed medium re-derives it and the 48-byte record stays untouched.
+    current.scattering = current.water ? waterScattering(current.extinction) : float3(0.0, 0.0, 0.0);
+    current.phaseG = current.water ? worldPush.water1.y : 0.0;
+    outer.scattering = outer.water ? waterScattering(outer.extinction) : float3(0.0, 0.0, 0.0);
+    outer.phaseG = outer.water ? worldPush.water1.y : 0.0;
     MediumStack medium;
     medium.current = current;
     medium.outer = outer;

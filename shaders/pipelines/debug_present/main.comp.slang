@@ -96,6 +96,23 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     } else if (pc.debugView == 9u) {
         float weight = meteringWeight(uv, gDepth[guidePix], gAlbedo[guidePix].a > 0.5);
         dbg = float3(weight, weight, weight);
+    } else if (pc.debugView == 10u) {
+        // r lane: fog transmittance along the camera ray (1 = clear air, 0 = fully opaque fog).
+        float t = volumeDebug[guidePix].r;
+        dbg = float3(t, t, t);
+    } else if (pc.debugView == 11u) {
+        // g lane: the fog in-scatter's luminance, Reinhard-scaled so daylight values stay readable.
+        float insc = max(volumeDebug[guidePix].g, 0.0);
+        float shown = insc / (1.0 + insc);
+        dbg = float3(shown, shown, shown);
+    } else if (pc.debugView == 12u) {
+        // b lane: cloud density along the camera ray (inert zero until the cloud layers exist).
+        float density = max(volumeDebug[guidePix].b, 0.0);
+        dbg = float3(density, density, density);
+    } else if (pc.debugView == 13u) {
+        // a lane: cloud-shadow transmittance at the first cloud crossing (1 = unshadowed).
+        float shadow = saturate(volumeDebug[guidePix].a);
+        dbg = float3(shadow, shadow, shadow);
     } else if (pc.debugView == 1u) {
         dbg = normalRough.xyz * 0.5 + 0.5;
     } else if (pc.debugView == 2u) {

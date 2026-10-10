@@ -32,15 +32,21 @@ abstract class GenerateRtBindings extends DefaultTask {
                     G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth", G_MOTION: "gMotion",
                     G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
                     CELESTIALS: "celestialsAtlas", SKY_VIEW: "skyViewLut", TRANSMITTANCE: "transmittanceLut",
+                    SKY_IRRADIANCE_LUT: "skyIrradianceLut", END_SKY_TEX: "endSkyTex",
+                    RESERVOIR_PREV: "reservoirPrev", RESERVOIR_CUR: "reservoirCur",
+                    RESERVOIR_SAMPLE_PREV: "reservoirSamplePrev",
+                    RESERVOIR_SAMPLE_CUR: "reservoirSampleCur", VOLUME_DEBUG: "volumeDebug",
                     ENTITY_ALBEDO: "entityAlbedoTex", MATERIAL_SURFACE0: "materialSurface0Tex",
                     MATERIAL_NORMAL_AO: "materialNormalAoTex", MATERIAL_SURFACE1: "materialSurface1Tex"]],
             [prefix: "DISPLAY", source: "pipelines/display/main.comp.slang", resources: [
                     OUTPUT: "outputImage", RT_IMAGE: "rtImage", EXPOSURE: "exposureImage", HDR_OUTPUT: "hdrImage",
-                    SDR_TONE_LUT: "toneLut", HDR_TONE_LUT: "hdrToneLut", LOOK_LUT: "lookLut", BLOOM: "bloomImage"]],
+                    SDR_TONE_LUT: "toneLut", HDR_TONE_LUT: "hdrToneLut", LOOK_LUT: "lookLut", BLOOM: "bloomImage",
+                    EXPOSURE_STATE: "exposureState"]],
             [prefix: "DEBUG_PRESENT", source: "pipelines/debug_present/main.comp.slang", resources: [
                     OUTPUT: "outputImage", G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth",
                     G_MOTION: "gMotion", G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
-                    SCENE: "sceneImage", EXPOSURE: "exposureImage", EXPOSURE_STATE: "exposureState"]],
+                    SCENE: "sceneImage", EXPOSURE: "exposureImage", EXPOSURE_STATE: "exposureState",
+                    VOLUME_DEBUG: "volumeDebug"]],
             [prefix: "EXPOSURE_HIST", source: "pipelines/exposure_hist/main.comp.slang", resources: [
                     COLOR: "colorImage", BINS: "histBins", DEPTH: "depthImage", ALBEDO: "albedoImage"]],
             [prefix: "EXPOSURE_RESOLVE", source: "pipelines/exposure_resolve/main.comp.slang", resources: [
@@ -49,8 +55,9 @@ abstract class GenerateRtBindings extends DefaultTask {
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
             [prefix: "SKY_LUT", source: "pipelines/sky_lut/view.comp.slang", resources: [
                     TRANSMITTANCE_IMAGE: "transmittanceImage", MULTISCATTER_IMAGE: "multiScatterImage",
-                    SKY_VIEW_IMAGE: "skyViewImage", TRANSMITTANCE_SAMPLER: "transmittanceLut",
-                    MULTISCATTER_SAMPLER: "multiScatterLut"]],
+                    SKY_VIEW_IMAGE: "skyViewImage", SKY_IRRADIANCE_IMAGE: "skyIrradianceImage",
+                    TRANSMITTANCE_SAMPLER: "transmittanceLut",
+                    MULTISCATTER_SAMPLER: "multiScatterLut", SKY_VIEW_SAMPLER: "skyViewLut"]],
             [prefix: "PRESENT", source: "pipelines/hdr_composite/main.comp.slang", resources: [
                     OUTPUT: "outputImage", SOURCE: "sourceImage"]],
             [prefix: "OVERLAY_IMAGE", source: "pipelines/overlay_composite/glow.frag.slang", resources: [VALUE: "sourceImage"]],
@@ -120,7 +127,13 @@ abstract class GenerateRtBindings extends DefaultTask {
                 constants.WORLD_SET = ordinary.values().first().set
                 ordinary.each { suffix, location -> constants["WORLD_${suffix}"] = location.index }
                 def guides = ordinary.findAll { suffix, ignored -> (suffix as String).startsWith("G_") }
-                def storageImages = guides + ordinary.findAll { suffix, ignored -> suffix == "OUTPUT" }
+                // The sky irradiance basis and the temporal reservoirs are storage images that the name
+                // convention cannot classify — they are not DLSS-RR guides, and the irradiance basis is
+                // only ever loaded — so the descriptor pool has to count them with the other images.
+                def storageImages = guides + ordinary.findAll { suffix, ignored ->
+                    suffix in ["OUTPUT", "SKY_IRRADIANCE_LUT", "RESERVOIR_PREV", "RESERVOIR_CUR",
+                               "RESERVOIR_SAMPLE_PREV", "RESERVOIR_SAMPLE_CUR", "VOLUME_DEBUG"]
+                }
                 def samplers = ordinary.findAll { suffix, ignored -> suffix != "TLAS" && !storageImages.containsKey(suffix) }
                 constants.WORLD_GUIDE_COUNT = guides.size()
                 constants.WORLD_SET_BINDING_COUNT = ordinary.values()*.index.max() + 1

@@ -20,6 +20,7 @@ import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Int4;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BiomeColors;
+import net.minecraft.client.renderer.EndFlashState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.resources.model.ModelBakery;
@@ -38,12 +39,14 @@ import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkBufferImageCopy;
+import org.lwjgl.vulkan.VkClearColorValue;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDependencyInfo;
 import org.lwjgl.vulkan.VkImageBlit;
 import org.lwjgl.vulkan.VkImageCopy;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageMemoryBarrier2;
+import org.lwjgl.vulkan.VkImageSubresourceRange;
 import org.lwjgl.vulkan.VkMemoryBarrier;
 import org.lwjgl.vulkan.VkMemoryBarrier2;
 import org.lwjgl.vulkan.VkSamplerCreateInfo;
@@ -63,6 +66,8 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtSkyLut;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
+import dev.comfyfluffy.caustica.rt.pipeline.RtFgInterpPipeline;
+import dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg;
 import dev.comfyfluffy.caustica.rt.overlay.RtWorldOverlay;
 import dev.comfyfluffy.caustica.rt.pipeline.RtHdrCompositePipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSdrPresentPipeline;
@@ -122,6 +127,20 @@ public final class RtComposite {
     }
 
     private static final int WATER_ANCHOR_MASK = 4095;
+    // worldPush.flags volumetric bits, mirroring WORLD_FLAG_FOG / WORLD_FLAG_VOLUME_SHADOW /
+    // WORLD_FLAG_VOLUME_DEBUG in world_common.slang (VolumeFogTest checks the two sides agree). The
+    // cloud, spray and march-tier bits have no Java setter until their features exist.
+    private static final int WORLD_FLAG_FOG = 1 << 7;
+    private static final int WORLD_FLAG_CLOUD = 1 << 8;
+    private static final int WORLD_FLAG_SPRAY = 1 << 9;
+    private static final int WORLD_FLAG_VOLUME_SHADOW = 1 << 10;
+    private static final int WORLD_FLAG_VOLUME_MARCH = 1 << 11;
+    private static final int WORLD_FLAG_VOLUME_DEBUG = 1 << 12;
+    /** The volumetric cloud slab (Phase 5) walks the layer instead of crossing it once. */
+    private static final int WORLD_FLAG_CLOUD_VOLUMETRIC = 1 << 13;
+    // Debug views the primary raygen fills the volume debug image for; one channel per view.
+    private static final int DEBUG_VIEW_VOLUME_FIRST = 10;
+    private static final int DEBUG_VIEW_VOLUME_LAST = 13;
     // The versioned look package owns every photometric anchor and the sky geometry. Its sun illuminance is the
     // photometric solar constant at the top of the atmosphere; the shader's transmittance LUT brings that
     // to ~117,000 lux under a zenith sun and reddens/dims it through sunset, and because world.rmiss tints
@@ -132,8 +151,21 @@ public final class RtComposite {
     // 31,800 cd/m² white / 5,730 cd/m² 18%-grey noon surface. It is therefore independent of the sky
     // package's angular radii, which only jitter the shadow ray and so only set penumbra softness.
     private static final RtLookPackage LOOK = RtLookPackage.current();
+    /**
+     * The night ramp for {@link #nightFactor()}: a quarter of a day separates midnight from either horizon
+     * crossing, and the lift reaches full once {@code NIGHT_RAMP} of that has been crossed. 0.08 puts full
+     * night from about 1900 ticks after sunset to the same before sunrise, and leaves both ramps roughly
+     * 96 seconds long, so a sunrise still looks like one instead of a light switch.
+     */
+    private static final float NIGHT_RAMP = 0.08f;
+    private static final long DAY_TICKS = 24000L;
     private static final Identifier SUN_ID = Identifier.withDefaultNamespace("sun");
     private static final Identifier[] MOON_IDS = createMoonIds();
+    private static final Identifier END_FLASH_ID = Identifier.withDefaultNamespace("end_flash");
+    // Vanilla's standalone end-sky texture (SkyRenderer.END_SKY_LOCATION), loaded by the TextureManager
+    // when the client's SkyRenderer is constructed, i.e. always before the first traced frame.
+    private static final Identifier END_SKY_LOCATION =
+            Identifier.withDefaultNamespace("textures/environment/end_sky.png");
     // Sign of the sub-pixel jitter as reported to DLSS-RR + applied to the primary ray, mirroring the
     // validated DLSS-SR convention (Vulkan flipped clip space wants Y negated).
     private static float jitterSignX() {
@@ -181,6 +213,10 @@ public final class RtComposite {
     private RtToneLut sdrToneLut;
     private RtToneLut hdrToneLut;
     private RtToneLut lookLut;
+    // Absolute classpath path of the LMT currently uploaded into lookLut (null until first load), so
+    // the swap check above is a string compare on the steady-state path and a matching name is never
+    // re-read from the Resource.
+    private String loadedLookLutName;
     private int loadedHdrLutNits = -1;
     private RtImage output;
     // Packed primary -> indirect continuations. Pass A is fixed at one sample and owns two records per
@@ -190,10 +226,17 @@ public final class RtComposite {
     // Bloom pyramid, finest first: level 0 is half display resolution and each level halves again. The
     // display mapper reads level 0, which the upsample sweep leaves holding the sum of every band.
     private RtImage[] bloomLevels = new RtImage[0];
-    // Parallel PQ-encoded ([0,1], ST.2084) HDR display image. Written alongside displayImage when HDR is
-    // enabled. When the PQ swapchain is active, the combined UI overlay is composited over this image, then
-    // this image is blitted straight to the swapchain.
+    // Parallel PQ-encoded ([0,1], ST.2084) HDR display image. Written alongside displayImage only while
+    // HDR output is enabled (allocated on demand for exactly that state — see ensureOutput). When the PQ
+    // swapchain is active, the combined UI overlay is composited over this image, then this image is
+    // blitted straight to the swapchain.
     private RtImage hdrDisplayImage;
+    /**
+     * 1x1 stand-in bound into the display pipeline's HDR slot while {@link #hdrDisplayImage} does not
+     * exist: the shader binding is format-qualified rgba16f, so the descriptor always needs a legal view
+     * even though the dispatch's hdrEnabled flag keeps the write gated off.
+     */
+    private RtImage hdrBindingPlaceholder;
     // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
     // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
     private boolean hdrWrittenThisFrame;
@@ -207,7 +250,7 @@ public final class RtComposite {
     // a format conversion — DLSS-FG requires a display-ready EOTF-encoded [0,1] signal (its programming
     // guide explicitly disallows scRGB), and PQ is exactly that.
     private RtImage fgHdrHudlessImage;
-    // Step C.2: composites the combined UI overlay over hdrDisplayImage at paper white, just before present.
+    // Composites the combined UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
     private long hdrUiSampler;
 
@@ -236,14 +279,31 @@ public final class RtComposite {
     private final Matrix4f fgClipToPrev = new Matrix4f();
     private final Matrix4f fgPrevToClip = new Matrix4f();
     private final Matrix4f fgMatTmp = new Matrix4f();
+    // Self-made interpolation instead of a vendor backend: the generated frame plus the previous displayed
+    // frame it blends against. The history is written only after the interpolation has read it.
+    private RtFgInterpPipeline fgInterpPipeline;
+    /** Packs the swapchain size of the last logged missing-HUD-less warning, so it warns once per size. */
+    private int fgHudlessMismatch = -1;
+    private RtImage fgSelfInterp;
+    private RtImage fgSelfHistory;
+    private boolean fgSelfHistoryWritten;
     // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
     // specular albedo, and reflection motion.
     private RtImage gNormal;
     private RtImage gAlbedo;
     private RtImage gDepth;
     private RtImage gMotion;
+    /** The two bounce-0 reservoir images, and which index this frame writes. */
+    private RtImage[] reservoirImages = new RtImage[0];
+    /** The companion (s,t) rectangle coordinates, one image per side, advanced on the same index. */
+    private RtImage[] reservoirSampleImages = new RtImage[0];
+    private int reservoirWrite;
     private RtImage gSpecAlbedo;
     private RtImage gSpecMotion;
+    // Per-pixel volumetric diagnostics (debug views 10..13), render-res like the guides. Written by the
+    // primary raygen only on frames whose WorldPush carries WORLD_FLAG_VOLUME_DEBUG; the debug present
+    // pass shows one channel per view.
+    private RtImage volumeDebug;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -258,6 +318,9 @@ public final class RtComposite {
     // toggled) at a fixed window size is noticed even though displayW/displayH didn't change.
     private boolean renderSizeRrEnabled;
     private int renderSizeRrQuality = Integer.MIN_VALUE;
+    // Same idea for the HDR output toggle: it decides whether hdrDisplayImage exists at all, so a runtime
+    // switch must trigger the ensureOutput rebuild that allocates or frees it.
+    private boolean renderSizeHdrEnabled;
 
     // Motion-vector reprojection state: the previous frame's camera-relative view-projection and
     // camera position, read into the push constant each frame then advanced at frame end.
@@ -275,7 +338,37 @@ public final class RtComposite {
     private boolean mvHasPrev;
     private float previousWaterWaveTime;
     private boolean waterWaveTimeValid;
+    // The rain level pushed last frame, so WorldPush.weather can carry both ends of the transition
+    // instead of forcing the shaders to diff against a history they do not have.
+    private float previousRainLevel;
+    // Accumulated wave clock (s) and the timestamp it was last advanced from. Accumulating is what lets
+    // the speed control change the rate without jumping the phase to a different wall-clock multiple.
+    private float waterWaveClock;
+    private long waveClockNanos;
+    // Per-axis wind-drift accumulators (blocks, double precision). The fog pair wraps each axis in
+    // whole 4096-block periods — the fog noise lattice's exact period — so a wrap is invisible by
+    // construction (the old shader-side speed x clock product snapped the whole field at the wave
+    // clock's hourly wrap). The cloud pair never wraps: the streak lattice has no period to wrap
+    // into, and the doubles only shed sub-block precision past millions of blocks of drift.
+    private double fogDriftX;
+    private double fogDriftZ;
+    private double cloudDriftX;
+    private double cloudDriftZ;
+    /**
+     * The cloud field's evolution phase, in noise-lattice units. Advanced by the same clamped step as
+     * the drift accumulators and never wrapped: the lattices it offsets are not periodic, so a wrap
+     * would jump every cloud in the sky, and at this rate fp32 keeps sub-cell precision for days of
+     * continuous play - long past any session that would notice the crawl freezing.
+     */
+    private double cloudEvolve;
+    /**
+     * Evolution rate in lattice units per second; see {@link #cloudEvolve}. One unit is one warp-lattice
+     * cell, i.e. a full reorganisation of the streak shapes, so 0.03 puts one of those every ~33 s -
+     * clouds that visibly live rather than a fixed decal sliding along.
+     */
+    private static final double CLOUD_EVOLVE_SPEED = 0.030d;
     private long atlasSampler;
+    private long endSkySampler;
     private boolean failed;
     private boolean loggedActive;
 
@@ -296,6 +389,10 @@ public final class RtComposite {
     private float moonV0;
     private float moonU1 = 1f;
     private float moonV1 = 1f;
+    private float endFlashU0;
+    private float endFlashV0;
+    private float endFlashU1 = 1f;
+    private float endFlashV1 = 1f;
 
     // Per-frame TLAS resources, rebuilt in place from a small ring of persistent slots (see
     // RtAccel.TlasRing — replaces the old create-and-defer-destroy-per-frame churn whose VMA slow path
@@ -489,6 +586,13 @@ public final class RtComposite {
             failed = false;
             CausticaMod.LOGGER.info("RT failure latch cleared by render-state invalidation; retrying RT");
         }
+        // RR and the frame-generation backends latch independently of the composite; hand them the
+        // same recovery path. Each reset is a no-op while its backend is healthy.
+        RtFsrFg.INSTANCE.resetFailure();
+        RtDlssFg.INSTANCE.resetFailure();
+        RtDlssRr.INSTANCE.resetFailure();
+        RtWorldOverlay.INSTANCE.resetFailureLatch();
+        RtUiOverlay.resetFailureLatch();
     }
 
     /** Capture the frame's camera for the next composite. Called from GameRendererMixin. */
@@ -513,6 +617,34 @@ public final class RtComposite {
      */
     public Matrix4fc currentViewProjection() {
         return mvCurProjView;
+    }
+
+    /**
+     * This frame's world-to-view rotation and projection, and the camera position they were built
+     * for. {@link dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg} needs all three because FidelityFX
+     * asks for a camera basis and frustum scalars rather than matrices, and re-deriving them from
+     * Minecraft's settings would risk disagreeing with what the tracer actually used.
+     *
+     * <p>Do not mutate what these return; they are the live fields.
+     */
+    public Matrix4fc frameViewRotation() {
+        return frameCaptured ? frameViewRotation : null;
+    }
+
+    public Matrix4fc frameProjection() {
+        return frameCaptured ? frameProjection : null;
+    }
+
+    public double cameraX() {
+        return camX;
+    }
+
+    public double cameraY() {
+        return camY;
+    }
+
+    public double cameraZ() {
+        return camZ;
     }
 
     /**
@@ -626,10 +758,29 @@ public final class RtComposite {
                 loadedHdrLutNits = wantedHdrNits;
             }
             // The scene-referred LMT is part of the immutable versioned look package and shared by
-            // both SDR and HDR output transforms. It cannot be switched independently from the
-            // package's exposure and photometric anchors.
+            // both SDR and HDR output transforms. Unlike the HDR LUT above it CAN be swapped
+            // independently at runtime — tonemap.look-override names another .bin in the same
+            // directory — because an LMT is a scene-referred curve: it never changes how much of the
+            // scene the display transform sees, only its shape, so the exposure history stays valid.
+            // Re-checked every frame rather than only when null, so iterating on a look does not need
+            // a rebuild. Reading the Resource is skipped when the name already matches.
+            String wantedLmtName = lookQualifiedLmtName();
+            if (!wantedLmtName.equals(loadedLookLutName)) {
+                RtToneLut newLookLut = tryLoadLookLut(ctx, wantedLmtName);
+                if (newLookLut != null) {
+                    if (lookLut != null) {
+                        ctx.waitIdle(); // no in-flight frame may sample the old LUT
+                        lookLut.destroy();
+                    }
+                    lookLut = newLookLut;
+                    loadedLookLutName = wantedLmtName;
+                }
+            }
             if (lookLut == null) {
+                // First load failed and there was nothing to fall back to (should not happen: the
+                // packaged LMT is validated by RtLookPackage's static initializer).
                 lookLut = RtToneLut.loadResource(ctx, LOOK.lmtResource());
+                loadedLookLutName = LOOK.lmtResource();
             }
             // A resource reload re-stitches the block atlas. We've already torn down the world pipeline
             // (onResourceReloadStart) so nothing references the old atlas, but MC's deferred free keeps the
@@ -642,19 +793,26 @@ public final class RtComposite {
                     return false;
                 }
             }
+            // RR resolved its true optimal render size after the first feature creation (the DLSSD
+            // library registers the optimal-settings callback only once loaded) — invalidate the
+            // cached render size so ensureOutput re-queries and rebuilds at it.
+            if (RtDlssRr.INSTANCE.takeRefreshRequest()) {
+                renderSizeRrQuality = Integer.MIN_VALUE;
+            }
             ensureOutput(ctx, width, height);
             // ensureOutput's rebuild path (only taken on resize/RR-setting change) already rebinds
             // displayPipeline's descriptor set; this covers the case ensureOutput early-returned but
             // hdrToneLut/lookLut may have been hot-swapped just above; setImages is a no-op if the bound
             // views already match, so this is cheap on every other frame.
             RtToneLut boundLookLut = lookLut;
-            displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view,
+            displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayBindingView(ctx),
                     sdrToneLut.view(), sdrToneLut.sampler(), hdrToneLut.view(), hdrToneLut.sampler(),
-                    boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler());
+                    boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler(),
+                    exposure.stateBuffer());
             bloomPipeline.setImages(rrOutput.view, exposure.image().view, bloomLevels);
             debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
                     gMotion.view, gSpecAlbedo.view, gSpecMotion.view, rrOutput.view, exposure.image().view,
-                    exposure.stateBuffer());
+                    volumeDebug.view, exposure.stateBuffer());
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
@@ -674,6 +832,17 @@ public final class RtComposite {
             }
             return true;
         } catch (Throwable t) {
+            // Close a graphics-use claimed by a half-run recordFrame before anything else: an open
+            // token would make the next beginFrame() throw, turning one bad frame into a crash loop.
+            if (pendingGraphicsUse != null) {
+                try {
+                    finishGraphicsUse();
+                } catch (Throwable cleanup) {
+                    pendingGraphicsUse = null;
+                    CausticaMod.LOGGER.warn("RT graphics use could not be closed after a composite failure",
+                            cleanup);
+                }
+            }
             ctx.gpuExecutor().throwIfFailed();
             failed = true;
             CausticaMod.LOGGER.error("RT composite failed; reverting to vanilla path", t);
@@ -777,20 +946,24 @@ public final class RtComposite {
         RtEntityTextures.INSTANCE.reset(bindlessTextureCapacity);
         worldPipeline.setEntityAlbedoTexture(0, atlasView, sampler);
         RtBlockMaterials.INSTANCE.bindPages(worldPipeline, sampler);
-        RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, materialOverrides);
+        RtMaterialRegistry.INSTANCE.rebuild(ctx, RtBlockMaterials.INSTANCE, emissionSemantics, materialOverrides);
         materialBindingsReady = true;
         // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
         // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
         // directions), so the block-atlas fallback is never read if the celestials atlas isn't ready.
         long celView = celestialsAtlasView();
-        if (worldPipeline.hasSkyAtlas()) {
-            worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
-            // Atmosphere LUTs live for the device's lifetime, but the world pipeline's descriptor sets do
-            // not (a resource reload rebuilds it), so rebind them alongside the atlas.
-            if (skyLut != null) {
-                worldPipeline.setSkyLuts(skyLut.skyViewView(), skyLut.transmittanceView(),
-                        skyLut.sampler());
-            }
+        worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
+        // The end sky's own texture: linear + wrapping (the cube repeats it 16x16 per face), so it cannot
+        // share the nearest-filtered atlas sampler. Falls back to the block atlas the same way the
+        // celestials binding does — the descriptor must always be written — and is only ever sampled by
+        // the miss shader's end-sky branch, which requires the End's own skybox.
+        long endSkyView = endSkyAtlasView();
+        worldPipeline.setEndSkyTexture(endSkyView != 0L ? endSkyView : atlasView, endSkySampler(ctx));
+        // Atmosphere LUTs live for the device's lifetime, but the world pipeline's descriptor sets do
+        // not (a resource reload rebuilds it), so rebind them alongside the atlas.
+        if (skyLut != null) {
+            worldPipeline.setSkyLuts(skyLut.skyViewView(), skyLut.transmittanceView(),
+                    skyLut.skyIrradianceView(), skyLut.sampler());
         }
         setCelestialUvAtlas(celView);
         // Atlas UVs and material IDs are one resource epoch. Drop old terrain as a unit rather than
@@ -819,6 +992,17 @@ public final class RtComposite {
         }
     }
 
+    /** Vulkan image-view of vanilla's end_sky.png, or 0 if it is not registered yet. */
+    private static long endSkyAtlasView() {
+        try {
+            GpuTextureView view = Minecraft.getInstance().getTextureManager()
+                    .getTexture(END_SKY_LOCATION).getTextureView();
+            return vkImageView(view);
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
     /**
      * Hooked at the HEAD of {@link net.minecraft.client.Minecraft#reloadResourcePacks()} (mixin). A
      * resource reload re-stitches the block atlas (and reloads entity textures): MC frees the old GPU
@@ -837,6 +1021,7 @@ public final class RtComposite {
         RtContext ctx = RtContext.currentOrNull();
         if (ctx != null) {
             ctx.waitIdle();
+            RtWorldOverlay.INSTANCE.onResourceReload();
             if (worldPipeline != null) {
                 worldPipeline.destroy();
                 worldPipeline = null;
@@ -857,9 +1042,59 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(3, gMotion.view);
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecMotion.view);
+        bindReservoirImages();
+        if (volumeDebug != null) {
+            worldPipeline.setVolumeDebugImage(volumeDebug.view);
+        }
+    }
+
+    /** Rebind the reservoir pair so the trace reads the image last frame wrote and writes the other. */
+    private void bindReservoirImages() {
+        if (worldPipeline == null || reservoirImages.length != 2 || reservoirSampleImages.length != 2) {
+            return;
+        }
+        worldPipeline.setReservoirImages(reservoirImages[reservoirWrite ^ 1].view,
+                reservoirImages[reservoirWrite].view,
+                reservoirSampleImages[reservoirWrite ^ 1].view,
+                reservoirSampleImages[reservoirWrite].view);
+    }
+
+    /** Zero the images this frame's trace is about to write, so uncovered texels read as empty history. */
+    private void clearReservoir(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack) {
+        if (reservoirImages.length != 2 || reservoirSampleImages.length != 2) {
+            return;
+        }
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "reservoir clear")) {
+            VkClearColorValue color = VkClearColorValue.calloc(stack);
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
+            range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VK10.vkCmdClearColorImage(cmd, reservoirImages[reservoirWrite].image,
+                    VK10.VK_IMAGE_LAYOUT_GENERAL, color, range);
+            VK10.vkCmdClearColorImage(cmd, reservoirSampleImages[reservoirWrite].image,
+                    VK10.VK_IMAGE_LAYOUT_GENERAL, color, range);
+            // The indirect trace writes these same images from the raygen. Submission order alone does not
+            // order a transfer write against a shader write, so without this barrier the clear can land
+            // after the trace and erase (or tear) the reservoir this frame just built.
+            VkMemoryBarrier.Buffer cleared = VkMemoryBarrier.calloc(1, stack);
+            cleared.get(0).sType$Default()
+                    .srcAccessMask(VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                    .dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT);
+            VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, cleared, null, null);
+        }
     }
 
     private void destroyGuideImages() {
+        for (RtImage reservoir : reservoirImages) {
+            reservoir.destroy();
+        }
+        reservoirImages = new RtImage[0];
+        for (RtImage reservoir : reservoirSampleImages) {
+            reservoir.destroy();
+        }
+        reservoirSampleImages = new RtImage[0];
+        reservoirWrite = 0;
         if (gNormal != null) {
             gNormal.destroy();
             gNormal = null;
@@ -884,6 +1119,10 @@ public final class RtComposite {
             gSpecMotion.destroy();
             gSpecMotion = null;
         }
+        if (volumeDebug != null) {
+            volumeDebug.destroy();
+            volumeDebug = null;
+        }
         if (rrOutput != null) {
             rrOutput.destroy();
             rrOutput = null;
@@ -896,81 +1135,120 @@ public final class RtComposite {
         // the RR path whose render-resolution guide inputs the debug pass visualizes.
         boolean rrEnabled = RtDlssRr.enabled();
         int rrQuality = rrEnabled ? RtDlssRr.quality() : Integer.MIN_VALUE;
+        boolean hdrEnabled = CausticaConfig.Rt.Hdr.enabled();
         if (output != null && continuationQueue != null
-                && displayImage != null && hdrDisplayImage != null && rrOutput != null
+                && displayImage != null && rrOutput != null
                 && bloomLevels.length > 0 && exposure.ready()
                 && displayW == width && displayH == height
-                && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality) {
+                && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality
+                && renderSizeHdrEnabled == hdrEnabled && hdrEnabled == (hdrDisplayImage != null)) {
             return;
         }
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
-        if (displayImage != null) {
-            displayImage.destroy();
-        }
-        if (hdrDisplayImage != null) {
-            hdrDisplayImage.destroy();
-        }
-        destroyBloomLevels();
-        if (output != null) {
-            output.destroy();
-        }
-        if (continuationQueue != null) {
-            continuationQueue.destroy();
-            continuationQueue = null;
-        }
-        destroyGuideImages();
+        // Every image created below defers its UNDEFINED->GENERAL init barrier into one synchronous
+        // submit, instead of one submit+wait per image across a 15+-image rebuild.
+        ctx.beginImageInitBatch();
+        try {
+            if (displayImage != null) {
+                displayImage.destroy();
+            }
+            if (hdrDisplayImage != null) {
+                hdrDisplayImage.destroy();
+                hdrDisplayImage = null;
+            }
+            destroyBloomLevels();
+            if (output != null) {
+                output.destroy();
+            }
+            if (continuationQueue != null) {
+                continuationQueue.destroy();
+                continuationQueue = null;
+            }
+            destroyGuideImages();
 
-        displayW = width;
-        displayH = height;
-        // The path tracer + its guide buffers run at render res; DLSS-RR (or a fallback blit) upscales
-        // to display res. With RR off there is no reconstruction pass, so trace at 1:1 for a faithful reference.
-        // With RR on, ask NGX what render resolution its chosen quality mode actually expects rather
-        // than assuming a fixed ratio: different quality modes (and driver versions) use different
-        // ratios, and DLSSD's own optimal-settings query is the source of truth for what it will accept.
-        int[] optimal = rrEnabled ? RtDlssRr.INSTANCE.queryOptimalRenderSize(width, height) : null;
-        renderW = optimal != null ? optimal[0] : width;
-        renderH = optimal != null ? optimal[1] : height;
-        renderSizeRrEnabled = rrEnabled;
-        renderSizeRrQuality = rrQuality;
+            displayW = width;
+            displayH = height;
+            // The path tracer + its guide buffers run at render res; DLSS-RR (or a fallback blit) upscales
+            // to display res. With RR off there is no reconstruction pass, so trace at 1:1 for a faithful reference.
+            // With RR on, ask NGX what render resolution its chosen quality mode actually expects rather
+            // than assuming a fixed ratio: different quality modes (and driver versions) use different
+            // ratios, and DLSSD's own optimal-settings query is the source of truth for what it will accept.
+            int[] optimal = rrEnabled ? RtDlssRr.INSTANCE.queryOptimalRenderSize(width, height) : null;
+            renderW = optimal != null ? optimal[0] : width;
+            renderH = optimal != null ? optimal[1] : height;
+            renderSizeRrEnabled = rrEnabled;
+            renderSizeRrQuality = rrQuality;
+            renderSizeHdrEnabled = hdrEnabled;
 
-        // RT traces and DLSS-RR reconstruct scene-linear ACEScg in an HDR R16G16B16A16_SFLOAT target,
-        // so radiance > 1 and wide-gamut colour survive to the display seam. displayImage stays
-        // R8G8B8A8 to match the main target it is copied into
-        // (vkCmdCopyImage requires texel-size-compatible formats).
-        output = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "trace color " + renderW + "x" + renderH);
-        long pixelRecords = Math.multiplyExact((long) renderW, (long) renderH);
-        long continuationBytes = Math.multiplyExact(
-                Math.multiplyExact(pixelRecords, 2L), PATH_RECORD_BYTES);
-        continuationQueue = ctx.createBuffer(continuationBytes,
-                VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
-                "path continuation queue " + renderW + "x" + renderH + "x2");
-        displayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM, "RT display image " + width + "x" + height);
-        // PQ-encoded ([0,1], ST.2084) HDR display image, written in parallel by display.comp when HDR mode is active.
-        hdrDisplayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "RT HDR display image " + width + "x" + height);
-        // Bloom pyramid. Level 0 is half display resolution (the prefilter's 13-tap already covers a 5x5
-        // display-pixel footprint, so nothing is lost by starting there); each further level halves again
-        // until the look package's level count or the smallest useful size is reached.
-        int bloomWidth = Math.max(1, (width + 1) / 2);
-        int bloomHeight = Math.max(1, (height + 1) / 2);
-        int bloomLevelCount = RtBloomPipeline.levelsFor(bloomWidth, bloomHeight, LOOK.bloom().levels());
-        bloomLevels = new RtImage[bloomLevelCount];
-        for (int level = 0; level < bloomLevelCount; level++) {
-            bloomLevels[level] = ctx.createStorageImage(bloomWidth, bloomHeight,
-                    VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                    "RT bloom level " + level + " " + bloomWidth + "x" + bloomHeight);
-            bloomWidth = Math.max(1, bloomWidth / 2);
-            bloomHeight = Math.max(1, bloomHeight / 2);
+            // RT traces and DLSS-RR reconstruct scene-linear ACEScg in an HDR R16G16B16A16_SFLOAT target,
+            // so radiance > 1 and wide-gamut colour survive to the display seam. displayImage stays
+            // R8G8B8A8 to match the main target it is copied into
+            // (vkCmdCopyImage requires texel-size-compatible formats).
+            output = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "trace color " + renderW + "x" + renderH);
+            long pixelRecords = Math.multiplyExact((long) renderW, (long) renderH);
+            long continuationBytes = Math.multiplyExact(
+                    Math.multiplyExact(pixelRecords, 2L), PATH_RECORD_BYTES);
+            continuationQueue = ctx.createBuffer(continuationBytes,
+                    VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                    "path continuation queue " + renderW + "x" + renderH + "x2");
+            displayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM, "RT display image " + width + "x" + height);
+            // PQ-encoded ([0,1], ST.2084) HDR display image, written in parallel by display.comp when HDR
+            // mode is active. Allocated only while HDR output is enabled: at display resolution it costs
+            // ~29 MB at 1440p / ~66 MB at 4K and is never read when the flag is off. While it is absent
+            // the display pipeline's HDR slot binds the 1x1 placeholder (see hdrDisplayBindingView).
+            if (hdrEnabled) {
+                hdrDisplayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        "RT HDR display image " + width + "x" + height);
+            }
+            // Bloom pyramid. Level 0 is half display resolution (the prefilter's 13-tap already covers a 5x5
+            // display-pixel footprint, so nothing is lost by starting there); each further level halves again
+            // until the look package's level count or the smallest useful size is reached.
+            int bloomWidth = Math.max(1, (width + 1) / 2);
+            int bloomHeight = Math.max(1, (height + 1) / 2);
+            int bloomLevelCount = RtBloomPipeline.levelsFor(bloomWidth, bloomHeight, LOOK.bloom().levels());
+            bloomLevels = new RtImage[bloomLevelCount];
+            for (int level = 0; level < bloomLevelCount; level++) {
+                bloomLevels[level] = ctx.createStorageImage(bloomWidth, bloomHeight,
+                        VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        "RT bloom level " + level + " " + bloomWidth + "x" + bloomHeight);
+                bloomWidth = Math.max(1, bloomWidth / 2);
+                bloomHeight = Math.max(1, bloomHeight / 2);
+            }
+            // Guide buffers match the trace (render) resolution; DLSS-RR consumes them at render res.
+            gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide normal roughness " + renderW + "x" + renderH);
+            gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide diffuse albedo " + renderW + "x" + renderH);
+            gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide linear depth " + renderW + "x" + renderH);
+            gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
+            gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
+            gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
+            // Bounce-0 RIS reservoir ping-pong. Both sides are render-res RGBA32F: the trace writes one and
+            // reads the other, and they alternate per traced frame. They are not DLSS-RR guides, so they get
+            // their own bindings rather than a guide slot. The format must match the rgba32f the shaders
+            // declare — a narrower texel would make every reservoir access alias its neighbour.
+            reservoirImages = new RtImage[]{
+                    ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
+                            "reservoir A " + renderW + "x" + renderH),
+                    ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32G32B32A32_SFLOAT,
+                            "reservoir B " + renderW + "x" + renderH)};
+            // The survivor's rectangle coordinates. Half precision is deliberate: a quadrature audit of the
+            // merge showed quantising (s,t) to fp16 changes the estimator's bias by less than its own noise.
+            reservoirSampleImages = new RtImage[]{
+                    ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT,
+                            "reservoir sample A " + renderW + "x" + renderH),
+                    ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT,
+                            "reservoir sample B " + renderW + "x" + renderH)};
+            reservoirWrite = 0;
+            // Per-pixel volumetric diagnostics, same render resolution as the guides the primary pass
+            // writes them from.
+            volumeDebug = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    "volume debug " + renderW + "x" + renderH);
+            // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
+            rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
+            // Also creates the 1x1 exposure image, so it stays inside the init-batch window.
+            exposure.ensureResources(ctx);
+        } finally {
+            ctx.endImageInitBatch();
         }
-        // Guide buffers match the trace (render) resolution; DLSS-RR consumes them at render res.
-        gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide normal roughness " + renderW + "x" + renderH);
-        gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide diffuse albedo " + renderW + "x" + renderH);
-        gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide linear depth " + renderW + "x" + renderH);
-        gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
-        gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
-        gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
-        // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
-        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
-        exposure.ensureResources(ctx);
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
         waterWaveTimeValid = false;
@@ -979,13 +1257,30 @@ public final class RtComposite {
             bindGuideImages();
         }
         RtToneLut boundLookLut = lookLut;
-        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayImage.view,
+        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayBindingView(ctx),
                 sdrToneLut.view(), sdrToneLut.sampler(), hdrToneLut.view(), hdrToneLut.sampler(),
-                boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler());
+                boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler(),
+                exposure.stateBuffer());
         bloomPipeline.setImages(rrOutput.view, exposure.image().view, bloomLevels);
         debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
                 gMotion.view, gSpecAlbedo.view, gSpecMotion.view, rrOutput.view, exposure.image().view,
-                exposure.stateBuffer());
+                volumeDebug.view, exposure.stateBuffer());
+    }
+
+    /**
+     * The view bound into the display pipeline's HDR output slot: the real HDR display image while HDR
+     * output is enabled, otherwise the persistent 1x1 placeholder that keeps the format-qualified
+     * descriptor legally bound without pinning a display-resolution image.
+     */
+    private long hdrDisplayBindingView(RtContext ctx) {
+        if (hdrDisplayImage != null) {
+            return hdrDisplayImage.view;
+        }
+        if (hdrBindingPlaceholder == null) {
+            hdrBindingPlaceholder = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    "RT HDR display placeholder");
+        }
+        return hdrBindingPlaceholder.view;
     }
 
     private void destroyBloomLevels() {
@@ -1003,6 +1298,11 @@ public final class RtComposite {
      * (or after a reset) push the current view-projection with zero delta so MVs come out zero.
      */
     private void updateMotion() {
+        // The reservoir pair advances on the same cadence as the motion-vector history: exactly one step
+        // per frame that runs the trace, so "the image the previous traced frame wrote" is always the one
+        // bound as prev.
+        reservoirWrite ^= 1;
+        bindReservoirImages();
         mvCurProjView.set(frameProjection).mul(frameViewRotation);
         if (mvHasPrev) {
             mvPushMatrix.set(mvPrevProjView);
@@ -1031,7 +1331,7 @@ public final class RtComposite {
         RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter = gpuExecutor.graphicsUseWaiter();
         // Reuse a completed readback slot, then latch one pre-exposure value for both raygen and resolve.
         // This belongs after the timeline snapshot and before any world push data is written.
-        exposure.beginFrame(graphicsUseWaiter);
+        exposure.beginFrame(graphicsUseWaiter, nightFactor());
         pendingGraphicsUse = graphicsUse;
         RtEntities.FrameEntities frameEntities = null;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
@@ -1079,6 +1379,12 @@ public final class RtComposite {
             if (waterWaves()) {
                 flags |= 0b10000; // animated water wave normals
             }
+            if (CausticaConfig.Rt.Sky.VANILLA_SUN.value()) {
+                flags |= 0b100000; // draw the sun from the celestials sprite rather than as a disc
+            }
+            if (CausticaConfig.Rt.Sky.VANILLA_MOON.value()) {
+                flags |= 0b1000000; // likewise for the moon
+            }
 
             // Water parameters: camera-biome tint plus wrapped animation time. Per-water-body tint
             // comes from the primitive; this is the fallback for a camera already inside the medium.
@@ -1089,7 +1395,36 @@ public final class RtComposite {
                 wtg = ((wc >> 8) & 0xFF) / 255f;
                 wtb = (wc & 0xFF) / 255f;
             }
-            float waterWaveTime = (float) (System.nanoTime() / 1.0e9 % 3600.0);
+            // Accumulate the wave clock from a clamped per-frame step rather than reading it off the wall
+            // clock, so changing the speed control alters the rate without teleporting the phase. The step
+            // clamp keeps a stall or a pause from fast-forwarding the sea.
+            long waveClockNow = System.nanoTime();
+            float waveClockStep = waveClockNanos == 0L ? 0f
+                    : Math.min(Math.max((waveClockNow - waveClockNanos) / 1.0e9f, 0f), 0.25f);
+            waveClockNanos = waveClockNow;
+            // Wrapped hourly to keep the phase argument well inside float32's precise range.
+            waterWaveClock = (waterWaveClock + waveClockStep) % 3600.0f;
+            // Wind drift for the fog billows and the cloud streaks: integrate speed x direction
+            // per frame (the same clamped step the wave clock uses, so a pause cannot teleport the
+            // fields), then wrap the fog pair per axis. Unconditional — the drift stays coherent
+            // across tier toggles, and the accumulators are two multiplies a frame.
+            if (waveClockStep > 0f) {
+                double fogSpeed = CausticaConfig.Rt.Volume.FOG_WIND_SPEED.value();
+                double fogAzim = Math.toRadians(CausticaConfig.Rt.Volume.FOG_WIND_ANGLE.value());
+                fogDriftX += fogSpeed * Math.cos(fogAzim) * waveClockStep;
+                fogDriftZ += fogSpeed * Math.sin(fogAzim) * waveClockStep;
+                fogDriftX -= 4096.0 * Math.floor(fogDriftX / 4096.0);
+                fogDriftZ -= 4096.0 * Math.floor(fogDriftZ / 4096.0);
+                double cloudSpeed = CausticaConfig.Rt.Volume.CLOUD_WIND_SPEED.value();
+                double cloudAzim = Math.toRadians(CausticaConfig.Rt.Volume.CLOUD_WIND_ANGLE.value());
+                cloudDriftX += cloudSpeed * Math.cos(cloudAzim) * waveClockStep;
+                cloudDriftZ += cloudSpeed * Math.sin(cloudAzim) * waveClockStep;
+                // The rate is a warp-lattice cell every ~80 s at 60 fps: fast enough that a player who
+                // looks away and back sees different shapes, slow enough that nothing boils and RR reads
+                // the field as the same slowly-moving signal it reads the drift as.
+                cloudEvolve += CLOUD_EVOLVE_SPEED * waveClockStep;
+            }
+            float waterWaveTime = waterWaveClock;
             float waterWaveDelta = waterWaveTime - previousWaterWaveTime;
             // A first frame, long pause, or one-hour phase wrap has no adjacent wave frame to reproject.
             // Use the current phase so the reflection MV is neutral instead of manufacturing a huge jump.
@@ -1099,6 +1434,14 @@ public final class RtComposite {
             previousWaterWaveTime = waterWaveTime;
             waterWaveTimeValid = true;
             Float4 waterParams = linearAcesCgFromSrgb(wtr, wtg, wtb, waterWaveTime);
+            // Wave-shape controls, read per frame: height and wavelength scale the spectrum in the shader,
+            // clock rate scales the accumulated time above. All 1 is the authored look. The fourth lane is
+            // not a wave control but rides along in the same push: how much of its Fresnel reflection water
+            // keeps.
+            Float4 waterWave = new Float4(CausticaConfig.Rt.Composite.WATER_WAVE_HEIGHT.value(),
+                    CausticaConfig.Rt.Composite.WATER_WAVE_SCALE.value(),
+                    CausticaConfig.Rt.Composite.WATER_WAVE_SPEED.value(),
+                    CausticaConfig.Rt.Composite.WATER_REFLECTION.value());
             // Wave-domain anchor: the terrain rebase origin reduced mod 4096 (kept small for shader
             // float precision). hitPos.xz (rebased) + anchor reconstructs a world-pinned coordinate, so the
             // ripple pattern stays fixed in the world as the player moves and the rebase origin shifts.
@@ -1121,6 +1464,76 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush();
+            // Volumetric flags. Fog follows the sky LUT's own sky-light gate: its ambient term reads the
+            // sky irradiance basis, which is only baked where the sky lights the world, so a dimension
+            // without sky light must not read it. The volume debug views ask the primary raygen to fill
+            // the volume debug image this frame.
+            boolean skyLit = sky.skyEnvironment().x() > 0f;
+            if (CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit) {
+                flags |= WORLD_FLAG_FOG;
+            }
+            if (CausticaConfig.Rt.Volume.FOG_SHADOW.value()) {
+                flags |= WORLD_FLAG_VOLUME_SHADOW;
+            }
+            boolean fogMarchOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit
+                    && CausticaConfig.Rt.Volume.FOG_MARCH.value();
+            if (fogMarchOn) {
+                flags |= WORLD_FLAG_VOLUME_MARCH;
+            }
+            // Spray rides the marched fog integrator (a wavefield density has no closed form), so the
+            // flag only goes up when that tier is actually running and the strength is non-zero.
+            boolean sprayOn = fogMarchOn && CausticaConfig.Rt.Composite.WATER_SPRAY.value() > 0f;
+            if (sprayOn) {
+                flags |= WORLD_FLAG_SPRAY;
+            }
+            // The planar cloud sheet and its shadow field. Same sky-light gate as the fog (the
+            // sheet's ambient reads the sky dome), independent of every fog switch — cloud shadows
+            // work with the fog off. The coverage lane doubles as the shader gate, so a coverage
+            // of zero leaves every consumer inert even with the flag up.
+            boolean cloudOn = CausticaConfig.Rt.Volume.CLOUD_ENABLED.value() && skyLit;
+            if (cloudOn) {
+                flags |= WORLD_FLAG_CLOUD;
+            }
+            // The volumetric tier is a second bit, not a replacement of the first: every consumer that
+            // only wants the layer's mean opacity (the NEE probes, the fog sun legs, a continuation ray)
+            // keeps reading WORLD_FLAG_CLOUD, and only sky.rmiss branches on this one.
+            boolean volumetricCloudOn = cloudOn
+                    && CausticaConfig.Rt.Volume.CLOUD_VOLUMETRIC.value();
+            if (volumetricCloudOn) {
+                flags |= WORLD_FLAG_CLOUD_VOLUMETRIC;
+            }
+            int debugViewValue = debugView();
+            if (skyLit && debugViewValue >= DEBUG_VIEW_VOLUME_FIRST && debugViewValue <= DEBUG_VIEW_VOLUME_LAST) {
+                flags |= WORLD_FLAG_VOLUME_DEBUG;
+            }
+            // The volume debug image reads the push block rather than the flags, so the fog density is
+            // pushed as zero while the fog is off — otherwise the debug views would keep showing a fog
+            // the flags no longer render.
+            boolean fogOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit;
+            // Weather drives the volume block: the levels are pushed whether or not a feature currently
+            // consumes them, so every volume shader reads one consistent weather snapshot. The previous
+            // frame's rain level rides along so temporal-stability work can interpolate.
+            float partialTick = Minecraft.getInstance().getDeltaTracker().getGameTimeDeltaPartialTick(false);
+            float rainLevel = level.getRainLevel(partialTick);
+            float thunderLevel = level.getThunderLevel(partialTick);
+            float storm = CausticaConfig.Rt.Volume.stormLevel(rainLevel, thunderLevel);
+            float cloudRainBoost = CausticaConfig.Rt.Volume.CLOUD_RAIN_BOOST.value();
+            // Fog density over the day: dawn and dusk are the peak (low-sun ground mist is the look
+            // people expect from fog), while noon and night keep a fraction of it. Sun elevation is
+            // sin(2π·dayFraction) against the same fraction the GameTime lane pushes: +1 at noon,
+            // 0 at 06:00/18:00, -1 at midnight. A gaussian in elevation (σ ≈ 14°) is the twilight
+            // term; smoothstep plateaus hold noon at 20% and night at 25% of the peak so the fog
+            // never fully leaves. Both plateaus ramp in past ±0.10 elevation so the twilight peak
+            // owns the horizon stretch unopposed.
+            float timeOfDayFrac = (level.getGameTime() % 24000L + partialTick) / 24000.0f;
+            float sunElevation = (float) Math.sin(timeOfDayFrac * 2.0 * Math.PI);
+            float twilight = (float) Math.exp(-(sunElevation * sunElevation) / (0.25f * 0.25f));
+            float dayPlateau = Math.clamp((sunElevation - 0.10f) / 0.30f, 0.0f, 1.0f);
+            dayPlateau = dayPlateau * dayPlateau * (3.0f - 2.0f * dayPlateau);
+            float nightPlateau = Math.clamp((-sunElevation - 0.10f) / 0.30f, 0.0f, 1.0f);
+            nightPlateau = nightPlateau * nightPlateau * (3.0f - 2.0f * nightPlateau);
+            float fogDayFactor = Math.max(twilight,
+                    Math.max(dayPlateau * 0.20f, nightPlateau * 0.25f));
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1137,10 +1550,18 @@ public final class RtComposite {
                     sky.look1(),
                     sky.look2(),
                     sky.look3(),
+                    sky.skyEnvironment(),
+                    sky.skyboxState(),
+                    sky.dimensionLight(),
+                    sky.dimensionAmbient(),
+                    sky.dimensionFog(),
+                    sky.look4(),
                     sky.sunUv(),
                     sky.moonUv(),
+                    sky.endFlashUv(),
                     waterParams,
                     waterAnchor,
+                    waterWave,
                     mvCurProjView,
                     breaking.length,
                     breaking,
@@ -1153,11 +1574,106 @@ public final class RtComposite {
                     new Float4(terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16f),
                     new Int4(terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(), 0),
                     terrain.lightCount(),
+                    terrain.lightTranslationCount(),
+                    terrain.lightTranslationApplies() ? 1 : 0,
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
+                    CausticaConfig.Rt.Lights.TEMPORAL_REUSE.value() ? 1 : 0,
+                    CausticaConfig.Rt.Lights.TEMPORAL_HISTORY.value(),
                     // Must be the SAME value the exposure resolve divides out this frame (it reads it
                     // from the same RtExposure accessor), or the two stop cancelling.
-                    exposure.preExposure()
+                    exposure.preExposure(),
+                    CausticaConfig.Rt.Composite.WATER_OPACITY.value(),
+                    // Vanilla's own GameTime. The end portal's layer scroll is authored against a value
+                    // that completes one cycle per in-game day, so a monotonic seconds clock churns it
+                    // more than a thousand times too fast. Same fraction the fog day factor consumed.
+                    timeOfDayFrac,
+                    // ---- Volumetric block (volume.slang). Fog zero means no fog: the shaders gate on
+                    // the flags bits, but a zero density keeps the WorldPush honest on its own. The fog
+                    // base is pushed already rebased so the height profile is world-pinned. Cloud and
+                    // spray lanes ride along at zero until their phases arrive. The density rides the
+                    // fog day factor computed above (dawn/dusk peak, noon 20%, night 25% of it).
+                    new Float4(fogOn
+                            ? CausticaConfig.Rt.Volume.FOG_DENSITY.value() * fogDayFactor
+                                    * (1f + CausticaConfig.Rt.Volume.FOG_RAIN_BOOST.value() * rainLevel)
+                            : 0f,
+                            CausticaConfig.Rt.Volume.FOG_HEIGHT.value(),
+                            CausticaConfig.Rt.Volume.FOG_BASE_Y.value() - terrain.blockY,
+                            CausticaConfig.Rt.Volume.FOG_ANISOTROPY.value()),
+                    // x/z the Java-accumulated wind drift (per-axis, pre-wrapped in whole
+                    // 4096-block periods — the fog lattice's exact period), z FBM noise amplitude
+                    // 0..1, w the shadow-cull floor (both fog tiers read it, so unlike the noise
+                    // lanes it rides ungated). The noise amplitude is zero unless the marched tier
+                    // runs, so the analytic frame samples no noise.
+                    new Float4((float) fogDriftX,
+                            (float) fogDriftZ,
+                            fogMarchOn ? CausticaConfig.Rt.Volume.FOG_NOISE.value() : 0f,
+                            CausticaConfig.Rt.Volume.FOG_SHADOW_FLOOR.value()),
+                    linearAcesCgFromSrgb(CausticaConfig.Rt.Volume.FOG_ALBEDO.value(),
+                            CausticaConfig.Rt.Volume.FOG_ALBEDO.value(),
+                            CausticaConfig.Rt.Volume.FOG_ALBEDO.value(),
+                            CausticaConfig.Rt.Volume.FOG_AMBIENT.value()),
+                    // ---- Cloud block. x coverage (0 = inert: every consumer early-outs), y the
+                    // cloud base already rebased like fog0.z, z the slab thickness the sheet's and
+                    // the shadow's optical depths scale with, w the density multiplier (the shadow
+                    // strength).
+                    // Coverage and density are the WEATHER-LIFTED values, not the sliders': rain decks
+                    // the sky over and shadows harder, and every consumer of these two lanes - sheet,
+                    // walk, shadow field, NEE, fog legs - reads the same lifted numbers because they were
+                    // lifted before the push rather than re-derived per consumer.
+                    new Float4(cloudOn ? CausticaConfig.Rt.Volume.rainCoverage(
+                            CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value(), storm, cloudRainBoost) : 0f,
+                            CausticaConfig.Rt.Volume.CLOUD_ALTITUDE.value() - terrain.blockY,
+                            CausticaConfig.Rt.Volume.CLOUD_THICKNESS.value(),
+                            CausticaConfig.Rt.Volume.rainDensity(
+                                    CausticaConfig.Rt.Volume.CLOUD_DENSITY.value(), storm, cloudRainBoost)),
+                    // x the volumetric tier's vertical profile mix (0 while that tier is off, so the
+                    // planar frame pushes exactly the block it always did), y the wind azimuth (the
+                    // streak frame's direction; the drift itself accumulates into cloud2.zw Java-side),
+                    // z the localized-coverage strength, w the fade distance (blocks). Gated lanes ride
+                    // zero while off.
+                    new Float4(volumetricCloudOn
+                                    ? CausticaConfig.Rt.Volume.CLOUD_TYPE.value() : 0f,
+                            cloudOn ? (float) Math.toRadians(
+                                    CausticaConfig.Rt.Volume.CLOUD_WIND_ANGLE.value()) : 0f,
+                            cloudOn ? CausticaConfig.Rt.Volume.CLOUD_PATCHINESS.value() : 0f,
+                            cloudOn ? CausticaConfig.Rt.Volume.CLOUD_FADE_DISTANCE.value() : 0f),
+                    // ---- Cloud anchoring block. xy the EXACT terrain origin (no mod-4096: the
+                    // streak lattice has no period, so the anchor must not wrap either), zw the
+                    // Java-accumulated cloud wind drift per axis (unwrapped doubles). MUST stay
+                    // before cloudColor: the generated record orders this block cloud0, cloud1,
+                    // cloud2, cloudColor (see world_common.slang), and the arguments here are
+                    // positional — swapping these two pushed the drift into the ambient-weight
+                    // lane and the ambient weight into the anchor (clouds froze, then burned).
+                    new Float4((float) terrain.blockX, (float) terrain.blockZ,
+                            (float) cloudDriftX, (float) cloudDriftZ),
+                    // x the field's evolution phase (unconditional, like the drift: a tier toggle must
+                    // not rewind the sky), yz unused, w the sheet's ambient-term weight.
+                    new Float4((float) cloudEvolve, 0f, 0f, 1f),
+                    // z spray strength: the setting's base lifted by rain (rain is what spray is for),
+                    // and zero unless the spray flag went up with the marched tier.
+                    new Float4(rainLevel, thunderLevel,
+                            sprayOn ? CausticaConfig.Rt.Composite.WATER_SPRAY.value()
+                                    * (0.5f + 0.5f * rainLevel) : 0f,
+                            previousRainLevel),
+                    // x march steps per segment, y jitter strength 0..1, z reserved (max integration
+                    // distance — left at 0: truncating the integral would desynchronise the out fogT
+                    // from the throughput attenuation riding it), w the volumetric cloud slab's step
+                    // count (zero unless that tier is on, which is how the shader's own early-out and
+                    // the flag agree). Zero on the analytic fog tier, whose integrator takes no march
+                    // parameters.
+                    new Float4(fogMarchOn ? (float) CausticaConfig.Rt.Volume.FOG_MARCH_STEPS.value() : 0f,
+                            fogMarchOn ? CausticaConfig.Rt.Volume.FOG_JITTER.value() : 0f,
+                            0f,
+                            volumetricCloudOn
+                                    ? (float) CausticaConfig.Rt.Volume.CLOUD_STEPS.value() : 0f),
+                    // ---- Water-volume block. x turbidity (the water's sigmaS/sigmaT fraction), y the
+                    // water phase's Henyey–Greenstein g (forward-biased per the plan's 0.5..0.9 range),
+                    // z spray band height in blocks, w the band's base: the sea level, already rebased
+                    // like fog0.z so the band stays pinned as the terrain rebase shifts.
+                    new Float4(CausticaConfig.Rt.Composite.WATER_TURBIDITY.value(), 0.6f, 1.5f,
+                            (float) (level.getSeaLevel() - terrain.blockY))
             ).write(push);
+            previousRainLevel = rainLevel;
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
@@ -1187,25 +1703,52 @@ public final class RtComposite {
             // WorldPush at all, and the RIS light buffers are read from world.rgen's hot inner loop, so
             // none of them should cost an extra BDA dereference to find.
             ByteBuffer pushConstants = stack.malloc(WorldPushConstantsData.BYTE_SIZE);
+            // The Materials page's switches, packed into one word for the same reason wetness and the
+            // parallax depth ride in this block: world.rchit evaluates materials and never dereferences
+            // WorldPush, so a per-hit world load would be paid on the hottest path in the frame.
+            int materialToggles =
+                    (CausticaConfig.Rt.Materials.TEXTURE_EMISSION.value()
+                            ? CausticaConfig.Rt.Materials.TOGGLE_TEXTURE_EMISSION : 0)
+                    | (CausticaConfig.Rt.Materials.BLOCK_EMISSION.value()
+                            ? CausticaConfig.Rt.Materials.TOGGLE_BLOCK_EMISSION : 0)
+                    | (CausticaConfig.Rt.Materials.SUBSURFACE.value()
+                            ? CausticaConfig.Rt.Materials.TOGGLE_SUBSURFACE : 0)
+                    | (CausticaConfig.Rt.Materials.POROSITY.value()
+                            ? CausticaConfig.Rt.Materials.TOGGLE_POROSITY : 0)
+                    | (CausticaConfig.Rt.Materials.ENTITY_PARALLAX.value()
+                            ? CausticaConfig.Rt.Materials.TOGGLE_ENTITY_PARALLAX : 0);
             new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
                     RtMaterialRegistry.INSTANCE.tableAddress(),
                     terrain.lightBufferAddress(), terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(), terrain.lightGridCellBufferAddress(),
-                    terrain.lightGridSpanBufferAddress(), continuationQueue.deviceAddress,
-                    (int) frameCounter).write(pushConstants);
+                    terrain.lightGridSpanBufferAddress(), terrain.lightTranslationAddress(),
+                    continuationQueue.deviceAddress,
+                    (int) frameCounter,
+                    CausticaConfig.Rt.Composite.WETNESS.value(),
+                    CausticaConfig.Rt.Composite.PARALLAX_DEPTH.value(),
+                    CausticaConfig.Rt.Materials.PARALLAX_LAYERS.value(),
+                    materialToggles).write(pushConstants);
             // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
             // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
             // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.
-            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.skyLut")) {
-                skyLut.record(cmd, pushBuf.deviceAddress);
+            // A dimension with no sky light blends the whole atmosphere out, so nothing reads these and the
+            // bake is skipped; the first frame back in a lit dimension re-bakes before its own trace.
+            if (sky.skyEnvironment().x() > 0f) {
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.skyLut")) {
+                    skyLut.record(cmd, pushBuf.deviceAddress);
+                }
+                VulkanCommandEncoder.memoryBarrier(cmd, stack); // sky LUT writes visible to raygen/miss
             }
-            VulkanCommandEncoder.memoryBarrier(cmd, stack); // sky LUT writes visible to raygen/miss
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world primary trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.tracePrimary")) {
                 active.trace(cmd, renderW, renderH, pushConstants, 0);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // continuation/guide writes visible to pass B
+            // The reservoir write only reaches pixels that get a bounce-0 diffuse vertex, so clear this
+            // frame's image first: an unwritten texel has to read as "no history" next frame, not as
+            // whatever vkAllocateMemory returned, which interpreted as RGBA32F can be NaN or Inf.
+            clearReservoir(ctx, cmd, stack);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world indirect trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.traceIndirect")) {
                 active.trace(cmd, renderW, renderH, pushConstants, 1);
@@ -1262,7 +1805,15 @@ public final class RtComposite {
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
                 displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                         sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
-                        true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length);
+                        CausticaConfig.Rt.Tonemap.LOOK_ENABLED.value(), lookLut.size,
+                        LOOK.bloom().strength() / bloomLevels.length,
+                        CausticaConfig.Rt.Tonemap.ADVANCED_GRADING.value(),
+                        CausticaConfig.Rt.Tonemap.AGX_GAIN.value(),
+                        CausticaConfig.Rt.Tonemap.AGX_SATURATION.value(),
+                        // Needs the meter, not just the setting: in manual exposure mode evScene is
+                        // never refreshed, so there is no absolute luminance to adapt to.
+                        CausticaConfig.Rt.Tonemap.PURKINJE.value() && exposure.isAuto(),
+                        CausticaConfig.Rt.Tonemap.PURKINJE_STRENGTH.value());
             }
             hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite
@@ -1335,7 +1886,9 @@ public final class RtComposite {
     }
 
     private record SkyPush(Float4 celestial, Float4 look0, Float4 look1, Float4 look2, Float4 look3,
-                           Float4 sunUv, Float4 moonUv) {}
+                           Float4 skyEnvironment, Float4 skyboxState, Float4 dimensionLight,
+                           Float4 dimensionAmbient, Float4 dimensionFog, Float4 look4,
+                           Float4 sunUv, Float4 moonUv, Float4 endFlashUv) {}
 
     private record CelestialUv(Float4 sun, Float4 moon) {}
 
@@ -1361,6 +1914,31 @@ public final class RtComposite {
      * floor — see {@code sky.MIN_VIEWER_ALTITUDE_KM}, which is set by what fp32 can resolve at planet
      * radius, not by anything visual — so zero here is safe and means "at or below sea level".
      */
+    /**
+     * How dark the world's sky is: 0 from sunrise to sunset, 1 through the middle of the night, ramping
+     * across {@link #NIGHT_RAMP} of a day at either end.
+     *
+     * <p>Derived from the dimension's own clock rather than from an attribute, because the attributes that
+     * look like they carry it do not: {@code STAR_BRIGHTNESS} measured 0.24 at midnight instead of 1, and
+     * {@code SKY_LIGHT_LEVEL} moves with where the camera stands. A control the player dials in EV has to
+     * reach the EV it says, so the ramp is computed here.
+     *
+     * <p>{@code hasSkyLight} is the dimension gate. The Nether fixes its clock, so without it a Nether
+     * session would sit at whatever the frozen time happens to read — permanently lifted, or never.
+     */
+    private float nightFactor() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || !mc.level.dimensionType().hasSkyLight()) {
+            return 0.0f;
+        }
+        // Minecraft's clock: 0 sunrise, 6000 noon, 12000 sunset, 18000 midnight.
+        float timeOfDay = (float) (Math.floorMod(mc.level.getDefaultClockTime(), DAY_TICKS) / (double) DAY_TICKS);
+        // Distance from midnight, so the two horizon crossings are the same distance and noon is furthest.
+        float fromMidnight = Math.abs(timeOfDay - 0.75f);
+        float distance = Math.min(fromMidnight, 1.0f - fromMidnight);
+        return Math.clamp((0.25f - distance) / NIGHT_RAMP, 0.0f, 1.0f);
+    }
+
     private SkyPush skyPush() {
         Minecraft mc = Minecraft.getInstance();
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
@@ -1376,9 +1954,69 @@ public final class RtComposite {
         float starAngle = probe.getValue(EnvironmentAttributes.STAR_ANGLE, partial) * toRadians;
         float starBrightness = probe.getValue(EnvironmentAttributes.STAR_BRIGHTNESS, partial);
         float moonPhase = probe.getValue(EnvironmentAttributes.MOON_PHASE, partial).index(); // 0 full .. 4 new
+        // Whether this dimension is lit by its sky at all, and what colour that sky carries. The Nether and
+        // the End report a zero factor: no sun, no moon, no stars, no atmosphere. Reading it from the probe
+        // rather than from a dimension id keeps a datapack-authored dimension correct for free, and a
+        // partial value is honoured because the shader blends on it.
+        float skyLightFactor = probe.getValue(EnvironmentAttributes.SKY_LIGHT_FACTOR, partial);
+        int skyColor = probe.getValue(EnvironmentAttributes.SKY_COLOR, partial);
+        Float4 skyEnvironment = new Float4(skyLightFactor,
+                (float) srgbToLinear(((skyColor >> 16) & 0xFF) / 255.0),
+                (float) srgbToLinear(((skyColor >> 8) & 0xFF) / 255.0),
+                (float) srgbToLinear((skyColor & 0xFF) / 255.0));
+
+        // Which sky a sky-light-free dimension renders, and what the End layers on top of it. The Skybox
+        // ordinal is the only thing that can tell the Nether from the End — skyLightFactor is zero in
+        // both, and they need opposite skies. The flash state is exactly what vanilla's SkyRenderer
+        // consumes (eased intensity plus the two raw angles), gated on the dimension's own
+        // hasEndFlashes and the player's lightning-flash option. The three attribute colours are the
+        // same ones vanilla's lightmap tints the end flash and its ambient floor with; a datapack
+        // dimension's custom values arrive here untouched.
+        var dimensionType = mc.level.dimensionType();
+        boolean flashEnabled = dimensionType.hasEndFlashes() && !mc.options.hideLightningFlash().get();
+        // Explicit mapping rather than ordinal(): the shader's SKYBOX_* constants are the contract, not
+        // Mojang's declaration order.
+        int skyboxOrdinal = switch (dimensionType.skybox()) {
+            case NONE -> 0;
+            case OVERWORLD -> 1;
+            case END -> 2;
+        };
+        // Vanilla only constructs and consumes the flash state for an END skybox — ClientLevel
+        // .endFlashState() is null in every other dimension — so the reads are gated the same way.
+        float flashIntensity = 0.0f;
+        float flashXAngle = 0.0f;
+        float flashYAngle = 0.0f;
+        if (skyboxOrdinal == 2 && flashEnabled) {
+            EndFlashState endFlash = mc.level.endFlashState();
+            if (endFlash != null) {
+                flashIntensity = Math.clamp(endFlash.getIntensity(partial), 0.0f, 1.0f);
+                flashXAngle = endFlash.getXAngle() * toRadians;
+                flashYAngle = endFlash.getYAngle() * toRadians;
+            }
+        }
+        Float4 skyboxState = new Float4(skyboxOrdinal, flashIntensity, flashXAngle, flashYAngle);
+        int skyLightColor = probe.getValue(EnvironmentAttributes.SKY_LIGHT_COLOR, partial);
+        int ambientLightColor = probe.getValue(EnvironmentAttributes.AMBIENT_LIGHT_COLOR, partial);
+        int fogColor = probe.getValue(EnvironmentAttributes.FOG_COLOR, partial);
+        Float4 dimensionLight = new Float4(
+                (float) srgbToLinear(((skyLightColor >> 16) & 0xFF) / 255.0),
+                (float) srgbToLinear(((skyLightColor >> 8) & 0xFF) / 255.0),
+                (float) srgbToLinear((skyLightColor & 0xFF) / 255.0),
+                dimensionType.ambientLight());
+        Float4 dimensionAmbient = new Float4(
+                (float) srgbToLinear(((ambientLightColor >> 16) & 0xFF) / 255.0),
+                (float) srgbToLinear(((ambientLightColor >> 8) & 0xFF) / 255.0),
+                (float) srgbToLinear((ambientLightColor & 0xFF) / 255.0),
+                0f);
+        Float4 dimensionFog = new Float4(
+                (float) srgbToLinear(((fogColor >> 16) & 0xFF) / 255.0),
+                (float) srgbToLinear(((fogColor >> 8) & 0xFF) / 255.0),
+                (float) srgbToLinear((fogColor & 0xFF) / 255.0),
+                0f);
 
         RtLookPackage.Sky sky = LOOK.sky();
         RtLookPackage.Lighting lighting = LOOK.lighting();
+        RtLookPackage.End end = LOOK.end();
         CelestialUv uv = celestialUv(moonPhase);
         return new SkyPush(
                 new Float4(sunAngle, moonAngle, starAngle, starBrightness),
@@ -1391,9 +2029,18 @@ public final class RtComposite {
                 new Float4(sky.sunDiscHalfAngleDegrees() * toRadians,
                         sky.moonDiscHalfAngleDegrees() * toRadians,
                         viewerAltitudeKm, moonPhase),
-                new Float4(sky.groundAlbedo(), sky.horizonSoftenDegrees() * toRadians, 0f, 0f),
+                new Float4(sky.groundAlbedo(), sky.horizonSoftenDegrees() * toRadians,
+                        end.flashAngularRadiusDegrees() * toRadians, end.skyGradientGain()),
+                skyEnvironment,
+                skyboxState,
+                dimensionLight,
+                dimensionAmbient,
+                dimensionFog,
+                new Float4(end.flashIlluminanceLux(), end.flashQuadLuminanceCdM2(),
+                        end.ambientIlluminanceLux(), end.skyBoxGain()),
                 uv.sun(),
-                uv.moon());
+                uv.moon(),
+                new Float4(endFlashU0, endFlashV0, endFlashU1, endFlashV1));
     }
 
     /**
@@ -1422,11 +2069,13 @@ public final class RtComposite {
         celestialUvMoonPhase = -1;
         sunU0 = 0f; sunV0 = 0f; sunU1 = 1f; sunV1 = 1f;
         moonU0 = 0f; moonV0 = 0f; moonU1 = 1f; moonV1 = 1f;
+        endFlashU0 = 0f; endFlashV0 = 0f; endFlashU1 = 1f; endFlashV1 = 1f;
     }
 
     private void refreshCelestialUvCache(int moonPhase) {
         sunU0 = 0f; sunV0 = 0f; sunU1 = 1f; sunV1 = 1f;
         moonU0 = 0f; moonV0 = 0f; moonU1 = 1f; moonV1 = 1f;
+        endFlashU0 = 0f; endFlashV0 = 0f; endFlashU1 = 1f; endFlashV1 = 1f;
         try {
             if (celestialUvAtlasHandle != 0L) {
                 TextureAtlas atlas = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(AtlasIds.CELESTIALS);
@@ -1434,6 +2083,9 @@ public final class RtComposite {
                 sunU0 = sun.getU0(); sunV0 = sun.getV0(); sunU1 = sun.getU1(); sunV1 = sun.getV1();
                 TextureAtlasSprite moon = atlas.getSprite(MOON_IDS[moonPhase]);
                 moonU0 = moon.getU0(); moonV0 = moon.getV0(); moonU1 = moon.getU1(); moonV1 = moon.getV1();
+                TextureAtlasSprite endFlash = atlas.getSprite(END_FLASH_ID);
+                endFlashU0 = endFlash.getU0(); endFlashV0 = endFlash.getV0();
+                endFlashU1 = endFlash.getU1(); endFlashV1 = endFlash.getV1();
             }
         } catch (Exception ignored) {
             // celestials atlas not yet loaded — keep full-range UVs (fallback texture is the block atlas)
@@ -1460,6 +2112,36 @@ public final class RtComposite {
                 : Math.pow((value + 0.055) / 1.055, 2.4);
     }
 
+    /**
+     * The look-package-relative LMT selected by config, or the packaged name when no override is set.
+     * The sanitizer in {@code CausticaConfig.Rt.Tonemap} has already rejected anything with a path
+     * separator, so this concatenation cannot leave the package directory.
+     */
+    private static String lookQualifiedLmtName() {
+        String override = CausticaConfig.Rt.Tonemap.LOOK_OVERRIDE.get();
+        if (override == null || override.isEmpty()) {
+            return LOOK.lmtResource();
+        }
+        String packaged = LOOK.lmtResource();
+        return packaged.substring(0, packaged.lastIndexOf('/') + 1) + override;
+    }
+
+    /**
+     * Loads an LMT, returning null when an override names something unreadable or contract-violating so
+     * the caller keeps the LUT it already has. A mistyped file name should cost a warning and one
+     * wrong-looking frame, not the whole renderer — {@code RtToneLut.loadResource} throws on bad magic,
+     * version, size or shaper. The packaged LMT is not caught: that failing is a build problem.
+     */
+    private static RtToneLut tryLoadLookLut(RtContext ctx, String resource) {
+        try {
+            return RtToneLut.loadResource(ctx, resource);
+        } catch (RuntimeException e) {
+            CausticaMod.LOGGER.warn("Cannot use tonemap.look-override '{}': {}; keeping the current LMT",
+                    resource, e.getMessage());
+            return null;
+        }
+    }
+
     public void destroy() {
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
@@ -1475,6 +2157,11 @@ public final class RtComposite {
             hdrDisplayImage.destroy();
             hdrDisplayImage = null;
         }
+        if (hdrBindingPlaceholder != null) {
+            hdrBindingPlaceholder.destroy();
+            hdrBindingPlaceholder = null;
+        }
+        renderSizeHdrEnabled = false;
         destroyBloomLevels();
         if (fgHudlessImage != null) {
             fgHudlessImage.destroy();
@@ -1523,6 +2210,7 @@ public final class RtComposite {
             lookLut.destroy();
             lookLut = null;
         }
+        loadedLookLutName = null;
         loadedHdrLutNits = -1;
         if (hdrCompositePipeline != null) {
             hdrCompositePipeline.destroy();
@@ -1552,6 +2240,19 @@ public final class RtComposite {
         fgInterpW = -1;
         fgInterpH = -1;
         fgInterpFormat = Integer.MIN_VALUE;
+        if (fgInterpPipeline != null) {
+            fgInterpPipeline.destroy();
+            fgInterpPipeline = null;
+        }
+        if (fgSelfInterp != null) {
+            fgSelfInterp.destroy();
+            fgSelfInterp = null;
+        }
+        if (fgSelfHistory != null) {
+            fgSelfHistory.destroy();
+            fgSelfHistory = null;
+        }
+        fgSelfHistoryWritten = false;
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
@@ -1575,6 +2276,13 @@ public final class RtComposite {
             }
             atlasSampler = 0L;
         }
+        if (endSkySampler != 0L) {
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx != null) {
+                VK10.vkDestroySampler(ctx.vk(), endSkySampler, null);
+            }
+            endSkySampler = 0L;
+        }
     }
 
     private long atlasSampler(RtContext ctx) {
@@ -1596,6 +2304,32 @@ public final class RtComposite {
             }
         }
         return atlasSampler;
+    }
+
+    /**
+     * Linear + wrapping sampler for the end-sky cube: vanilla's buildEndSky() tiles end_sky.png 16x16
+     * per face and magnifies it heavily, so REPEAT addressing is load-bearing and NEAREST (the atlas
+     * sampler) would render it as hard pixels rather than vanilla's soft cloudscape.
+     */
+    private long endSkySampler(RtContext ctx) {
+        if (endSkySampler == 0L) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                        .magFilter(VK10.VK_FILTER_LINEAR).minFilter(VK10.VK_FILTER_LINEAR)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .minLod(0f).maxLod(0.25f);
+                LongBuffer p = stack.mallocLong(1);
+                if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {
+                    throw new IllegalStateException("vkCreateSampler(end sky) failed");
+                }
+                endSkySampler = p.get(0);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SAMPLER, endSkySampler, "end sky sampler");
+            }
+        }
+        return endSkySampler;
     }
 
     private static long blockAlbedoAtlasView() {
@@ -1884,8 +2618,10 @@ public final class RtComposite {
      * unless both FG and the UI overlay redirect are active — capturing this without the redirect would just
      * copy the ALREADY-composited backbuffer, which is useless as a distinct hudless input.
      */
+
     public void captureFgHudless(RenderTarget main) {
-        if (!RtDlssFg.enabled() || !RtUiOverlay.enabled() || main == null || main.getColorTexture() == null) {
+        if (!RtDlssFg.enabled() || !RtFramePresenter.hudlessInputWanted() || !RtUiOverlay.enabled()
+                || main == null || main.getColorTexture() == null) {
             return;
         }
         RtContext ctx = RtContext.currentOrNull();
@@ -1933,6 +2669,9 @@ public final class RtComposite {
      * version, just within a single method instead of split across a mixin hook.
      */
     private void captureFgHdrHudless(VkCommandBuffer cmd, MemoryStack stack, RtImage src) {
+        if (!RtFramePresenter.hudlessInputWanted()) {
+            return;
+        }
         RtContext ctx = RtContext.currentOrNull();
         if (ctx == null) {
             return;
@@ -2042,6 +2781,154 @@ public final class RtComposite {
         }
         enc.execute(cmd);
         return out;
+    }
+
+    /**
+     * Generate the next frame with AMD FidelityFX. Returns {@code null} when this frame has no
+     * traced guides, when the context could not come up, or when the dispatch failed; the caller
+     * then duplicates the rendered frame instead.
+     *
+     * <p>Only image handles cross the shim boundary. ffx-api builds its own image views from the
+     * {@code VkImage} and the format, so unlike the DLSS path no view handle is needed here, and
+     * every buffer it reads has to be in {@code VK_IMAGE_LAYOUT_GENERAL} - which is what
+     * {@link RtContext#createStorageImage} produces.
+     *
+     * <p>{@code srcW}/{@code srcH} are the extent of {@code backbufferImage} itself and are what the backend
+     * is told to treat as the display size. The swapchain extent is not usable for that: the window system
+     * can make it a pixel different from the render target (a 2560x1441 swapchain over a 2560x1440 target),
+     * and describing a 1440-row image as 1441 rows puts the generated frame on a slightly different
+     * vertical scale from the real one. The two are then presented on alternate frames, which reads as the
+     * whole screen, user interface included, vibrating up and down.
+     */
+    public RtImage fgInterpolateFsr(VulkanCommandEncoder enc, long backbufferImage,
+            int srcW, int srcH, boolean hdrBackbuffer) {
+        if (failed || gDepth == null || gMotion == null || !frameCaptured) {
+            return null;
+        }
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null) {
+            return null;
+        }
+        final int fmt = hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : VK10.VK_FORMAT_R8G8B8A8_UNORM;
+        if (!RtFsrFg.INSTANCE.ensureContext(srcW, srcH, renderW, renderH, fmt)) {
+            return null;
+        }
+        // The output is allocated at the colour input's extent too, so the backend writes one image whose
+        // geometry matches its input; the extra present stretches it to the swapchain the same way
+        // Minecraft's own blit stretches the render target.
+        ensureFgInterp(ctx, 1, srcW, srcH, fmt);
+        RtImage out = fgInterp[0];
+        // A hudless target that is missing or the wrong size is worse than none: pass 0 and FSR
+        // separates screen-fixed content by itself.
+        RtImage hudlessSrc = hdrBackbuffer ? fgHdrHudlessImage : fgHudlessImage;
+        // The HUD-less copy is sized by the main render target, and a pixel of disagreement between the two
+        // is a resize in progress rather than a reason to drop the input. Without it FSR interpolates the
+        // presented image - smearing the UI into the world motion and putting a static HUD into the
+        // optical-flow input - so only a real mismatch is worth giving up over; the buffer is described by
+        // its own size either way, so nothing is read out of bounds.
+        boolean hudlessReady = hudlessSrc != null
+                && Math.abs(hudlessSrc.width - srcW) <= 2
+                && Math.abs(hudlessSrc.height - srcH) <= 2;
+        if (!hudlessReady && fgHudlessMismatch != srcW * 100000 + srcH) {
+            fgHudlessMismatch = srcW * 100000 + srcH;
+            CausticaMod.LOGGER.warn("FSR-FG has no usable HUD-less source: color input {}x{}, captured hudless {} "
+                            + "(the presented image becomes the interpolation source, so the UI is interpolated too)",
+                    srcW, srcH, hudlessSrc == null ? "was never captured"
+                            : hudlessSrc.width + "x" + hudlessSrc.height);
+        }
+
+        VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
+        boolean ok = RtFsrFg.INSTANCE.frame(cmd.address(),
+                backbufferImage, fmt,
+                hudlessReady ? hudlessSrc.image : 0L,
+                hudlessReady ? (hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT
+                        : VK10.VK_FORMAT_R8G8B8A8_UNORM) : 0,
+                hudlessReady ? hudlessSrc.width : 0,
+                hudlessReady ? hudlessSrc.height : 0,
+                out.image, fmt,
+                gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
+                gMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                fgReset);
+        if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
+            throw new IllegalStateException("vkEndCommandBuffer(fsr interpolate) failed");
+        }
+        fgReset = false;
+        if (!ok) {
+            return null;
+        }
+        enc.execute(cmd);
+        return out;
+    }
+
+    /**
+     * Generate the frame halfway between the previous and current displayed frames from the ray-traced
+     * motion guide, for {@link RtFramePresenter} to present as its generated frame. Returns {@code null} —
+     * the caller then duplicates the real frame — when this frame has no traced motion guide, when the HDR
+     * backbuffer is in use, or on the first frame after the history is allocated or resized. The history
+     * copy is recorded on every call regardless, so a frame that cannot be interpolated still feeds the next
+     * one that can.
+     */
+    public RtImage fgInterpolateSelf(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
+            int swapW, int swapH, boolean hdrBackbuffer) {
+        if (failed || hdrBackbuffer || gMotion == null || !frameCaptured) {
+            return null;
+        }
+        RtContext ctx = RtContext.currentOrNull();
+        if (ctx == null) {
+            return null;
+        }
+        if (!ensureFgSelfImages(ctx, swapW, swapH)) {
+            return null;
+        }
+        boolean hasHistory = fgSelfHistoryWritten;
+        VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            if (hasHistory) {
+                fgInterpPipeline.setImages(fgSelfInterp.view, backbufferView, fgSelfHistory.view, gMotion.view);
+                fgInterpPipeline.dispatch(cmd, swapW, swapH, CausticaConfig.Rt.Fg.DEBUG_VIEW.value());
+            }
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            VK10.vkCmdCopyImage(cmd, backbufferImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                    fgSelfHistory.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, swapW, swapH));
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        }
+        if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
+            throw new IllegalStateException("vkEndCommandBuffer(fg self interpolate) failed");
+        }
+        enc.execute(cmd);
+        fgSelfHistoryWritten = true;
+        return hasHistory ? fgSelfInterp : null;
+    }
+
+    /**
+     * Create the interpolated output and the history image at backbuffer size, and report whether they are
+     * usable. A fresh pair is not: it has no previous frame in it yet. Resizing discards the history, and
+     * the pipeline is rebuilt with the images because its descriptor set refers to them.
+     */
+    private boolean ensureFgSelfImages(RtContext ctx, int w, int h) {
+        final int fmt = VK10.VK_FORMAT_R8G8B8A8_UNORM;
+        if (fgSelfInterp != null && fgSelfHistory != null && fgInterpPipeline != null
+                && fgSelfInterp.width == w && fgSelfInterp.height == h) {
+            return true;
+        }
+        // Both images may still be read by an interpolation queued for the frame being replaced.
+        ctx.waitIdle();
+        if (fgInterpPipeline != null) {
+            fgInterpPipeline.destroy();
+            fgInterpPipeline = null;
+        }
+        if (fgSelfInterp != null) {
+            fgSelfInterp.destroy();
+        }
+        if (fgSelfHistory != null) {
+            fgSelfHistory.destroy();
+        }
+        fgSelfInterp = ctx.createStorageImage(w, h, fmt, "FG self interp " + w + "x" + h);
+        fgSelfHistory = ctx.createStorageImage(w, h, fmt, "FG history " + w + "x" + h);
+        fgInterpPipeline = RtFgInterpPipeline.create(ctx);
+        fgSelfHistoryWritten = false;
+        return false;
     }
 
     private boolean ensureFgFeature(RtContext ctx, int w, int h, int rw, int rh, int fmt) {

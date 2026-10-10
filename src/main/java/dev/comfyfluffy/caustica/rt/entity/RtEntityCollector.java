@@ -11,6 +11,7 @@ import dev.comfyfluffy.caustica.mixin.RenderSetupAccessor;
 import dev.comfyfluffy.caustica.mixin.RenderTypeAccessor;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
+import dev.comfyfluffy.caustica.rt.material.RtUnlitPipelines;
 import net.fabricmc.fabric.api.client.renderer.v1.Renderer;
 import net.fabricmc.fabric.api.client.renderer.v1.mesh.Mesh;
 import net.fabricmc.fabric.api.client.renderer.v1.mesh.MeshView;
@@ -23,6 +24,7 @@ import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.font.TextRenderable;
 import net.minecraft.client.model.Model;
 import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.resources.Identifier;
 import net.minecraft.client.renderer.OrderedSubmitNodeCollector;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.color.block.BlockTintSource;
@@ -43,7 +45,9 @@ import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.resources.model.ModelBakery;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
+import net.minecraft.client.resources.model.sprite.AtlasManager;
 import net.minecraft.core.Direction;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -69,12 +73,28 @@ import java.util.function.Predicate;
 /**
  * A {@link SubmitNodeCollector} that intercepts supported entity submissions and renders them straight
  * into an {@link RtEntityCapture}, reusing vanilla's posing and animation. Models, items, blocks, text,
- * custom quads, and line primitives are captured; screen-space effects and debug geometry are ignored.
+ * the burning-entity flame overlay, custom quads, and line primitives are captured; screen-space effects
+ * and debug geometry are ignored.
  *
  * <p>Driven once per entity per frame: {@link #begin} sets the capture, then {@code
  * EntityRenderDispatcher.submit} fans out into {@code submitModel} here. Reused across entities.
  */
 public final class RtEntityCollector implements SubmitNodeCollector {
+
+    /**
+     * Fraction of the unlit emission baseline a beacon beam column pays. 0.22 keeps it reading as a glow
+     * at any distance without becoming the brightest thing in the frame; raise toward 1 to restore the old
+     * blowout, lower for a subtler ribbon.
+     */
+    private static final float BEACON_BEAM_EMISSION_SCALE = 0.22f;
+    /** world_common.slang {@code ENTITY_PRIM_UNLIT}. */
+    private static final int PRIM_FLAG_UNLIT = 1;
+    /** world_common.slang {@code ENTITY_PRIM_END_PORTAL}. */
+    private static final int PRIM_FLAG_END_PORTAL = 2;
+    /** The one vanilla fragment shader that composites the end portal and the end gateway. */
+    private static final String END_PORTAL_FRAGMENT_SHADER = "core/rendertype_end_portal";
+    /** The pipeline define saying how many layers that shader stacks. */
+    private static final String END_PORTAL_LAYERS_DEFINE = "PORTAL_LAYERS";
     private static final Direction[] DIRECTIONS = Direction.values();
     private static final Predicate<Direction> NEVER_CULL = direction -> false;
     // Vanilla leash constants (LeashFeatureRenderer.LEASH_RENDER_STEPS / LEASH_WIDTH).
@@ -82,6 +102,16 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private static final float LEASH_WIDTH = 0.05f;
     // Shared all-zero UV quad for untextured geometry (leash/line ribbons on the white slot).
     private static final float[] ZERO_UV = new float[4];
+    // Vanilla flame-overlay geometry (FlameFeatureRenderer.prepare). FLAME_EXTENT is one literal in
+    // vanilla: it both scales the entity's bounding box and sets each band's height.
+    private static final float FLAME_EXTENT = 1.4f;
+    private static final float FLAME_BAND_STEP = 0.45f;
+    private static final float FLAME_WIDTH_DECAY = 0.9f;
+    private static final float FLAME_DEPTH_STEP = 0.03f;
+    private static final float FLAME_BASE_OFFSET = 0.02f;
+    private final float[] flameX = new float[4], flameY = new float[4], flameZ = new float[4];
+    private final float[] flameU = new float[4], flameV = new float[4];
+    private final Vector3f flamePos = new Vector3f();
 
     private RtEntityCapture capture;
     private boolean profileDynamicEntity;
@@ -337,6 +367,49 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
     }
 
+    /** The pipeline a render type draws with. RenderSetup is final, so the accessor cast goes through
+     *  Object (the interface is mixed in at runtime), mirroring RtEntityTextures#textureLocation. */
+    private static RenderPipeline pipeline(RenderType renderType) {
+        Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+        return ((RenderSetupAccessor) setup).caustica$pipeline();
+    }
+
+    /**
+     * Whether a submission is the end portal / end gateway composite. Both are drawn by the same vanilla
+     * fragment shader, which sums a stack of layers sampled from the pipeline's second texture on top of a
+     * base sampled from its first; the hit shader needs to know to do the same rather than shade a single
+     * texture.
+     */
+    private static boolean endPortalStack(RenderPipeline pipeline) {
+        if (pipeline == null) {
+            return false;
+        }
+        Identifier fragment = pipeline.getFragmentShader();
+        return fragment != null && END_PORTAL_FRAGMENT_SHADER.equals(fragment.getPath());
+    }
+
+    /**
+     * How many layers the composite stacks, read from the pipeline's own {@code PORTAL_LAYERS} define: the
+     * end portal and the end gateway compile the same fragment shader with different counts (15 and 16),
+     * and the difference is one entry of the colour table. Zero means the define was not found.
+     */
+    private static int endPortalLayers(RenderPipeline pipeline) {
+        String directives = pipeline.getShaderDefines().asSourceDirectives();
+        int at = directives.indexOf(END_PORTAL_LAYERS_DEFINE);
+        if (at < 0) {
+            return 0;
+        }
+        int i = at + END_PORTAL_LAYERS_DEFINE.length();
+        while (i < directives.length() && !Character.isDigit(directives.charAt(i))) {
+            i++;
+        }
+        int start = i;
+        while (i < directives.length() && Character.isDigit(directives.charAt(i))) {
+            i++;
+        }
+        return i > start ? Integer.parseInt(directives, start, i, 10) : 0;
+    }
+
     /** Whether a render type is alpha-blended (translucent) — its pipeline's color target has a blend
      *  function. Cutout/solid have none. Drives stochastic entity transparency in world.rahit. */
     private static boolean isTranslucent(RenderType renderType) {
@@ -555,6 +628,66 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     @Override
     public void submitFlame(PoseStack poseStack, EntityRenderState renderState, Quaternionf rotation) {
+        if (capture == null) {
+            return;
+        }
+        AtlasManager atlas = Minecraft.getInstance().getAtlasManager();
+        TextureAtlasSprite fire0 = atlas.get(ModelBakery.FIRE_0);
+        TextureAtlasSprite fire1 = atlas.get(ModelBakery.FIRE_1);
+        // Vanilla draws this overlay with RenderTypes.entityCutoutCull(block atlas): an alpha-cutout
+        // pipeline, so the quads are hard-cut rather than blended and carry no stochastic dither.
+        capture.clearUvRemap(); // sprite UVs are already atlas-space
+        capture.currentOrder = 0;
+        capture.currentAlphaBucket = RtAccel.ENTITY_BUCKET_ANY_HIT;
+        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(TextureAtlas.LOCATION_BLOCKS);
+        capture.currentEmission = 0f;
+        capture.currentPrimFlags = 0;
+        capture.currentLayerTexSlot = 0;
+        // The feature renderer mutates the pose it was handed, at draw time and long after this call.
+        // Working on a copy keeps the caller's stack top intact for the shadow and name-tag submissions
+        // that follow.
+        Matrix4f pose = new Matrix4f(poseStack.last().pose());
+        float width = renderState.boundingBoxWidth * FLAME_EXTENT;
+        pose.scale(width, width, width);
+        pose.rotate(rotation);
+        float height = renderState.boundingBoxHeight / width;
+        pose.translate(0f, 0f, (float) ((int) (height * 0.3f)) * FLAME_BASE_OFFSET - FLAME_BASE_OFFSET);
+        float halfWidth = 0.5f;
+        float base = 0f;
+        float depth = 0f;
+        for (int layer = 0; height > 0f; layer++) {
+            TextureAtlasSprite sprite = layer % 2 == 0 ? fire0 : fire1;
+            setSpriteMaterial(sprite, false);
+            float u0 = sprite.getU0();
+            float v0 = sprite.getV0();
+            float u1 = sprite.getU1();
+            float v1 = sprite.getV1();
+            if ((layer / 2) % 2 != 0) {
+                float swap = u0;
+                u0 = u1;
+                u1 = swap;
+            }
+            flameCorner(pose, -halfWidth, base, depth, u1, v1, 0);
+            flameCorner(pose, halfWidth, base, depth, u0, v1, 1);
+            flameCorner(pose, halfWidth, base + FLAME_EXTENT, depth, u0, v0, 2);
+            flameCorner(pose, -halfWidth, base + FLAME_EXTENT, depth, u1, v0, 3);
+            // Vanilla's own normal is (0,1,0) in the billboard's frame, and a Y-axis rotation leaves
+            // that axis unchanged, so the untransformed up vector is exactly what it submits.
+            capture.addDirectQuad(flameX, flameY, flameZ, flameU, flameV, 0f, 1f, 0f, -1);
+            height -= FLAME_BAND_STEP;
+            base -= FLAME_BAND_STEP;
+            halfWidth *= FLAME_WIDTH_DECAY;
+            depth -= FLAME_DEPTH_STEP;
+        }
+    }
+
+    private void flameCorner(Matrix4f pose, float x, float y, float z, float u, float v, int index) {
+        pose.transformPosition(x, y, z, flamePos);
+        flameX[index] = flamePos.x;
+        flameY[index] = flamePos.y;
+        flameZ[index] = flamePos.z;
+        flameU[index] = u;
+        flameV[index] = v;
     }
 
     // Leashes/leads: replicate LeashFeatureRenderer's geometry — a 24-segment curve with two crossed
@@ -860,14 +993,42 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         pendingOrder = 0;
         capture.clearUvRemap(); // custom callbacks already emit final texture/atlas UV coordinates
         boolean stochasticAlpha = isTranslucent(renderType);
-        // Lines are untextured: bind the white slot so albedo is exactly the vertex colour (slot 0 is
-        // the block atlas, whose (0,0) texel would tint the ribbon arbitrarily).
-        capture.currentTexSlot = lines ? RtEntityTextures.INSTANCE.whiteSlot()
-                : RtEntityTextures.INSTANCE.slotFor(renderType);
+        // Untextured geometry — lines, and a quad list whose render type binds no texture at all (the
+        // lightning bolt) — binds the white slot so its albedo is exactly the vertex colour. Slot 0 is not
+        // a substitute: it is the block atlas, and UV (0,0) lands on whatever sprite is stitched at the
+        // atlas origin, which would tint the submission arbitrarily.
+        int textureSlot = lines ? 0 : RtEntityTextures.INSTANCE.slotFor(renderType);
+        capture.currentTexSlot = textureSlot != 0 ? textureSlot : RtEntityTextures.INSTANCE.whiteSlot();
         capture.currentMaterialId = lines
                 ? RtMaterialRegistry.INSTANCE.entityFallbackId(false)
                 : RtEntityTextures.INSTANCE.materialIdFor(renderType, stochasticAlpha);
         capture.currentAlphaBucket = lines ? RtAccel.ENTITY_BUCKET_OPAQUE : alphaBucket(renderType);
+        RenderPipeline submission = pipeline(renderType);
+        // A vanilla pipeline with no lighting term outputs its final display colour, so tracing it as a
+        // diffuse surface lights something that was never lit — the beacon beam came back as a sun-shaded
+        // column. Emitting its authored colour instead reproduces what the game drew. Such a surface is
+        // still opaque to the path, so it keeps blocking and receiving like the ribbon it is drawn from.
+        boolean unlit = !lines && RtUnlitPipelines.unlit(submission);
+        // Vanilla composites the end portal and the end gateway from a base image plus a stack of animated
+        // layers sampled from a SECOND texture (rendertype_end_portal.fsh). Shading only the base is what
+        // makes them read as a flat purple cube, so the prim also carries the layer texture's slot and the
+        // hit shader reproduces the layer sum from the surface position.
+        boolean endPortal = !lines && endPortalStack(submission);
+        int layerSlot = endPortal ? RtEntityTextures.INSTANCE.layerSlotFor(renderType) : 0;
+        int layerCount = endPortal ? endPortalLayers(submission) : 0;
+        // Without the second texture and the layer count the composite cannot be reproduced at all, so the
+        // submission shades its base texture instead of sampling a slot it does not have.
+        boolean portalStack = layerSlot != 0 && layerCount > 0;
+        // The unlit baseline is anchored on a glowstone FACE's exitance (~318 cd/m²), and every unlit
+        // submission but one is meant to read as bright: lightning IS a blinding flash and the end portal
+        // IS a glowing sheet. The beacon beam is the exception — vanilla draws it as stacked low-alpha
+        // glow layers, so painting the whole column at a glowing face's luminance turns it into a solid
+        // white bar that dominates the night. It pays a dedicated fraction of the baseline instead.
+        float unlitEmission = RtMaterialRegistry.defaultEmissionLuminanceCdM2()
+                * (RtUnlitPipelines.beaconBeam(submission) ? BEACON_BEAM_EMISSION_SCALE : 1f);
+        capture.currentEmission = unlit ? unlitEmission : 0f;
+        capture.currentPrimFlags = (unlit ? PRIM_FLAG_UNLIT : 0) | (portalStack ? PRIM_FLAG_END_PORTAL : 0);
+        capture.currentLayerTexSlot = portalStack ? layerSlot | (layerCount << 16) : 0;
 
         if (lines) {
             lineVertexConsumer.begin();

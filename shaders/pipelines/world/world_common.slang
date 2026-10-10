@@ -26,9 +26,54 @@ public struct WorldPushConstants {
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
     public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
     public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
+    // previous-frame light index -> current-frame light index, or -1 when that emitter is gone. Rebuilt
+    // with each published generation and uploaded in the same arena, so it always describes the
+    // generation the previous frame actually traced with.
+    public uint64_t lightTranslationAddr;
     public uint64_t pathQueueAddr;       // packed primary -> indirect continuation records
     public uint frameIndex;
+    // Global surface wetness 0..1, applied to every material's authored porosity. It rides the push
+    // constant rather than WorldPush because the closest-hit shader evaluates materials and never
+    // dereferences WorldPush at all, so a WorldPush field would cost that hot path an extra address
+    // load per hit to fetch one frame-constant scalar.
+    public float wetness;
+    // How far a parallax-displaced texel may sit below its flat position, in sprite-local UV (one
+    // sprite spans one block face, so 0.25 is LabPBR's 25% of a block). Scales the whole parallax
+    // response; 0 disables the march entirely, which is also the only way to tell a parallax artifact
+    // apart from everything else on a surface that has a height field.
+    public float parallaxDepth;
+    // Layer budget ceiling for that march, in steps. The walk derives its live count from how far the ray
+    // has to travel and caps it here, so this is the quality a frame actually pays for; the compile-time
+    // loop bound only has to be at least this large.
+    public int parallaxLayers;
+    // Material feature switches (bits below), read from the push constant for the same reason wetness is:
+    // the closest-hit shader evaluates materials without ever dereferencing WorldPush. Every bit is set by
+    // default, so a default frame is identical to one rendered before the switches existed.
+    public uint materialToggles;
 };
+
+// materialToggles bits. Each one gates a material feature the renderer would otherwise apply whenever the
+// asset authors it, so a player can isolate one channel against the rest.
+public static const uint MATERIAL_TOGGLE_TEXTURE_EMISSION = 1u;  // a pack's own _s emissiveness
+public static const uint MATERIAL_TOGGLE_BLOCK_EMISSION = 2u;    // block-state and block-light emission
+public static const uint MATERIAL_TOGGLE_SUBSURFACE = 4u;        // labPBR subsurface scattering
+public static const uint MATERIAL_TOGGLE_POROSITY = 8u;          // labPBR porosity, which gates wetness absorption
+public static const uint MATERIAL_TOGGLE_ENTITY_PARALLAX = 16u;
+
+// worldPush.flags volumetric bits (Java mirrors them in RtComposite). Every bit is clear by default, so a
+// frame rendered before the volumetrics existed is bit-identical to one after: the flags gate every
+// volume.slang read, the WorldPush volume block rides along inert.
+public static const uint WORLD_FLAG_FOG = 1u << 7u;           // analytic/marched height fog
+public static const uint WORLD_FLAG_CLOUD = 1u << 8u;         // planar + volumetric cloud layer
+public static const uint WORLD_FLAG_SPRAY = 1u << 9u;         // water-surface spray band
+public static const uint WORLD_FLAG_VOLUME_SHADOW = 1u << 10u; // fog in-scatter's sun shadow ray
+public static const uint WORLD_FLAG_VOLUME_MARCH = 1u << 11u;  // marched tier (clear = analytic)
+public static const uint WORLD_FLAG_VOLUME_DEBUG = 1u << 12u;  // write the volume debug image
+// Volumetric cloud slab (Phase 5): with this up the cloud layer is walked through instead of crossed
+// once. It is a separate bit from WORLD_FLAG_CLOUD on purpose — the planar sheet stays the base tier and
+// the fallback, and every consumer that only needs the layer's mean opacity (the NEE probes, the fog sun
+// legs, the continuation-ray attenuation) keeps reading it through WORLD_FLAG_CLOUD either way.
+public static const uint WORLD_FLAG_CLOUD_VOLUMETRIC = 1u << 13u;
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky
 // LUT bakes read sun/moon/look state from the same BDA slot the trace does, so there is exactly one
@@ -53,7 +98,8 @@ public struct WorldPush {
     public float3   camDelta;
     public uint     spp;
     public float2   jitter;
-    public uint     flags;            // bit0 submerged, bit4 waves
+    public uint     flags;            // bit0 submerged, bit4 waves, bit5 vanilla sun sprite, bit6 vanilla moon sprite;
+    // bit7..bit12 volumetric switches (volume.slang), all clear by default so a default frame
     public uint     maxBounces;
     // ---- Sky state. Only what the CPU alone can know: Minecraft's four eased celestial angles (the
     // 26.2 timeline drives them through a cubic-bezier ease and a datapack may replace the track, so
@@ -70,11 +116,38 @@ public struct WorldPush {
     // x drawn sun half-angle (rad), y drawn moon half-angle (rad), z viewer altitude (km),
     // w moon phase index (0 full .. 4 new).
     public float4   skyLook2;
-    public float4   skyLook3;         // x ground albedo, yzw reserved
+    // x ground albedo, y horizon fade (rad), z end flash NEE half-angle (rad), w end sky gradient gain.
+    public float4   skyLook3;
+    // Dimension sky state, read from Minecraft's environment attributes so a datapack's custom dimension
+    // needs no registry here. x is the sky-light factor: 1 where the sky lights the world, 0 in a dimension
+    // such as the Nether or the End that has no sky light at all. yzw is the dimension's own sky colour in
+    // linear BT.709, used as the dome where that factor is 0.
+    public float4   skyEnvironment;
+    // Which sky a sky-light-free dimension renders, as DimensionType.Skybox's ordinal (0 none, 1
+    // overworld, 2 end). skyLightFactor alone cannot tell the Nether from the End, and the two need
+    // opposite skies. y is the end flash's eased intensity (0..1, 0 when the dimension has no flashes or
+    // the option hides them), z/w its x/y angle (rad) exactly as EndFlashState reports them.
+    public float4   skyboxState;
+    // xyz = the dimension's SKY_LIGHT_COLOR (linear BT.709) — the tint vanilla's lightmap gives the end
+    // flash and the end's ambient; w = DimensionType.ambientLight (End 0.25, Nether 0.1, overworld 0).
+    public float4   dimensionLight;
+    // xyz = the dimension's AMBIENT_LIGHT_COLOR (linear BT.709), the second tint of that ambient floor;
+    // w reserved.
+    public float4   dimensionAmbient;
+    // xyz = the dimension's FOG_COLOR (linear BT.709), the horizon end of the sky dome where the
+    // dimension supplies no atmosphere; w reserved.
+    public float4   dimensionFog;
+    // x end flash NEE illuminance (lux at full intensity), y end flash quad peak luminance (cd/m²),
+    // z end ambient illuminance (lux at ambientLight 1.0), w end sky box gain.
+    public float4   skyLook4;
     public float4   sunUv;            // vanilla sun sprite atlas rect (u0,v0,u1,v1)
     public float4   moonUv;           // vanilla current-moon-phase sprite atlas rect
+    public float4   endFlashUv;       // vanilla end_flash sprite atlas rect (u0,v0,u1,v1)
     public float4   waterParams;      // xyz linear ACEScg camera-biome water tint, w wave time (s)
     public float4   waterAnchor;      // xy world-stable wave-domain anchor, z previous wave time
+    // Wave-shape controls from the Video Settings water page: x height scale, y wavelength scale,
+    // z wave-clock rate. All 1 reproduces the authored spectrum; w reserved.
+    public float4   waterWave;
     public float4x4 curViewProj;      // forward camera-relative view-projection
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
@@ -82,12 +155,77 @@ public struct WorldPush {
     public float4   lightGridOrigin;     // xyz minimum cell origin in rebased blocks, w cell size
     public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
     public uint     lightCount;       // packed Light records in pc.lightBufAddr
+    // Entries in pc.lightTranslationAddr, i.e. the previous generation's light count.
+    public uint     lightTranslationCount;
+    // Non-zero only on a frame whose light generation differs from the last traced frame's. A history
+    // index is already in the current generation on every other frame, so translating then would remap
+    // it onto an unrelated emitter; identity is the correct lookup whenever this is zero.
+    public uint     lightTranslationValid;
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
+    // Bypasses the bounce-0 temporal merge while still storing this frame's reservoir, so switching it
+    // back on starts from a full screen of current data instead of a screen of stale texels. Exists so
+    // reuse can be A/B-ed in one frame at one position rather than across two scene visits.
+    public uint     risTemporalReuse;
+    // Effective-sample ceiling the temporal merge may accumulate to. Equal to risCandidates it degenerates
+    // to single-frame shading; 0 is treated the same way rather than as an unbounded history.
+    public uint     risTemporalHistory;
     // Pre-exposure scalar applied to radiance at the outImage write
     // ONLY, so all light transport above stays in absolute scene units. Keeps stored fp16 values
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
     // exactly and this cannot change the image. 1.0 disables it.
     public float    preExposure;
+    // Multiplier on water's Beer-Lambert extinction (1 = authored look, 0 = fully clear, clamped to
+    // [0, 4] on the CPU). Applies wherever waterExtinction builds a medium, so the camera-submerged
+    // start medium and every interface crossing scale identically.
+    public float    waterOpacity;
+    // Minecraft's own day-cycle fraction, ((gameTime % 24000) + partialTick) / 24000 — exactly what the
+    // vanilla `GameTime` global uniform holds, because the end portal's layer scroll is authored against
+    // it and advances one full cycle per in-game day. Not a wall-clock seconds value: feeding it seconds
+    // runs the scroll ~1200x too fast.
+    public float    endPortalTime;
+    // ---- Volumetric block (see volume.slang). Every field is zero while its feature is off, so a
+    // default frame pushes an inert block and the shaders gate on the flags bits before reading it.
+    // x fog extinction at the base (1/block), y height scale H (block), z fog base height (REBASED
+    // blocks — Java subtracts the terrain origin, the same anchoring waterAnchor uses), w Henyey–
+    // Greenstein anisotropy.
+    public float4   fog0;
+    // x/z the Java-accumulated wind drift (blocks, per axis, each axis pre-wrapped in whole
+    // 4096-block periods — the fog lattice's exact period, so a wrap is invisible by
+    // construction), z noise amplitude 0..1, w the shadow-cull floor (fogShadowFloor reads it;
+    // unlike the drift lanes it is valid on both fog tiers).
+    public float4   fog1;
+    // xyz single-scatter albedo (ACEScg linear, also the sigmaS/sigmaT ratio), w ambient-term weight.
+    public float4   fogColor;
+    // x coverage, y cloud base (rebased blocks), z layer thickness (block), w density multiplier.
+    public float4   cloud0;
+    // x the vertical profile mix 0..1 the volumetric tier's density uses (0 = a flat stratus board,
+    // 1 = a rounded cumulus billow; both normalised to the same column depth), y wind azimuth (rad; the
+    // streak frame's direction — the drift itself is accumulated Java-side into cloud2.zw), z the
+    // localized-coverage (patchiness) strength the field's macro gate reads, w the planar sheet's fade
+    // distance (blocks; sheet-only — the shadow field never dissolves).
+    public float4   cloud1;
+    // xy the EXACT terrain origin in world blocks (fp32; the streak lattice is not
+    // periodic, so unlike the wave domain's mod-4096 anchor this one must not wrap), zw the
+    // Java-accumulated cloud wind drift per axis (unwrapped; the accumulator is a double and only
+    // sheds sub-block precision past millions of blocks of drift).
+    public float4   cloud2;
+    // x the field's evolution phase (Java-accumulated, no wrap: the noise lattices it offsets are not
+    // periodic, and at the rate it advances fp32 keeps sub-cell precision for days of continuous play),
+    // yz unused, w ambient-term weight.
+    public float4   cloudColor;
+    // x rain level 0..1, y thunder level 0..1, z spray strength, w the previous frame's rain level
+    // (temporal-stability work interpolates toward it rather than jumping on a weather change).
+    public float4   weather;
+    // x march step count, y jitter strength 0..1, z max integration distance (block, 0 = ray tmax),
+    // w reserved.
+    public float4   volumeParams;
+    // ---- Water-volume block (the water medium's own scattering + the spray band). x turbidity, the
+    // water's single-scatter fraction sigmaS/sigmaT in 0..1 (0 = the feature is off, the same
+    // zero-when-inert invariant the rest of the block keeps); y the Henyey–Greenstein g of the
+    // water's phase; z spray band height in blocks; w the spray band's base height in REBASED blocks
+    // (the sea level minus the terrain origin, the same anchoring fog0.z uses). The spray strength
+    // itself rides weather.z, whose lane the plan reserves for it.
+    public float4   water1;
 };
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
@@ -179,6 +317,9 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
 // RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
 public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
+// Set on a hit whose prim carries ENTITY_PRIM_UNLIT: the surface contributes its own emission and no
+// diffuse, subsurface or specular response, because what it was authored with is already a final colour.
+public static const uint PAYLOAD_UNLIT = 256u;
 // Set by world.rchit on any dielectric hit (water or glass/ice): true when the incoming ray travels
 // against the prim's outward face normal (entering the volume), false when it exits. Derived from face
 // orientation rather than toggled, so a stray or missing face cannot corrupt the medium for the rest of
@@ -186,6 +327,12 @@ public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
 // meaningful on a miss and this bit only on a hit, so they never need to be read together, but they get
 // distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_DIELECTRIC_ENTERING = 8u;
+// Set on a trace whose ONLY consumer is the guide buffers (Pass A's primary trace and every guide
+// probe). Alpha coverage then has to resolve deterministically: the diffuse-albedo guide is what
+// DLSS-RR demodulates against, and a coverage that flips per pixel per frame is a demodulation signal
+// no accumulation can hold, so the sheet's noise survives as a smear instead of averaging to its mean.
+// The radiance pass leaves this clear and keeps the dither, which integrates the same composite.
+public static const uint PAYLOAD_GUIDE_STABLE = 512u;
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;
@@ -210,9 +357,20 @@ public struct Prim {
     public float4 tint;
     public uint materialId;
     public uint flags;
-    public uint aux0;
+    public uint aux0; // asfloat() = the submission's vertex alpha; vanilla puts some transparency there
     public uint aux1;
 };
+
+// The submission came from a vanilla pipeline with no lighting term, so its colour is already final and
+// the path tracer must not light it as well as emit it. Assigned by RtEntityCollector from
+// RtUnlitPipelines, which matches on the pipeline's fragment shader.
+public static const uint ENTITY_PRIM_UNLIT = 1u;
+
+// The submission is vanilla's end portal / end gateway composite: its colour is a base texture plus a
+// stack of transformed samples of a second texture, so the hit shader must reproduce that sum instead of
+// shading one image. The prim's aux1 lane carries the layer texture's bindless slot in its low 16 bits
+// and the layer count in the high 16.
+public static const uint ENTITY_PRIM_END_PORTAL = 2u;
 
 // Terrain per-triangle record (48 B). The final 16-byte lane contains integer geometry-local metadata;
 // shared surface parameters live once in MaterialHeader instead of being copied into every triangle.
@@ -242,6 +400,10 @@ public struct MaterialHeader {
 public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
+// The _n alpha carries a real height field — at least one texel strictly between flush and maximum
+// depth. Cleared for both degenerate fills, so a pack that never authored the channel, or one whose
+// alpha was left at 0, costs the parallax march nothing.
+public static const uint MATERIAL_FEATURE_HEIGHT = 8u;
 public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
 // Final HDR emitting-surface luminance (look-package baseline or absolute JSON cd/m² override), baked in Java
 // at material-compile time (RtMaterialRegistry) and packed here as a 16-bit fraction of the max — every

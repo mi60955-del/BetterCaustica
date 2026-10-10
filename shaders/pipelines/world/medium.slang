@@ -11,8 +11,17 @@ import world_core;
 
 public static const float WATER_DENSITY = 0.1;
 public static const float3 WATER_ABSORB_FLOOR = float3(0.015, 0.010, 0.008);
-public float3 waterExtinction(float3 tint) {
-    return WATER_ABSORB_FLOOR + WATER_DENSITY * (float3(1.0, 1.0, 1.0) - clamp(tint, 0.0, 1.0));
+// `opacity` scales the whole extinction (floor included), so 0 reads as fully clear water rather
+// than as a floor-only residue. Above 1 the tint-driven channel spread (red dies fastest → blue
+// water) is frozen at its 1.0 strength and only the achromatic mean keeps growing — scaling the
+// spread too would leave blue as the last surviving channel and read as saturated dye instead of
+// the grey-black of genuinely opaque water. Below 1 the whole curve scales, matching 1.0 exactly.
+public float3 waterExtinction(float3 tint, float opacity) {
+    float3 base = WATER_ABSORB_FLOOR
+            + WATER_DENSITY * (float3(1.0, 1.0, 1.0) - clamp(tint, 0.0, 1.0));
+    float mean = (base.r + base.g + base.b) / 3.0;
+    float chromaScale = min(opacity, 1.0);
+    return mean * opacity + (base - mean) * chromaScale;
 }
 
 // A non-water dielectric's tint is a filter over one block of travel rather than a biome water colour, so
@@ -42,6 +51,14 @@ public float3 volumeExtinction(float3 tint, float transmission) {
 public struct Medium {
     public float ior;
     public float3 extinction;
+    // Scattering of the medium itself (1/block, same unit as extinction). Air and every non-water
+    // dielectric carry zero; water's sigmaS is DERIVED from its extinction and worldPush.water1.x —
+    // see waterScattering below. Because the derivation is a pure function of the packed extinction
+    // and a per-frame global, no scattering lane had to be added to the 48-byte PackedPathSegment:
+    // the resumed record re-derives instead of unpacking.
+    public float3 scattering;
+    // Henyey–Greenstein anisotropy of `scattering`.
+    public float phaseG;
     public bool water; // drives the wave-refraction caustic on submerged receivers; nothing else is water-specific
 };
 
@@ -54,6 +71,8 @@ public Medium airMedium() {
     Medium m;
     m.ior = 1.0;
     m.extinction = float3(0.0, 0.0, 0.0);
+    m.scattering = float3(0.0, 0.0, 0.0);
+    m.phaseG = 0.0;
     m.water = false;
     return m;
 }
@@ -75,12 +94,30 @@ public void mediumPop(inout MediumStack stack) {
     stack.outer = airMedium();
 }
 
+// The water medium's own scattering: `turbidity` (worldPush.water1.x) is the single-scatter fraction
+// sigmaS/sigmaT, so scattering = turbidity * extinction keeps the two coefficients energy-consistent
+// by construction (sigmaS <= sigmaT for every channel, with equality at turbidity 1). Because the
+// fraction is a per-frame global rather than a per-segment quantity, it is DERIVED from the packed
+// extinction wherever the medium is materialised — at the interface (makeDielectricMedium) and again
+// when a packed record resumes (segment.unpackPathSegment) — instead of being carried in the 48-byte
+// path record. Zero turbidity yields zero scattering, so the packed record needs no change at all and
+// the pre-water-fog packing stays byte-identical.
+public float3 waterScattering(float3 extinction) {
+    float turbidity = worldPush.water1.x;
+    return turbidity > 0.0 ? turbidity * extinction : float3(0.0, 0.0, 0.0);
+}
+
 // Water's tint is a biome colour whose absorption is calibrated per block of depth; any other volume
-// dielectric's tint is a filter over a reference block of travel. Both end up as per-channel extinction.
-public Medium makeDielectricMedium(bool isWater, float ior, float3 tint, float transmission) {
+// dielectric's tint is a filter over a reference block of travel. Both end up as per-channel extinction;
+// `waterOpacity` (worldPush.waterOpacity) scales only the water branch.
+public Medium makeDielectricMedium(bool isWater, float ior, float3 tint, float transmission,
+        float waterOpacity) {
     Medium m;
     m.ior = ior;
-    m.extinction = isWater ? waterExtinction(tint) : volumeExtinction(tint, transmission);
+    m.extinction = isWater ? waterExtinction(tint, waterOpacity)
+            : volumeExtinction(tint, transmission);
+    m.scattering = isWater ? waterScattering(m.extinction) : float3(0.0, 0.0, 0.0);
+    m.phaseG = isWater ? worldPush.water1.y : 0.0;
     m.water = isWater;
     return m;
 }

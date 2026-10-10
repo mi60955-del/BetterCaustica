@@ -21,11 +21,39 @@ import medium;
 import segment;
 import water;
 import trace;
+import volume;
+import sky;
 import guides;
+
+// Volume debug image (debug views 10..13): r fog transmittance along the camera ray, g the fog
+// in-scatter's luminance, b the cloud coverage the camera ray reads off the cloud plane, a the
+// cloud-shadow transmittance the sun leg from the camera would ride. The cloud lanes live since
+// Phase 4; a cloud-off frame leaves them at their inert defaults (0 and 1) through the same push
+// gates every other consumer uses. Gated by WORLD_FLAG_VOLUME_DEBUG, so the ordinary frame never
+// touches this image.
+void writeVolumeDebug(int2 pix, float3 ro, float3 rd, float t, bool allowShadowCull) {
+    float fogT;
+    float3 insc = fogSegmentInScatter(ro, rd, t, pix, allowShadowCull, fogT);
+    float cloudDensity = 0.0;
+    float cloudShadow = 1.0;
+    if ((worldPush.flags & WORLD_FLAG_CLOUD) != 0u && worldPush.cloud0.x > 0.0) {
+        float tPlane = (worldPush.cloud0.y - ro.y) / rd.y;
+        if (tPlane > 0.0) {
+            cloudDensity = cloudCoverageWorld(ro.xz + rd.xz * tPlane);
+        }
+        if (celestialLight.halfAngle > 0.0) {
+            cloudShadow = cloudShadowTransmittance(ro, celestialLight.dir);
+        }
+    }
+    volumeDebug[pix] = float4(fogT, luminance(insc), cloudDensity, cloudShadow);
+}
 
 public PathSegment tracePrimary(PathSegment seg,
                                 DevicePtr<PackedPathSegment> queue,
                                 uint splitRecord,
+                                int2 pix,
+                                bool volumeDebugOn,
+                                out bool prefixInImage,
                                 out uint nextRecord) {
     float3 ro = seg.ro;
     float3 rd = seg.rd;
@@ -36,7 +64,9 @@ public PathSegment tracePrimary(PathSegment seg,
     uint seed = seg.seed;
     bool showCelestial = seg.showCelestial;
     bool waterWaves = (worldPush.flags & 16u) != 0u;
+    bool fogOn = (worldPush.flags & WORLD_FLAG_FOG) != 0u;
     nextRecord = PATH_NO_NEXT;
+    prefixInImage = false;
 
     {
         int bounce = seg.bounce;
@@ -44,7 +74,14 @@ public PathSegment tracePrimary(PathSegment seg,
                                                rayConeWidth, rayConeSpread, seed, bounce,
                                                showCelestial);
         traceRadiance(CULL_PRIMARY, ro, 0.0, rd, 10000.0,
-                      showCelestial, rayConeWidth, rayConeSpread);
+                      showCelestial, rayConeWidth, rayConeSpread, true);
+
+        // The volume debug image rides on the camera ray's own trace, before the guide probes below
+        // overwrite the payload's hit distance.
+        if (volumeDebugOn) {
+            writeVolumeDebug(pix, ro, rd, payload.hitT >= 0.0 ? payload.hitT : 10000.0,
+                    payload.hitT >= 0.0);
+        }
 
         if (payload.hitT < 0.0) {
             if (bounce == 0) {
@@ -91,6 +128,17 @@ public PathSegment tracePrimary(PathSegment seg,
                     gv_spec = makeSpecSurface(gv_hitCamRel, n, float3(payload.motionPrev), rough,
                                               rrSpecularAlbedo(payload.f0, rough, dot(n, v)));
                 }
+                // A fog-dominated pixel's diffuse guide converges toward mid-grey by the fog's opacity:
+                // RR demodulates against gv_albedo, and the fog term in front of the surface is not that
+                // surface's albedo, so leaving it would brighten dark surfaces and darken bright ones
+                // wherever fog sits in front. Guarded so the fog-off guide write stays untouched.
+                if (fogOn) {
+                    float fogOpacity = 1.0 - fogTransmittance(worldPush.fog0.x, worldPush.fog0.z,
+                            worldPush.fog0.y, ro.y, rd.y, payload.hitT);
+                    if (fogOpacity > 0.0) {
+                        gv_albedo = lerp(gv_albedo, float3(0.5, 0.5, 0.5), fogOpacity);
+                    }
+                }
             }
 
             return terminal;
@@ -101,6 +149,37 @@ public PathSegment tracePrimary(PathSegment seg,
         if (any(medium.current.extinction > 0.0)) {
             throughput *= exp(-medium.current.extinction * payload.hitT);
         }
+
+        // Fog over the camera-to-interface stretch. The terminal hit is consumed by Pass B, which
+        // re-traces it and integrates the fog itself; the dielectric branches resume from the interface,
+        // so this is the only place that stretch can be consumed for them. The transmittance rides the
+        // branch throughputs; the in-scatter is radiance COMMON to both Fresnel branches and cannot ride
+        // either record, so it is written into outImage here once and flagged: the indirect pass
+        // accumulates on top of the stored value instead of overwriting it. The write is guarded so a
+        // fog-off frame never touches outImage from this pass.
+        prefixInImage = false;
+        if (fogOn && !any(medium.current.extinction > 0.0)) {
+            // The in-scatter call owns the segment's sigma (the indoor sky-exposure ladder may thin
+            // it), and its out fogT is that same thinned transmittance — attenuate throughput with
+            // it so the two agree instead of re-integrating at full density here.
+            float prefixFogT;
+            float3 prefixRadiance = fogSegmentInScatter(ro, rd, payload.hitT, pix, true, prefixFogT);
+            throughput *= prefixFogT;
+            outImage[pix] = float4(clamp(prefixRadiance * worldPush.preExposure,
+                    float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
+            prefixInImage = true;
+        }
+        // The water medium's own scattering over the camera-to-interface stretch (the camera started
+        // submerged): the same prefix doctrine as the fog branch above — the radiance is common to
+        // both Fresnel continuations and can ride neither record, so it is written into outImage once
+        // and flagged, and the indirect pass accumulates on top. The two branches never co-fire: the
+        // fog stands down while any extinction is present, the water term needs the water medium.
+        if (medium.current.water && worldPush.water1.x > 0.0) {
+            float3 prefixWater = waterSegmentInScatter(ro, rd, payload.hitT, pix, medium.current);
+            outImage[pix] = float4(clamp(prefixWater * worldPush.preExposure,
+                    float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
+            prefixInImage = true;
+        }
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0),
                            RAY_CONE_MIN_WIDTH);
 
@@ -109,29 +188,30 @@ public PathSegment tracePrimary(PathSegment seg,
         float3 geometricNormal = n;
         float3 previousNormal = n;
         if (isWater && waterWaves) {
-            float2 waterDomain = hitPos.xz + worldPush.waterAnchor.xy;
+            float3 waterPos = float3(hitPos.xz + worldPush.waterAnchor.xy, hitPos.y);
             float waterFootprint = rayConeWidth / max(abs(dot(-rd, geometricNormal)), 0.2);
             if (bounce == 0 && abs(geometricNormal.y) >= 0.5) {
                 float2 currentGrad;
                 float2 previousGrad;
-                waterWaveGradTemporal(waterDomain, worldPush.waterParams.w,
+                waterWaveGradTemporal(waterPos.xz, waterPos.y, worldPush.waterParams.w,
                                       worldPush.waterAnchor.z, waterFootprint, currentGrad, previousGrad);
                 float orientation = geometricNormal.y >= 0.0 ? 1.0 : -1.0;
                 n = orientation * normalize(float3(-currentGrad.x, 1.0, -currentGrad.y));
                 previousNormal = orientation
                         * normalize(float3(-previousGrad.x, 1.0, -previousGrad.y));
             } else {
-                n = applyWaterWaves(geometricNormal, waterDomain,
+                n = applyWaterWaves(geometricNormal, waterPos, rd,
                                     worldPush.waterParams.w, waterFootprint);
             }
         }
 
         float transmission = clamp(payloadTransmission(), 0.0, 1.0);
         Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0),
-                                              payloadAlbedo(), transmission);
+                                              payloadAlbedo(), transmission,
+                                              worldPush.waterOpacity);
         float etaI = medium.current.ior;
         float etaT = entering ? entered.ior : medium.outer.ior;
-        float F = fresnelDielectric(clamp(dot(-rd, n), 0.0, 1.0), etaI, etaT);
+        float F = waterReflectance(fresnelDielectric(clamp(dot(-rd, n), 0.0, 1.0), etaI, etaT), isWater);
         float3 transmittedDir = refract(rd, n, etaI / etaT);
         float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
 
@@ -139,7 +219,10 @@ public PathSegment tracePrimary(PathSegment seg,
             gv_normal = n;
             gv_rough = 0.0;
             gv_albedo = float3(0.0, 0.0, 0.0);
-            gv_emissive = false;
+            // An emissive pane (the nether portal) is a light source to the RIS emitter sampling, not a
+            // surface to blur against whatever shows through it. Its radiance is added by Pass B at the
+            // far face.
+            gv_emissive = payloadEmission() > 0.0;
             gv_hitCamRel = hitPos - worldPush.camOffset;
             gv_motionUseRefracted = false;
             gv_motionObjDisp = isWater ? float3(0.0, 0.0, 0.0) : payload.motionPrev;
@@ -233,8 +316,21 @@ void main() {
     uint seed = (dispatchIndex.x * 1973u + dispatchIndex.y * 9277u + 26699u)
             ^ (worldPush.frameIndex * 2654435761u);
     MediumStack cameraMedium = makeMediumStack((worldPush.flags & 1u) != 0u
-            ? makeDielectricMedium(true, WATER_IOR, worldPush.waterParams.xyz, 1.0)
+            ? makeDielectricMedium(true, WATER_IOR, worldPush.waterParams.xyz, 1.0,
+                    worldPush.waterOpacity)
             : airMedium());
+    // The fog in-scatter's light comes from the same derived celestial body the indirect pass uses;
+    // deriving it costs two LUT fetches, so it only happens on a debug frame that will actually read it.
+    bool volumeDebugOn = (worldPush.flags & WORLD_FLAG_VOLUME_DEBUG) != 0u;
+    // The pre-interface fog and the underwater in-scatter both need the derived celestial body the
+    // indirect pass uses; deriving it costs two LUT fetches, so it happens only on frames that will
+    // actually read it (a volume-debug frame, fog frames, or a submerged camera with water scattering on).
+    bool fogOn = (worldPush.flags & WORLD_FLAG_FOG) != 0u;
+    bool cameraWaterScatter = (worldPush.flags & 1u) != 0u && worldPush.water1.x > 0.0;
+    if (fogOn || volumeDebugOn || cameraWaterScatter) {
+        celestialLight = dominantCelestialLight(skyState(worldPush), transmittanceLut);
+        celestialLight.illuminance = bt709ToAcesCg(celestialLight.illuminance);
+    }
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
     uint baseRecordCount = dimensions.x * dimensions.y;
     uint splitRecord = baseRecordCount + pixelIndex;
@@ -244,9 +340,14 @@ void main() {
     PathSegment current = makePathSegment(origin, dir, float3(1.0, 1.0, 1.0),
             cameraMedium, 0.0, rayConeSpread, seed, 0, true);
     uint nextRecord;
+    bool prefixInImage;
     PathSegment terminal = tracePrimary(
-            current, queue, splitRecord, nextRecord);
-    queue[pixelIndex] = packPathSegment(terminal, nextRecord);
+            current, queue, splitRecord, pix, volumeDebugOn, prefixInImage, nextRecord);
+    PackedPathSegment packedTerminal = packPathSegment(terminal, nextRecord);
+    if (prefixInImage) {
+        packedTerminal.pathFlags |= PATH_PREFIX_IN_IMAGE;
+    }
+    queue[pixelIndex] = packedTerminal;
 
     writeGuides(pix, dir, jndc, size, rayConeSpread);
 }
