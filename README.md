@@ -1,26 +1,49 @@
-# Caustica
+# BetterCaustica
 
-Caustica is an experimental ray-traced renderer for Minecraft 26.2's Vulkan backend.
-It replaces the vanilla world view with hardware ray tracing and NVIDIA DLSS
-features while keeping Minecraft's familiar UI and gameplay intact.
+BetterCaustica is a fork of [Caustica](https://github.com/ComfyFluffy/Caustica) by
+ComfyFluffy, an experimental ray-traced renderer for Minecraft 26.2's Vulkan
+backend. Caustica replaces the vanilla world view with hardware ray tracing and
+NVIDIA DLSS features while keeping Minecraft's familiar UI and gameplay intact.
 
-Caustica is early software. Expect bugs, missing visual cases, and frequent
+Both are early software. Expect bugs, missing visual cases, and frequent
 changes while the renderer is being built.
 
-![Caustica ray-traced Minecraft scene](docs/gallery/2026-07-09_21.25.14.jpg)
+![Caustica ray-traced Minecraft scene](docs/gallery/2026-10-01_00.38.05.jpg)
+
+## What this fork adds
+
+Maintained by island_i. On top of upstream Caustica:
+
+- Volumetric fog and clouds, with heterogeneous volume noise, weather-driven
+  cloud thickening and evolution phase, and volume quality presets
+- Water scattering inside the volumetric medium
+- AMD FidelityFX (FSR) frame generation as a backend that runs on any
+  Vulkan 1.3 device, next to the NVIDIA-only DLSS frame generation
+- Fog and cloud debug views, with the matching Video Settings options
+- Simplified and Traditional Chinese option translations
+- Mod Menu and Sodium Config API entry points for the settings screen
+
+The ray-tracing core, DLSS support and the ACES HDR pipeline are upstream's.
 
 ## Links
 
+- [BetterCaustica Releases](https://github.com/mi60955-del/BetterCaustica/releases) — download the jar here
+- [BetterCaustica source](https://github.com/mi60955-del/BetterCaustica)
+- [Gallery](docs/gallery.md)
+
+Upstream Caustica (this fork's builds are not published there):
+
+- [Upstream repository](https://github.com/ComfyFluffy/Caustica)
 - [Discord](https://discord.gg/SeWCjyKu2)
 - [Modrinth](https://modrinth.com/mod/caustica)
 - [CurseForge](https://www.curseforge.com/minecraft/mc-mods/caustica/preview)
-- [Gallery](docs/gallery.md)
 
 ## Features
 
 - Vulkan hardware path-traced world rendering
+- Volumetric fog, clouds and water scattering
 - DLSS Ray Reconstruction support
-- DLSS Frame Generation support (experimental)
+- Frame Generation through DLSS (NVIDIA, experimental) or FSR (any Vulkan 1.3 device)
 - HDR output
 - Dynamic entity rendering in the ray-traced scene
 - LabPBR-style material support
@@ -39,9 +62,12 @@ changes while the renderer is being built.
 
 1. Install Fabric Loader for Minecraft `26.2`.
 2. Install Fabric API.
-3. Put the Caustica jar in your Minecraft `mods` folder.
+3. Download `bettercaustica-<version>.jar` from [Releases](https://github.com/mi60955-del/BetterCaustica/releases) and put it in your Minecraft `mods` folder.
 4. Launch the game with the Vulkan graphics backend.
-5. Open Video Settings to adjust Caustica's renderer options.
+5. Open Video Settings to adjust the renderer options.
+
+BetterCaustica installs in place of upstream Caustica: the two jars share the
+`caustica` system-property namespace, so remove Caustica first.
 
 ## Usage Notes
 
@@ -63,6 +89,13 @@ Caustica takes over the world renderer, so other mods that heavily modify world
 rendering, shader pipelines, post-processing, or the Vulkan backend may conflict.
 UI-only mods are more likely to work.
 
+Sodium is not supported and support is not planned. Caustica bypasses the vanilla
+render path, so Sodium brings no performance gain while both mods claim the same
+`LevelRenderer` entry point, the Vulkan device, and the Video Settings screen.
+Neither mod declares a conflict, so the loader will happily start a broken
+combination. Use separate profiles, or keep Sodium with Caustica's renderer
+switched off (`-Dcaustica.rt=false`), which leaves Caustica inert.
+
 ## Status
 
 Caustica is not a finished renderer yet. Current work focuses on visual
@@ -72,7 +105,8 @@ paths behave consistently.
 ## License
 
 Caustica's project-owned source code and documentation are licensed under the
-GNU Lesser General Public License v3.0 or later. See [LICENSE.md](LICENSE.md),
+GNU Lesser General Public License v3.0 or later. BetterCaustica's changes are
+licensed under the same terms. See [LICENSE.md](LICENSE.md),
 [COPYING](COPYING), and [COPYING.LESSER](COPYING.LESSER).
 
 Release artifacts may bundle NVIDIA DLSS/NGX SDK components under NVIDIA's own
@@ -80,7 +114,11 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## TODO List
 
-- [ ] Nether/End sky, weather, volumetric fog/clouds
-- [ ] NRD + FSR for non-NVIDIA GPUs
+- [ ] Nether/End sky and weather
+- [x] Volumetric fog and clouds (this fork)
+- [ ] NRD denoising for non-NVIDIA GPUs
+- [x] FSR frame generation for non-NVIDIA GPUs (this fork)
 - [ ] LOD
-- [ ] ReSTIR
+- [x] ReSTIR emitter resampling
+- [ ] ReSTIR temporal reservoir reuse (built and toggleable; so far it measures
+      noisier than resampling from scratch, so its value is unproven)

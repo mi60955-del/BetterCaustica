@@ -19,7 +19,7 @@ import org.jspecify.annotations.Nullable;
  */
 public final class RtExposureDebugEntry implements DebugScreenEntry {
     public static final Identifier ID = DebugScreenEntries.register(
-            Identifier.fromNamespaceAndPath("caustica", "rt_exposure"), new RtExposureDebugEntry());
+            Identifier.fromNamespaceAndPath("bettercaustica", "rt_exposure"), new RtExposureDebugEntry());
 
     @Override
     public void display(DebugScreenDisplayer displayer, @Nullable Level serverOrClientLevel,

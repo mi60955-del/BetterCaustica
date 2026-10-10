@@ -1,11 +1,12 @@
 {
 	"schemaVersion": 1,
-	"id": "caustica",
+	"id": "bettercaustica",
 	"version": "${version}",
-	"name": "Caustica",
-	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction for the Minecraft Vulkan backend.",
+	"name": "BetterCaustica",
+	"description": "Hardware-ray-traced renderer with DLSS Ray Reconstruction and volumetric fog and clouds for the Minecraft Vulkan backend.",
 	"authors": [
-		"i"
+		"island_i (BetterCaustica)",
+		"ComfyFluffy (Caustica)"
 	],
 	"license": "LGPL-3.0-or-later",
 	"environment": "client",
@@ -15,15 +16,25 @@
 		],
 		"client": [
 			"dev.comfyfluffy.caustica.client.CausticaClient"
+		],
+		"modmenu": [
+			"dev.comfyfluffy.caustica.client.CausticaModMenu"
+		],
+		"sodium:config_api_user": [
+			"dev.comfyfluffy.caustica.client.CausticaSodiumConfig"
 		]
 	},
 	"mixins": [
-		"caustica.mixins.json"
+		"bettercaustica.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.19.3",
 		"minecraft": "26.2",
 		"java": ">=25",
 		"fabric-api": "*"
+	},
+	"suggests": {
+		"modmenu": "*",
+		"sodium": "*"
 	}
 }
