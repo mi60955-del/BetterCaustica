@@ -7,10 +7,16 @@ import dev.comfyfluffy.caustica.mixin.ParticleGroupAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.particle.EndRodParticle;
+import net.minecraft.client.particle.FireflyParticle;
+import net.minecraft.client.particle.FlameParticle;
+import net.minecraft.client.particle.GlowParticle;
+import net.minecraft.client.particle.LavaParticle;
 import net.minecraft.client.particle.Particle;
 import net.minecraft.client.particle.ParticleGroup;
 import net.minecraft.client.particle.ParticleRenderType;
 import net.minecraft.client.particle.SingleQuadParticle;
+import net.minecraft.client.particle.SoulParticle;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.culling.Frustum;
@@ -41,6 +47,7 @@ import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUseWaiter;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor.TrackedGraphicsUse;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
@@ -85,13 +92,20 @@ public final class RtEntities {
     /** Custom-index flag (bit 22) marking a particle billboard instance (shares the entity geom table). */
     public static final int PARTICLE_BIT = 0x400000;
     // TLAS visibility-mask bits, ANDed against the per-ray cull mask in world.rgen. Bit 0 = secondary rays
-    // (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray (CULL_PRIMARY).
+    // (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray (CULL_PRIMARY); bit 2 =
+    // rays leaving a specular or dielectric interface (CULL_SPECULAR).
     private static final int MASK_SECONDARY = 0x01;
     private static final int MASK_PRIMARY = 0x02;
+    private static final int MASK_SPECULAR = 0x04;
     /** Default mask: visible to every ray (terrain and ordinary entities use this). */
     private static final int MASK_ALL = 0xFF;
-    /** Particles are primary-ray-only: visible/lit by the camera path, invisible to shadows/GI/reflections. */
-    private static final int PARTICLE_MASK = MASK_PRIMARY;
+    /**
+     * Particles are seen by the camera and by mirror / water / glass continuations, but never by a plain
+     * secondary ray. That keeps them out of shadow rays on two counts: a translucent billboard should not
+     * cast a hard opaque shadow, and every glossy surface in the scene would otherwise run the particle
+     * alpha-cutout any-hit shader.
+     */
+    private static final int PARTICLE_MASK = MASK_PRIMARY | MASK_SPECULAR;
     public static boolean particlesEnabled() {
         return CausticaConfig.Rt.Entities.PARTICLES_ENABLED.value();
     }
@@ -195,6 +209,24 @@ public final class RtEntities {
     private IdentityHashMap<Particle, ParticlePrev> particlePrev = new IdentityHashMap<>();
     private IdentityHashMap<Particle, ParticlePrev> particleCur = new IdentityHashMap<>();
     private final float[] particleCenterScratch = new float[3];
+
+    // Vanilla bakes the lightmap into a particle's vertex colour (particle.vsh multiplies its Color by
+    // sample_lightmap), so lighting a billboard by N·L darkens exactly what vanilla draws brightest: a
+    // torch flame hangs above its torch with its normal pointing at the camera, where ndl ≈ 0. The
+    // particles vanilla draws self-luminous are emitted from their own colour instead, at the package's
+    // emitter baseline; every other particle keeps RT direct/indirect lighting.
+    private static final List<Class<? extends Particle>> SELF_LUMINOUS_PARTICLES = List.of(
+            FlameParticle.class, SoulParticle.class, LavaParticle.class, EndRodParticle.class,
+            GlowParticle.class, FireflyParticle.class);
+
+    private static boolean selfLuminous(Particle particle) {
+        for (Class<? extends Particle> type : SELF_LUMINOUS_PARTICLES) {
+            if (type.isInstance(particle)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** Previous frame's particle center (rebase-space) + that frame's rebase origin, for the MV diff. */
     private static final class ParticlePrev {
@@ -696,6 +728,11 @@ public final class RtEntities {
                 continue;
             }
             boolean firstPersonSelf = entity == cameraEntity && firstPerson;
+            // With SELF_ENABLED off the first-person body is excluded from every ray, not just primary:
+            // no reflection, shadow, or GI trace of the owner is captured at all.
+            if (firstPersonSelf && !CausticaConfig.Rt.Entities.SELF_ENABLED.value()) {
+                continue;
+            }
             int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
             float ix;
             float iy;
@@ -987,6 +1024,10 @@ public final class RtEntities {
                     int vertBefore = vb / 3;
                     particleScratch.clear();
                     sq.extract(particleScratch, cam, partial);
+                    // Emission lane for THIS particle (see SELF_LUMINOUS_PARTICLES): the hit shader emits
+                    // this strength from the particle's own colour instead of lighting it.
+                    capture.currentEmission = selfLuminous(sq)
+                            ? RtMaterialRegistry.defaultEmissionLuminanceCdM2() : 0f;
                     for (SingleQuadParticle.Layer layer : particleScratch.layers()) {
                         capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(layer.textureAtlasLocation());
                         particleScratch.buildLayer(layer, particleCapture);
@@ -1128,9 +1169,16 @@ public final class RtEntities {
                                    BlockEntity be, float partial, long now, int rbx, int rby, int rbz) {
         capture.reset();
         try {
+            // tryExtractRenderState partitions renderers rather than filtering them: it returns null
+            // unless its flag matches BlockEntityRenderer.shouldRenderOffScreen() exactly. One call
+            // therefore never sees both halves, and the off-screen half is where the beacon beam and the
+            // end gateway live. Only a block entity that produced nothing pays the second call.
             BlockEntityRenderState state = beDispatcher.tryExtractRenderState(be, partial, null, false);
             if (state == null) {
-                return; // off-screen-only (beacon/end-gateway), distance-culled, or no renderer
+                state = beDispatcher.tryExtractRenderState(be, partial, null, true);
+            }
+            if (state == null) {
+                return; // distance-culled, or no renderer
             }
             collector.begin(capture, false);
             // Identity pose ⇒ block-local mesh; world placement is the per-frame instance transform in emitBe.

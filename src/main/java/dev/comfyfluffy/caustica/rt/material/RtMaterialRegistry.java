@@ -45,6 +45,12 @@ public final class RtMaterialRegistry {
     public static final int FEATURE_SPEC = 1;
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
+    // Set only when the _n alpha actually carries a height field, i.e. at least one texel sits strictly
+    // between flush and maximum depth. Both degenerate fills are excluded: a channel never authored
+    // reads as all-255 (flush), and an RGBA map whose alpha was left at 0 would read as all-maximum-depth
+    // and sink the surface. Without this bit the parallax march would issue its first height fetch on
+    // every hit of every bounce just to discover that the surface is flat.
+    public static final int FEATURE_HEIGHT = 8;
     public static final int FEATURE_STOCHASTIC_ALPHA = 16;
     // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo. Baked into every
     // emissive RtMaterialDesc.emissionStrength at compile time (compileDesc/compileEntityDesc), times
@@ -103,6 +109,7 @@ public final class RtMaterialRegistry {
     private int entityFallbackId;
     private int nextDynamicId;
     private int tableCapacity;
+    private boolean reserveWarned;
 
     private record EntityTemplate(RtMaterialDesc desc, RtBlockMaterials.Entry entry) {
     }
@@ -117,8 +124,18 @@ public final class RtMaterialRegistry {
     private RtMaterialRegistry() {
     }
 
-    /** Build and atomically publish the block and entity registry for the current resource epoch. */
-    public void rebuild(RtContext ctx, RtBlockMaterials blockMaterials, RtMaterialOverrides overrides) {
+    /** Build and atomically publish the block and entity registry for the current resource epoch.
+
+     * <p>Caller precondition, same as {@link #destroy()}: no in-flight trace may reference the previous
+     * table — the reload path guarantees this with a device idle before rebuilding. Synchronized so the
+     * publish sequence cannot interleave with the {@code synchronized} runtime resolve paths, even
+     * though both currently run on the render thread.
+     *
+     * @param emissionSemantics decides which sprites can be shaded with a state-uniform emission source
+     *                          and therefore need a uniform emission summary + albedo grid compiled
+     */
+    public synchronized void rebuild(RtContext ctx, RtBlockMaterials blockMaterials,
+                                     RtEmissionSemantics emissionSemantics, RtMaterialOverrides overrides) {
         Map<TextureAtlasSprite, RtBlockMaterials.Entry> entriesBySprite = blockMaterials.preparedEntries();
         List<TextureAtlasSprite> sprites = new ArrayList<>(entriesBySprite.keySet());
         sprites.sort(Comparator.comparing(sprite -> sprite.contents().name().toString()));
@@ -127,16 +144,22 @@ public final class RtMaterialRegistry {
         entityResources.sort(Comparator.comparing(Identifier::toString));
         RtBlockMaterials.Entry fallbackEntry = blockMaterials.entry(null);
 
-        // One pass per sprite computes both the raw average (translucent shadow filtering) and the
-        // premultiplied-linear uniform emission summary; sprites are independent, so scan in parallel.
+        // One pass per sprite computes the raw average (translucent shadow filtering) for every sprite;
+        // the uniform emission summary and albedo grid are only consumed by STATE_UNIFORM shading, which
+        // only sprites a light-emitting state can resolve reach, plus the lava fluid's mean-color area
+        // light (fluids render no block model, so they never appear in the emission-semantics scan).
+        // Sprites are independent, so scan in parallel.
+        Identifier lavaStill = Identifier.withDefaultNamespace("block/lava_still");
         Map<TextureAtlasSprite, SpriteStats> spriteStats = new ConcurrentHashMap<>();
-        sprites.parallelStream().forEach(sprite -> spriteStats.put(sprite, computeSpriteStats(sprite)));
+        sprites.parallelStream().forEach(sprite -> spriteStats.put(sprite, computeSpriteStats(sprite,
+                emissionSemantics.mayResolveAsStateUniform(sprite)
+                        || sprite.contents().name().equals(lavaStill))));
 
         int profileVariants = SPRITE_PROFILES.length * MODEL_VARIANTS * EMISSION_VARIANTS;
         List<MaterialHeaderData> headers = new ArrayList<>(3 + profileVariants
                 + sprites.size() * profileVariants);
-        List<RtMaterialDesc> descriptions = new ArrayList<>(headers.size());
-        List<RtEmissionGrid> grids = new ArrayList<>(headers.size());
+        List<RtMaterialDesc> descriptions = new ArrayList<>(3 + profileVariants + sprites.size() * profileVariants);
+        List<RtEmissionGrid> grids = new ArrayList<>(3 + profileVariants + sprites.size() * profileVariants);
         add(headers, descriptions, grids, compileDesc(MODEL_OPAQUE, 0, RtMaterials.Profile.DEFAULT,
                 false, true, RtMaterialDesc.EmissionSummary.NONE), transparentWhiteAverage(), fallbackEntry, null);
         int[] fallbackVariants = new int[profileVariants];
@@ -176,17 +199,24 @@ public final class RtMaterialRegistry {
         for (TextureAtlasSprite sprite : sprites) {
             RtBlockMaterials.Entry entry = entriesBySprite.get(sprite);
             int baseFeatures = entry.features()
-                    & (FEATURE_SPEC | FEATURE_NORMAL | FEATURE_HEURISTIC_EMISSION);
+                    & (FEATURE_SPEC | FEATURE_NORMAL | FEATURE_HEURISTIC_EMISSION | FEATURE_HEIGHT);
             SpriteStats stats = spriteStats.getOrDefault(sprite, SpriteStats.NEUTRAL);
+            // Duplicate descriptions within one sprite always produce identical headers (same albedo
+            // average, page UVs and emission grid), so value-equal variants share one record. The
+            // glass collapse makes this the norm: MODEL_DIELECTRIC fixes roughness/metalness, so the
+            // four profiles' glass variants are one header per emitting flag, and LabPBR sprites'
+            // emitting/non-emitting pairs coincide whenever no heuristic-emission bit differentiates
+            // them. The map must not span sprites: the average and entry are per-sprite compile inputs.
+            Map<RtMaterialDesc, Integer> compiled = new HashMap<>();
 
             // The first sprite-wide (block == null) rule owns this sprite for every state, so its variants
             // are compiled straight into the primary map and the base variants are never emitted. Only
             // block-conditional rules stay in the per-quad runtime scan.
             MutableCompiledOverride spriteWide = null;
-            for (MutableCompiledOverride compiled : compiledOverrides) {
-                if (compiled.rule.block() == null && compiled.rule.matchesSprite(sprite)) {
-                    spriteWide = compiled;
-                    compiled.matchedSprite = true;
+            for (MutableCompiledOverride compiledOverride : compiledOverrides) {
+                if (compiledOverride.rule.block() == null && compiledOverride.rule.matchesSprite(sprite)) {
+                    spriteWide = compiledOverride;
+                    compiledOverride.matchedSprite = true;
                     break;
                 }
             }
@@ -205,15 +235,15 @@ public final class RtMaterialRegistry {
                         if (spriteWide != null) {
                             desc = spriteWide.rule.apply(desc);
                         }
-                        variants[index(profile, glass, emitting)] = headers.size();
-                        add(headers, descriptions, grids, desc, stats.average(), entry, stats.albedoGrid());
+                        variants[index(profile, glass, emitting)] = addVariant(headers, descriptions, grids,
+                                compiled, desc, stats.average(), entry, stats.albedoGrid());
                     }
                 }
             }
             ids.put(sprite, variants);
 
-            for (MutableCompiledOverride compiled : compiledOverrides) {
-                if (compiled.rule.block() == null || !compiled.rule.matchesSprite(sprite)) continue;
+            for (MutableCompiledOverride compiledOverride : compiledOverrides) {
+                if (compiledOverride.rule.block() == null || !compiledOverride.rule.matchesSprite(sprite)) continue;
                 int[] overrideVariants = new int[profileVariants];
                 for (RtMaterials.Profile profile : SPRITE_PROFILES) {
                     for (boolean glass : new boolean[]{false, true}) {
@@ -223,13 +253,13 @@ public final class RtMaterialRegistry {
                                     features, profile, emitting, false,
                                     variantSummary(features, emitting, entry, stats.uniformSummary()),
                                     dielectricIor);
-                            RtMaterialDesc desc = compiled.rule.apply(base);
-                            overrideVariants[index(profile, glass, emitting)] = headers.size();
-                            add(headers, descriptions, grids, desc, stats.average(), entry, stats.albedoGrid());
+                            RtMaterialDesc desc = compiledOverride.rule.apply(base);
+                            overrideVariants[index(profile, glass, emitting)] = addVariant(headers, descriptions,
+                                    grids, compiled, desc, stats.average(), entry, stats.albedoGrid());
                         }
                     }
                 }
-                compiled.ids.put(sprite, overrideVariants);
+                compiledOverride.ids.put(sprite, overrideVariants);
             }
         }
 
@@ -238,7 +268,7 @@ public final class RtMaterialRegistry {
         Set<RtMaterialOverrides.Rule> entityMatchedOverrides = new HashSet<>();
         for (Identifier name : entityResources) {
             RtBlockMaterials.Entry entry = entriesByResource.get(name);
-            int features = entry.features() & (FEATURE_SPEC | FEATURE_NORMAL);
+            int features = entry.features() & (FEATURE_SPEC | FEATURE_NORMAL | FEATURE_HEIGHT);
             RtMaterialDesc desc = compileEntityDesc(features, false, entry.emissionSummary());
             for (RtMaterialOverrides.Rule rule : overrides.rules()) {
                 if (!rule.matchesEntity(name)) continue;
@@ -254,8 +284,10 @@ public final class RtMaterialRegistry {
 
         // Full entity textures have fixed [0,1] UVs and receive IDs above. Atlas sprites need a second,
         // append-only header with the actual stitched atlas rectangle, which is only known when the sprite
-        // first appears in capture. Reserve room for atlas and alpha-mode variants.
-        int dynamicReserve = Math.max(64, Math.addExact(sprites.size(),
+        // first appears in capture. Reserve room for atlas variants, their stochastic-alpha copies, and
+        // the stochastic copies of full entity textures; a runtime spike past the reserve degrades (the
+        // specialization is skipped with a warning) rather than failing the frame.
+        int dynamicReserve = Math.max(64, Math.addExact(Math.multiplyExact(sprites.size(), 2),
                 Math.multiplyExact(entityResources.size(), 3)));
         int recordCapacity = Math.addExact(headers.size(), dynamicReserve);
         long byteSize = Math.multiplyExact((long) recordCapacity, MaterialHeaderData.BYTE_SIZE);
@@ -289,7 +321,8 @@ public final class RtMaterialRegistry {
                     || entityMatchedOverrides.contains(compiled.rule)) {
                 matchedOverrideRules++;
             } else {
-                CausticaMod.LOGGER.warn("RT material override {} matched no compiled texture ({})",
+                CausticaMod.LOGGER.warn("RT material override {} matched no compiled texture it could win "
+                        + "with ({}) — either nothing matches, or a higher-priority rule shadowed it",
                         compiled.rule.source(), compiled.rule.sprite());
             }
         }
@@ -352,7 +385,11 @@ public final class RtMaterialRegistry {
         return stochasticAlpha ? withStochasticAlpha(entityFallbackId) : entityFallbackId;
     }
 
-    /** Return an append-only material-instance variant with stochastic coverage enabled. */
+    /**
+     * Return an append-only material-instance variant with stochastic coverage enabled. When the table's
+     * dynamic reserve is exhausted the base material is returned unchanged with a one-time warning:
+     * losing an alpha specialization must not fail the frame that asked for it.
+     */
     public synchronized int withStochasticAlpha(int materialId) {
         if (table == null || materialId < 0 || materialId >= nextDynamicId) {
             throw new IllegalStateException("RT material is not available for alpha specialization: " + materialId);
@@ -364,7 +401,8 @@ public final class RtMaterialRegistry {
         Integer current = stochasticAlphaIds.get(materialId);
         if (current != null) return current;
         if (nextDynamicId >= tableCapacity) {
-            throw new IllegalStateException("RT material header reserve exhausted");
+            warnReserveExhausted();
+            return materialId;
         }
         int id = nextDynamicId++;
         long targetOffset = Math.multiplyExact((long) id, MaterialHeaderData.BYTE_SIZE);
@@ -398,7 +436,8 @@ public final class RtMaterialRegistry {
         EntityTemplate template = entityTemplates.get(key.name());
         if (template == null) return entityFallbackId(stochasticAlpha);
         if (nextDynamicId >= tableCapacity || table == null) {
-            throw new IllegalStateException("RT entity material header reserve exhausted");
+            warnReserveExhausted();
+            return entityFallbackId(stochasticAlpha);
         }
         int id = nextDynamicId++;
         MaterialHeaderData header = header(template.desc(), transparentWhiteAverage(), template.entry(),
@@ -417,6 +456,7 @@ public final class RtMaterialRegistry {
     /** Caller must ensure no in-flight trace references the current table. */
     public void destroy() {
         snapshot = null;
+        reserveWarned = false;
         entityTextureIds = Map.of();
         entityTemplates = Map.of();
         entitySpriteIds.clear();
@@ -427,6 +467,15 @@ public final class RtMaterialRegistry {
         if (table != null) {
             table.destroy();
             table = null;
+        }
+    }
+
+    /** One-time warning that the table's append-only reserve ran out and specialization was skipped. */
+    private void warnReserveExhausted() {
+        if (!reserveWarned) {
+            reserveWarned = true;
+            CausticaMod.LOGGER.warn("RT material header reserve exhausted; alpha/entity specializations are "
+                    + "skipped until the next resource reload (base materials still render)");
         }
     }
 
@@ -508,6 +557,26 @@ public final class RtMaterialRegistry {
     }
 
     /**
+     * Append a header for {@code desc} unless an identical description was already compiled for the
+     * current sprite, and return the record's id. Value-equal descriptions within one sprite always
+     * produce identical headers — the albedo average, page UVs and emission grid are per-sprite compile
+     * inputs — so the duplicates share one table record and one grid.
+     */
+    private static int addVariant(List<MaterialHeaderData> headers, List<RtMaterialDesc> descriptions,
+                                  List<RtEmissionGrid> grids, Map<RtMaterialDesc, Integer> compiled,
+                                  RtMaterialDesc desc, float[] average, RtBlockMaterials.Entry entry,
+                                  RtEmissionGrid uniformGrid) {
+        Integer existing = compiled.get(desc);
+        if (existing != null) {
+            return existing;
+        }
+        add(headers, descriptions, grids, desc, average, entry, uniformGrid);
+        int id = headers.size() - 1;
+        compiled.put(desc, id);
+        return id;
+    }
+
+    /**
      * The emission grid whose per-texel source matches what {@code world.rchit} shades for this
      * description — the same selection {@link #variantSummary}/override application made for the summary.
      */
@@ -564,8 +633,10 @@ public final class RtMaterialRegistry {
 
     /**
      * Per-sprite compile inputs gathered in a single pixel pass: the raw average RGBA (matching the
-     * previous translucent shadow-filter input) and the premultiplied-linear uniform emission summary
-     * used when a state emits light but no per-texel mask was compiled.
+     * previous translucent shadow-filter input) for every sprite, plus the premultiplied-linear uniform
+     * emission summary and albedo grid used when a state emits light but no per-texel mask was compiled.
+     * The summary/grid are built only when {@code buildUniform} is set — nothing consumes them for a
+     * sprite no emitting state can resolve (see {@link RtEmissionSemantics#mayResolveAsStateUniform}).
      */
     private record SpriteStats(float[] average, RtMaterialDesc.EmissionSummary uniformSummary,
                                RtEmissionGrid albedoGrid) {
@@ -573,7 +644,7 @@ public final class RtMaterialRegistry {
                 RtMaterialDesc.EmissionSummary.NONE, null);
     }
 
-    private static SpriteStats computeSpriteStats(TextureAtlasSprite sprite) {
+    private static SpriteStats computeSpriteStats(TextureAtlasSprite sprite, boolean buildUniform) {
         var contents = sprite.contents();
         int width = contents.width();
         int height = contents.height();
@@ -584,7 +655,7 @@ public final class RtMaterialRegistry {
         int covered = 0;
         // A uniform (state-gated) emitter radiates alpha-weighted albedo per texel; its grid mirrors that
         // so the light collector's footprint math is one code path across all emission sources.
-        RtEmissionGrid.Builder gridBuilder = new RtEmissionGrid.Builder(width, height);
+        RtEmissionGrid.Builder gridBuilder = buildUniform ? new RtEmissionGrid.Builder(width, height) : null;
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
                 int pixel = image.getPixel(x, y); // frame 0 always occupies the image's top-left tile
@@ -593,20 +664,25 @@ public final class RtMaterialRegistry {
                 sg += ARGB.green(pixel);
                 sb += ARGB.blue(pixel);
                 sa += a;
-                float alpha = a / 255.0f;
-                float plr = RtMaterialTextureData.srgbToLinear(ARGB.red(pixel)) * alpha;
-                float plg = RtMaterialTextureData.srgbToLinear(ARGB.green(pixel)) * alpha;
-                float plb = RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel)) * alpha;
-                lr += plr;
-                lg += plg;
-                lb += plb;
-                gridBuilder.add(x, y, plr, plg, plb, alpha);
-                if (a > 1) covered++;
+                if (gridBuilder != null) {
+                    float alpha = a / 255.0f;
+                    float plr = RtMaterialTextureData.srgbToLinear(ARGB.red(pixel)) * alpha;
+                    float plg = RtMaterialTextureData.srgbToLinear(ARGB.green(pixel)) * alpha;
+                    float plb = RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel)) * alpha;
+                    lr += plr;
+                    lg += plg;
+                    lb += plb;
+                    gridBuilder.add(x, y, plr, plg, plb, alpha);
+                    if (a > 1) covered++;
+                }
             }
         }
         float inv = 1.0f / (width * (float) height);
         float scale = inv / 255.0f;
         float[] average = {sr * scale, sg * scale, sb * scale, sa * scale};
+        if (!buildUniform) {
+            return new SpriteStats(average, RtMaterialDesc.EmissionSummary.NONE, null);
+        }
         double luminance = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
         RtMaterialDesc.EmissionSummary uniform = luminance <= 0.0
                 ? RtMaterialDesc.EmissionSummary.NONE

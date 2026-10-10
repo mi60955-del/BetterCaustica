@@ -70,7 +70,11 @@ public final class RtBlockMaterials {
         final TextureAtlasSprite sprite;
         final Identifier name;
         final Identifier albedoLocation;
-        final int features;
+        // Mutable only so decode can add FEATURE_HEIGHT once it has seen the pixels: whether the _n
+        // alpha actually carries a height field is a property of the image, not of the resource's
+        // existence. Each candidate is decoded by exactly one worker, and nothing reads the field until
+        // the parallel pass has completed.
+        int features;
         final Identifier specLocation;
         final Identifier normalLocation;
         final int width;
@@ -132,6 +136,7 @@ public final class RtBlockMaterials {
         entries.clear();
         resourceEntries.clear();
         fallback = null;
+        loggedFailure = false;
         for (Page page : pages) page.destroy();
         pages.clear();
     }
@@ -207,23 +212,15 @@ public final class RtBlockMaterials {
                 .thenComparing(Comparator.comparingInt((Candidate candidate) -> candidate.width).reversed())
                 .thenComparing(candidate -> candidate.name.toString()));
 
-        List<LayoutPage> layouts = new ArrayList<>();
-        layouts.add(new LayoutPage(pageSize, true));
-        for (Candidate candidate : authored) {
-            boolean placed = false;
-            for (int i = 0; i < layouts.size(); i++) {
-                if (layouts.get(i).place(candidate)) {
-                    candidate.page = i;
-                    placed = true;
-                    break;
-                }
-            }
-            if (!placed) {
-                LayoutPage page = new LayoutPage(pageSize, false);
-                if (!page.place(candidate)) continue;
-                candidate.page = layouts.size();
-                layouts.add(page);
-            }
+        List<LayoutPage> layouts = layoutPages(authored, pageSize);
+        if (layouts.size() > materialPageCapacity && authored.removeIf(candidate ->
+                candidate.sprite == null && candidate.features == 0)) {
+            // Entity textures with no features and no rule behind them cost page space but render
+            // nothing special; drop them and re-pack before failing the reload over descriptor slots.
+            CausticaMod.LOGGER.warn("RT material pages exceeded capacity ({} > {}); dropping feature-less "
+                    + "entity textures and re-packing", layouts.size(), materialPageCapacity);
+            for (Candidate candidate : authored) candidate.page = -1;
+            layouts = layoutPages(authored, pageSize);
         }
         if (layouts.size() > materialPageCapacity) {
             throw new IllegalStateException("RT material pages require " + layouts.size()
@@ -251,14 +248,25 @@ public final class RtBlockMaterials {
         });
         for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
             PagePixels pixels = pagePixels[pageIndex];
-            pages.add(new Page(
-                    new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface0,
-                            "material surface0 page " + pageIndex),
-                    new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.normalAo,
-                            "material normalAo page " + pageIndex),
-                    new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
-                            "material surface1 page " + pageIndex),
-                    pageIndex));
+            // Created one at a time and registered only as a complete Page: if a later texture throws,
+            // the already-created ones are destroyed instead of leaking outside the page list.
+            RtMaterialPageTexture surface0 = null;
+            RtMaterialPageTexture normalAo = null;
+            RtMaterialPageTexture surface1 = null;
+            try {
+                surface0 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface0,
+                        "material surface0 page " + pageIndex);
+                normalAo = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.normalAo,
+                        "material normalAo page " + pageIndex);
+                surface1 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
+                        "material surface1 page " + pageIndex);
+                pages.add(new Page(surface0, normalAo, surface1, pageIndex));
+            } catch (Throwable t) {
+                if (surface0 != null) surface0.destroy();
+                if (normalAo != null) normalAo.destroy();
+                if (surface1 != null) surface1.destroy();
+                throw t;
+            }
         }
 
         float fallbackUv = GUTTER / (float) pageSize;
@@ -361,6 +369,13 @@ public final class RtBlockMaterials {
             NativeImage albedo = candidate.blockSprite()
                     ? ((SpriteContentsAccessor) candidate.sprite.contents()).caustica$originalImage()
                     : resourceAlbedo;
+            // A height field is only worth a feature bit if it actually displaces something, and both
+            // degenerate fills have to be rejected. An all-255 alpha (the usual RGB normal map, whose
+            // absent channel reads as flush) leaves nothing to march, and an all-0 alpha — an RGBA
+            // normal map whose alpha was never authored — would otherwise read as every texel sitting
+            // at maximum depth and sink the whole surface. Only values strictly between the two
+            // endpoints mean the channel carries real geometry.
+            boolean hasDisplacement = false;
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
                     int i = (y * width + x) * 4;
@@ -386,6 +401,10 @@ public final class RtBlockMaterials {
                         surface1[i] = decoded.f0r();
                         surface1[i + 1] = decoded.f0g();
                         surface1[i + 2] = decoded.f0b();
+                        // surface1.a carries porosity — the other half of LabPBR's shared blue lane.
+                        // A texel encodes either porosity or SSS, never both, so this never collides
+                        // with the lane written above.
+                        surface1[i + 3] = decoded.porosity();
                     } else {
                         surface0[i] = 1.0f;
                         surface1[i] = surface1[i + 1] = surface1[i + 2] = 0.04f;
@@ -403,12 +422,22 @@ public final class RtBlockMaterials {
                         normalAo[i] = nx * 0.5f + 0.5f;
                         normalAo[i + 1] = ny * 0.5f + 0.5f;
                         normalAo[i + 2] = ARGB.blue(pixel) / 255.0f;
-                        normalAo[i + 3] = ARGB.alpha(pixel) / 255.0f;
+                        float heightMap = ARGB.alpha(pixel) / 255.0f;
+                        normalAo[i + 3] = heightMap;
+                        hasDisplacement |= heightMap > 0.0f && heightMap < 1.0f;
                     } else {
                         normalAo[i] = normalAo[i + 1] = 0.5f;
                         normalAo[i + 2] = 1.0f;
+                        // LabPBR height is a depth: byte 255 is flush with the flat surface and 0 is
+                        // 25% of a block deep. A material with no _n must therefore land on 255, not on
+                        // the 0 a zero-initialized array would give it — 0 would push the whole surface
+                        // a quarter block inward under parallax.
+                        normalAo[i + 3] = 1.0f;
                     }
                 }
+            }
+            if (hasDisplacement) {
+                candidate.features |= RtMaterialRegistry.FEATURE_HEIGHT;
             }
             RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
             RtEmissionGrid grid = null;
@@ -445,7 +474,10 @@ public final class RtBlockMaterials {
         PagePixels(int pageSize, int mipCount) {
             this.pageSize = pageSize;
             surface0 = allocate(pageSize, mipCount, 255, 0, 0, 0);
-            normalAo = allocate(pageSize, mipCount, 128, 128, 255, 0);
+            // Flat normal, full AO, and height 255 (0% depth) outside every candidate cell. The alpha
+            // matters as much as the others: the unclaimed page area is what a feature-less material
+            // samples as its fallback, and a 0 there would parallax it a quarter block inward.
+            normalAo = allocate(pageSize, mipCount, 128, 128, 255, 255);
             surface1 = allocate(pageSize, mipCount, 10, 10, 10, 0);
         }
 
@@ -511,11 +543,42 @@ public final class RtBlockMaterials {
         return sprites != null ? sprites : List.of();
     }
 
+    /** Shelf-pack every candidate into as few canonical pages as fit, setting each candidate's page. */
+    private static List<LayoutPage> layoutPages(List<Candidate> authored, int pageSize) {
+        List<LayoutPage> layouts = new ArrayList<>();
+        layouts.add(new LayoutPage(pageSize, true));
+        for (Candidate candidate : authored) {
+            boolean placed = false;
+            for (int i = 0; i < layouts.size(); i++) {
+                if (layouts.get(i).place(candidate)) {
+                    candidate.page = i;
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed) {
+                LayoutPage page = new LayoutPage(pageSize, false);
+                if (!page.place(candidate)) continue;
+                candidate.page = layouts.size();
+                layouts.add(page);
+            }
+        }
+        return layouts;
+    }
+
     private static Map<Identifier, Integer> discoverEntityMaterialResources(
             List<TextureAtlasSprite> blockSprites, RtMaterialOverrides overrides) {
         Set<Identifier> blockNames = new HashSet<>();
         for (TextureAtlasSprite sprite : blockSprites) {
             if (sprite != null) blockNames.add(sprite.contents().name());
+        }
+        // Overrides that target non-block textures by name: their textures are entity resources even
+        // when nothing else would classify them as one.
+        Set<Identifier> ruleTargeted = new HashSet<>();
+        for (RtMaterialOverrides.Rule rule : overrides.rules()) {
+            if (rule.block() == null) {
+                ruleTargeted.add(textureLocation(rule.sprite()));
+            }
         }
         Map<Identifier, Integer> result = new LinkedHashMap<>();
         Map<Identifier, Resource> authored = Minecraft.getInstance().getResourceManager().listResources(
@@ -529,6 +592,11 @@ public final class RtBlockMaterials {
             Identifier albedo = Identifier.fromNamespaceAndPath(material.getNamespace(), albedoPath);
             Identifier name = logicalTextureName(albedo);
             if (blockNames.contains(name) || !resourceExists(albedo)) continue;
+            // A _s/_n texture whose base is not a stitched block sprite only matters if it belongs to
+            // a texture the entity capture can actually render (entity/ and armor layers) or that an
+            // override rule targets; anything else is dead weight that can push the page count past
+            // capacity for no rendering benefit.
+            if (!isEntityTexturePath(albedo.getPath()) && !ruleTargeted.contains(albedo)) continue;
             result.merge(albedo, spec ? RtMaterialRegistry.FEATURE_SPEC
                     : RtMaterialRegistry.FEATURE_NORMAL, (a, b) -> a | b);
         }
@@ -547,7 +615,12 @@ public final class RtBlockMaterials {
         return result;
     }
 
-    private static Identifier sibling(Identifier name, String suffix) {
+        /** Texture path prefixes the entity capture can render LabPBR maps for. */
+        private static boolean isEntityTexturePath(String path) {
+            return path.startsWith("textures/entity/") || path.startsWith("textures/models/");
+        }
+
+        private static Identifier sibling(Identifier name, String suffix) {
         return Identifier.fromNamespaceAndPath(name.getNamespace(), "textures/" + name.getPath() + suffix);
     }
 

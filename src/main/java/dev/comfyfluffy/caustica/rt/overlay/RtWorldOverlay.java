@@ -20,7 +20,10 @@ import org.lwjgl.vulkan.VkRenderingInfo;
 import org.lwjgl.vulkan.VkViewport;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
@@ -56,6 +59,8 @@ public final class RtWorldOverlay {
     private final RtOverlayFramePool framePool = new RtOverlayFramePool();
     private final List<RtOverlayFeature> features =
             List.of(new RtGlowOutlineFeature(), new RtNameTagFeature(), new RtBlockOutlineFeature());
+    /** Features latched off after a failure; re-armed by {@link #destroy()} on the next RT teardown. */
+    private final Set<RtOverlayFeature> disabled = Collections.newSetFromMap(new IdentityHashMap<>());
     private boolean failed;
 
     // Shared world-overlay buffer every feature composites into (lazily sized to main's width/height, same
@@ -85,8 +90,15 @@ public final class RtWorldOverlay {
         try {
             List<RtOverlayFeature> ready = new ArrayList<>(features.size());
             for (RtOverlayFeature f : features) {
-                if (f.prepare(ctx, framePool, graphicsUse, main.width, main.height)) {
-                    ready.add(f);
+                if (disabled.contains(f)) {
+                    continue;
+                }
+                try {
+                    if (f.prepare(ctx, framePool, graphicsUse, main.width, main.height)) {
+                        ready.add(f);
+                    }
+                } catch (Throwable t) {
+                    disable(f, t);
                 }
             }
             if (!ready.isEmpty()) {
@@ -100,11 +112,19 @@ public final class RtWorldOverlay {
                 record(ctx, ready, targetView, main.width, main.height);
             }
         } catch (Throwable t) {
+            // A failure in the shared buffer/pipeline/composite infrastructure takes every feature
+            // down with it; individual features latch independently inside prepare/record.
             failed = true;
             CausticaMod.LOGGER.error("World overlay failed; disabling for this session", t);
         } finally {
             framePool.endFrame(ctx, graphicsUse);
         }
+    }
+
+    private void disable(RtOverlayFeature f, Throwable t) {
+        disabled.add(f);
+        CausticaMod.LOGGER.error("World overlay feature {} failed; disabling it until the next RT teardown",
+                f.getClass().getSimpleName(), t);
     }
 
     private void ensureOverlayBuffer(RtContext ctx, int width, int height) {
@@ -122,7 +142,10 @@ public final class RtWorldOverlay {
         }
         if (overlayImage == null || overlayImage.width != width || overlayImage.height != height) {
             if (overlayImage != null) {
-                overlayImage.destroy();
+                // The previous frame's composite was the last thing sampling this image; destroy only
+                // once that frame's graphics work has completed, never inline (resize can happen while
+                // a submit is still in flight).
+                ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), overlayImage::destroy);
             }
             overlayImage = ctx.createStorageImage(width, height, TARGET_FORMAT,
                     "world overlay " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
@@ -141,9 +164,22 @@ public final class RtWorldOverlay {
             endRendering(cmd);
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
+            boolean aborted = false;
             for (RtOverlayFeature f : ready) {
-                f.record(cmd, overlayView, width, height);
+                try {
+                    f.record(cmd, overlayView, width, height);
+                } catch (Throwable t) {
+                    disable(f, t);
+                    // A throw can leave the feature's rendering pass open, which poisons everything
+                    // recorded after it in this command buffer; drop this frame's overlay output
+                    // (the buffer is transient and simply never executed) rather than submit it.
+                    aborted = true;
+                    break;
+                }
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // this feature's writes visible to the next / final composite
+            }
+            if (aborted) {
+                return;
             }
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world overlay UI composite")) {
@@ -167,6 +203,8 @@ public final class RtWorldOverlay {
         for (RtOverlayFeature f : features) {
             f.destroy();
         }
+        disabled.clear();
+        failed = false;
         if (uiCompositePipeline != null && ctxRef != null) {
             uiCompositePipeline.destroy(ctxRef.vk());
             uiCompositeSet.destroy(ctxRef.vk());
@@ -179,6 +217,22 @@ public final class RtWorldOverlay {
         }
         ctxRef = null;
         framePool.destroy();
+    }
+
+    /** Latch reset for {@link #destroy()}: RT teardown re-arms every disabled feature and the shared path. */
+    public void resetFailureLatch() {
+        disabled.clear();
+        failed = false;
+    }
+
+    /**
+     * Client resources were reloaded (which re-stitches the font atlases); called from the reload path
+     * after the device has been idled, so features may drop GPU state keyed on old atlas views.
+     */
+    public void onResourceReload() {
+        for (RtOverlayFeature f : features) {
+            f.onResourceReload();
+        }
     }
 
     // ---- Recording helpers shared by features ----

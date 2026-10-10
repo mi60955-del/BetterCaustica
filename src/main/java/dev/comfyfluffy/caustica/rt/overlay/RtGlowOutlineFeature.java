@@ -44,15 +44,26 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
     private RtOverlayPipelines.ReadOnlyImageSet compositeSet;
     private RtImage maskImage;
 
-    // This frame's prepared draw data (valid between prepare() returning true and record()).
+    // This frame's prepared draw data (valid between prepare() returning true and record()). The
+    // scratch arrays are reused across frames and only grown when a frame needs more room.
     private final Matrix4f viewProj = new Matrix4f();
     private float camOffX, camOffY, camOffZ;
     private RtBuffer vbo;
     private RtBuffer ibo;
-    private int[] firstIndex;
-    private int[] indexCount;
-    private float[] colorRgba;
+    private float[] mergedVerts = new float[0];
+    private int[] mergedIdx = new int[0];
+    private int[] firstIndex = new int[0];
+    private int[] indexCount = new int[0];
+    private float[] colorRgba = new float[0];
     private int drawCount;
+
+    private static float[] ensureFloats(float[] buf, int length) {
+        return buf.length >= length ? buf : new float[length];
+    }
+
+    private static int[] ensureInts(int[] buf, int length) {
+        return buf.length >= length ? buf : new int[length];
+    }
 
     @Override
     public boolean prepare(RtContext ctx, RtOverlayFramePool pool, RtGpuExecutor.GraphicsUse graphicsUse,
@@ -74,12 +85,12 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
             totalVerts += e.verts().length / 3;
             totalIdx += e.idx().length;
         }
-        float[] mergedVerts = new float[totalVerts * 3];
-        int[] mergedIdx = new int[totalIdx];
+        mergedVerts = ensureFloats(mergedVerts, totalVerts * 3);
+        mergedIdx = ensureInts(mergedIdx, totalIdx);
         drawCount = batches.size();
-        firstIndex = new int[drawCount];
-        indexCount = new int[drawCount];
-        colorRgba = new float[drawCount * 4];
+        firstIndex = ensureInts(firstIndex, drawCount);
+        indexCount = ensureInts(indexCount, drawCount);
+        colorRgba = ensureFloats(colorRgba, drawCount * 4);
         int vOff = 0;
         int iOff = 0;
         int vBase = 0;
@@ -134,7 +145,10 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
         }
         if (maskImage == null || maskImage.width != width || maskImage.height != height) {
             if (maskImage != null) {
-                maskImage.destroy();
+                // The previous frame's passes were the last thing using this image; destroy only once
+                // that frame's graphics work has completed, never inline (resize can happen while a
+                // submit is still in flight).
+                ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), maskImage::destroy);
             }
             maskImage = ctx.createStorageImage(width, height, MASK_FORMAT,
                     "glow outline mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
@@ -152,8 +166,8 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
                 VK10.vkCmdBindIndexBuffer(cmd, ibo.handle, 0, VK10.VK_INDEX_TYPE_UINT32);
                 ByteBuffer push = stack.malloc(MASK_PUSH_BYTES);
                 viewProj.get(0, push);
+                push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
                 for (int i = 0; i < drawCount; i++) {
-                    push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
                     push.putFloat(80, colorRgba[i * 4]).putFloat(84, colorRgba[i * 4 + 1])
                             .putFloat(88, colorRgba[i * 4 + 2]).putFloat(92, colorRgba[i * 4 + 3]);
                     VK10.vkCmdPushConstants(cmd, maskPipeline.layout,

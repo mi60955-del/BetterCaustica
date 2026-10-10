@@ -47,6 +47,13 @@ public record RtMaterialDesc(
         if (source == null || emissionSource == null || emissionSummary == null) {
             throw new IllegalArgumentException("Material description enums/summary must be present");
         }
+        // Shader-side models include particle (2), which the CPU compiler never produces; keeping the
+        // CPU surface closed to it catches a mis-mapped constant at compile time rather than as noise
+        // in the traced image.
+        if (model != 0 && model != 1 && model != 3) {
+            throw new IllegalArgumentException("RtMaterialDesc model must be opaque (0), water (1) or dielectric (3): "
+                    + model);
+        }
         if (!finite01(roughness) || !finite01(metalness) || !Float.isFinite(ior) || ior <= 0.0f
                 || !finite01(transmission) || !Float.isFinite(emissionStrength) || emissionStrength < 0.0f) {
             throw new IllegalArgumentException("Invalid physical material parameters");

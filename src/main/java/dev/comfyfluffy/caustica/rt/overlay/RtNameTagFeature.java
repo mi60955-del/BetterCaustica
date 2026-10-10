@@ -14,9 +14,11 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -27,6 +29,7 @@ import net.minecraft.client.gui.font.TextRenderable;
 import net.minecraft.client.renderer.entity.EntityRenderer;
 import net.minecraft.util.ARGB;
 
+import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
@@ -62,10 +65,10 @@ final class RtNameTagFeature implements RtOverlayFeature {
     private static final int TEXT_COLOR = -2130706433; // 0x80FFFFFF
     private static final int BACKGROUND_COLOR = 0x40000000; // ~25% opaque black; vanilla's default opacity
 
-    // Generous cap on distinct font-atlas pages seen in one session (default ASCII + unicode fallback +
-    // headroom) — see SampledImageSetPool's doc for why each page needs its own descriptor set rather than
-    // one shared set rewritten per page.
-    private static final int MAX_ATLAS_PAGES = 16;
+    // Cap on distinct font-atlas pages bound at once (default ASCII + unicode fallback + modded font
+    // pages). A page beyond the cap — or one that fails to bind — degrades to that page's glyphs being
+    // skipped for the session (warned once), never to the whole name-tag pass failing.
+    private static final int MAX_ATLAS_PAGES = 64;
 
     private RtContext ctx;
     private RtOverlayPipelines.Pipeline pipeline;
@@ -73,8 +76,9 @@ final class RtNameTagFeature implements RtOverlayFeature {
     private long sampler;
 
     // One descriptor set per distinct font-atlas page, allocated once and reused across frames (a page's
-    // GpuTextureView is stable for the session — see SampledImageSetPool).
+    // GpuTextureView is stable between resource reloads — see SampledImageSetPool).
     private final Map<GpuTextureView, Long> pageSets = new IdentityHashMap<>();
+    private final Set<GpuTextureView> warnedViews = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Map<GpuTextureView, PageBuilder> pages = new IdentityHashMap<>();
     private final GlyphCapture glyphCapture = new GlyphCapture();
     private final Matrix4f pose = new Matrix4f();
@@ -82,7 +86,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
     private float camOffX, camOffY, camOffZ;
     private final List<DrawPage> drawPages = new ArrayList<>();
 
-    private record DrawPage(GpuTextureView view, RtBuffer vbo, int vertexCount) {
+    private record DrawPage(GpuTextureView view, RtBuffer vbo, int vertexCount, long descriptorSet) {
     }
 
     /** One font-atlas page's accumulated glyph quads this frame: x,y,z,u,v per vertex + a packed colour. */
@@ -129,6 +133,12 @@ final class RtNameTagFeature implements RtOverlayFeature {
             if (vertexCount == 0) {
                 continue;
             }
+            // Descriptor sets are resolved here rather than during record: an allocation failure then
+            // would poison the command buffer being recorded, while here it just skips one page.
+            long set = descriptorSetFor(e.getKey());
+            if (set == 0L) {
+                continue;
+            }
             RtBuffer vbo = pool.acquireVertex(ctx, (long) vertexCount * VERTEX_STRIDE, "name tag vbo");
             ByteBuffer buf = MemoryUtil.memByteBuffer(vbo.mapped, vertexCount * VERTEX_STRIDE).order(ByteOrder.LITTLE_ENDIAN);
             float[] posUv = b.posUv.elements();
@@ -139,7 +149,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
                 buf.putInt(ARGB.toABGR(b.colors.getInt(v))); // R8G8B8A8_UNORM memory order = ABGR-packed int
             }
             vbo.flush(0L, (long) vertexCount * VERTEX_STRIDE);
-            drawPages.add(new DrawPage(e.getKey(), vbo, vertexCount));
+            drawPages.add(new DrawPage(e.getKey(), vbo, vertexCount, set));
         }
         if (drawPages.isEmpty()) {
             return false;
@@ -168,6 +178,40 @@ final class RtNameTagFeature implements RtOverlayFeature {
                 .build(ctx, "name tag");
     }
 
+    /**
+     * The descriptor set bound to one atlas page, allocated once per view. A page that cannot be bound —
+     * the pool's fixed set count exhausted, or the view carries no Vulkan image — degrades to that page's
+     * glyphs being skipped: losing one page of text beats failing the whole pass. Returns 0 when skipped.
+     */
+    private long descriptorSetFor(GpuTextureView view) {
+        Long existing = pageSets.get(view);
+        if (existing != null) {
+            return existing;
+        }
+        if (pageSets.size() >= MAX_ATLAS_PAGES) {
+            return warnUnbindable(view, "the descriptor-set pool is exhausted");
+        }
+        long imageView = vkImageView(view);
+        if (imageView == 0L) {
+            return warnUnbindable(view, "the view has no Vulkan image");
+        }
+        try {
+            long set = imageSetPool.allocateAndBind(ctx, imageView, sampler);
+            pageSets.put(view, set);
+            return set;
+        } catch (Throwable t) {
+            return warnUnbindable(view, t.toString());
+        }
+    }
+
+    private long warnUnbindable(GpuTextureView view, String reason) {
+        if (warnedViews.add(view)) {
+            CausticaMod.LOGGER.warn("Name tag: font-atlas page {} cannot be bound ({}); its glyphs are skipped",
+                    view, reason);
+        }
+        return 0L;
+    }
+
     @Override
     public void record(VkCommandBuffer cmd, long targetView, int width, int height) {
         try (MemoryStack stack = MemoryStack.stackPush();
@@ -179,14 +223,35 @@ final class RtNameTagFeature implements RtOverlayFeature {
             push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
             VK10.vkCmdPushConstants(cmd, pipeline.layout, VK10.VK_SHADER_STAGE_VERTEX_BIT, 0, push);
             for (DrawPage page : drawPages) {
-                long set = pageSets.computeIfAbsent(page.view,
-                        v -> imageSetPool.allocateAndBind(ctx, vkImageView(v), sampler));
                 VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
-                        stack.longs(set), null);
+                        stack.longs(page.descriptorSet()), null);
                 VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(page.vbo.handle), stack.longs(0L));
                 VK10.vkCmdDraw(cmd, page.vertexCount, 1, 0, 0);
             }
             RtWorldOverlay.endRendering(cmd);
+        }
+    }
+
+    /**
+     * A resource reload re-stitches every font atlas, so per-page descriptor sets keyed on the old
+     * {@code GpuTextureView} identities would leak pool slots until the fixed-size pool starves. Runs
+     * from the reload path after the device has been idled, so dropping the pipeline (which owns the
+     * pool's layout) and the pool is safe; the next {@link #ensureResources} recreates them.
+     */
+    @Override
+    public void onResourceReload() {
+        if (ctx == null) {
+            return;
+        }
+        pageSets.clear();
+        warnedViews.clear();
+        if (pipeline != null) {
+            pipeline.destroy(ctx.vk());
+            pipeline = null;
+        }
+        if (imageSetPool != null) {
+            imageSetPool.destroy(ctx.vk());
+            imageSetPool = null;
         }
     }
 
@@ -204,6 +269,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
             imageSetPool = null;
         }
         pageSets.clear();
+        warnedViews.clear();
         if (sampler != 0L) {
             VK10.vkDestroySampler(ctx.vk(), sampler, null);
             sampler = 0L;

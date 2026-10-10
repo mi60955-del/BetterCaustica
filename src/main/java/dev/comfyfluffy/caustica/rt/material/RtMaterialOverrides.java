@@ -43,6 +43,9 @@ public final class RtMaterialOverrides {
         }
         // More-specific block+sprite rules win over sprite-wide rules. Ties use the resource identifier,
         // while the resource manager has already selected the highest-priority pack for each identifier.
+        // Winning is wholesale replacement, not field-wise merging: a block-conditional rule compiles its
+        // variants from the sprite's base description with only its own fields applied, so a sprite-wide
+        // rule's model/emission settings do not carry into a state where a block rule also matched.
         rules.sort(Comparator.comparing((Rule rule) -> rule.block() == null)
                 .thenComparing(rule -> rule.source().toString()));
         CausticaMod.LOGGER.info("RT material overrides: format={}, rules={}", FORMAT, rules.size());

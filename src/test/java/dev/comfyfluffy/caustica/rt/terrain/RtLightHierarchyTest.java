@@ -5,8 +5,11 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.concurrent.CancellationException;
 
+import static dev.comfyfluffy.caustica.rt.terrain.RtLightHierarchy.LIGHT_NOT_PRESENT;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class RtLightHierarchyTest {
     @Test
@@ -17,7 +20,7 @@ final class RtLightHierarchyTest {
         RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
                 new RtLightHierarchy.SectionInput(5, 4, 2, 1, other),
                 new RtLightHierarchy.SectionInput(2, 1, 0, 0, strongAndWeak)
-        ), 16, 0, 0, () -> false);
+        ), RtLightHierarchy.LightSpans.EMPTY, 16, 0, 0, () -> false);
 
         assertEquals(3, data.lightCount());
         assertEquals(0, data.sectionFirstLights()[2]);
@@ -42,10 +45,10 @@ final class RtLightHierarchyTest {
 
     @Test
     void lightGridAliasSpansEmbedSortedFlatLightRanges() {
-        RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
+        RtLightHierarchy.Data data = build(List.of(
                 new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f)),
                 new RtLightHierarchy.SectionInput(3, 1, 0, 0, light(1f, 1f))
-        ), 0, 0, 0, () -> false);
+        ), 0, 0, 0);
 
         RtLightGrid.Data grid = data.grid();
         int cellX = -grid.originX() / 16;
@@ -65,9 +68,9 @@ final class RtLightHierarchyTest {
 
     @Test
     void mortonOrderOverridesUnrelatedStableSlotOrder() {
-        RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
+        RtLightHierarchy.Data data = build(List.of(
                 new RtLightHierarchy.SectionInput(0, 8, 0, 0, light(1f, 1f)),
-                new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f))), 0, 0, 0, () -> false);
+                new RtLightHierarchy.SectionInput(9, 0, 0, 0, light(1f, 1f))), 0, 0, 0);
 
         assertEquals(0, data.sectionFirstLights()[9]);
         assertEquals(1, data.sectionFirstLights()[0]);
@@ -85,8 +88,8 @@ final class RtLightHierarchyTest {
     void retainedGenerationCanBeTranslatedAcrossARebase() {
         List<RtLightHierarchy.SectionInput> sections = List.of(
                 new RtLightHierarchy.SectionInput(0, 3, 0, 0, light(1f, 1f)));
-        RtLightHierarchy.Data oldGeneration = RtLightHierarchy.build(sections, 16, 0, 0, () -> false);
-        RtLightHierarchy.Data rebuiltGeneration = RtLightHierarchy.build(sections, 32, 0, 0, () -> false);
+        RtLightHierarchy.Data oldGeneration = build(sections, 16, 0, 0);
+        RtLightHierarchy.Data rebuiltGeneration = build(sections, 32, 0, 0);
 
         float oldToCurrent = oldGeneration.rebaseX() - rebuiltGeneration.rebaseX();
         assertEquals(rebuiltGeneration.packedLights()[0],
@@ -96,12 +99,80 @@ final class RtLightHierarchyTest {
     }
 
     @Test
+    void republishWithoutChangesTranslatesEveryIndexToItself() {
+        List<RtLightHierarchy.SectionInput> sections = List.of(
+                new RtLightHierarchy.SectionInput(0, 0, 0, 0, light(1f, 1f)),
+                new RtLightHierarchy.SectionInput(1, 1, 0, 0, concat(light(1f, 1f), light(1f, 2f))));
+        RtLightHierarchy.Data rebuilt = build(sections, build(sections, 0, 0, 0), 0, 0, 0);
+
+        assertArrayEquals(new int[]{0, 1, 2}, rebuilt.previousToCurrent());
+    }
+
+    @Test
+    void droppingTheLowestMortonSectionRenumbersWithoutLosingAnyRemainingEmitter() {
+        RtLightHierarchy.Data before = build(List.of(
+                new RtLightHierarchy.SectionInput(0, 0, 0, 0, concat(light(1f, 1f), light(1f, 2f))),
+                new RtLightHierarchy.SectionInput(1, 1, 0, 0, light(1f, 3f))), 0, 0, 0);
+        RtLightHierarchy.Data after = build(List.of(
+                new RtLightHierarchy.SectionInput(1, 1, 0, 0, light(1f, 3f))), before, 0, 0, 0);
+
+        // The surviving emitter moves from global index 2 to 0, so the identity mapping is already wrong.
+        assertArrayEquals(new int[]{LIGHT_NOT_PRESENT, LIGHT_NOT_PRESENT, 0}, after.previousToCurrent());
+    }
+
+    @Test
+    void reusingASlotAtAnotherAddressDoesNotClaimItsPredecessor() {
+        RtLightHierarchy.Data before = build(List.of(
+                new RtLightHierarchy.SectionInput(0, 0, 0, 0, light(1f, 1f))), 0, 0, 0);
+        RtLightHierarchy.Data after = build(List.of(
+                new RtLightHierarchy.SectionInput(0, 7, 3, 1, light(1f, 2f))), before, 0, 0, 0);
+
+        // The new geometry inherited slot 0, but it is not the emitter the previous index referred to.
+        assertArrayEquals(new int[]{LIGHT_NOT_PRESENT}, after.previousToCurrent());
+    }
+
+    @Test
     void supersededBuildStopsCooperatively() {
         List<RtLightHierarchy.SectionInput> sections = List.of(
                 new RtLightHierarchy.SectionInput(0, 0, 0, 0, light(1f, 1f)));
 
         assertThrows(CancellationException.class,
-                () -> RtLightHierarchy.build(sections, 0, 0, 0, () -> true));
+                () -> RtLightHierarchy.build(sections, RtLightHierarchy.LightSpans.EMPTY,
+                        0, 0, 0, () -> true));
+    }
+
+    private static RtLightHierarchy.Data build(List<RtLightHierarchy.SectionInput> sections,
+                                               int rebaseX, int rebaseY, int rebaseZ) {
+        return RtLightHierarchy.build(sections, RtLightHierarchy.LightSpans.EMPTY,
+                rebaseX, rebaseY, rebaseZ, () -> false);
+    }
+
+    private static RtLightHierarchy.Data build(List<RtLightHierarchy.SectionInput> sections,
+                                               RtLightHierarchy.Data previousGeneration,
+                                               int rebaseX, int rebaseY, int rebaseZ) {
+        return RtLightHierarchy.build(sections, previousGeneration.spans(),
+                rebaseX, rebaseY, rebaseZ, () -> false);
+    }
+
+    /**
+     * The table has to reach the shader in the same arena as the records it indexes, so it must be placed
+     * after them and the generation's total size has to account for it.
+     */
+    @Test
+    void translationTableExtendsTheArenaWithoutOverlappingTheRecords() {
+        List<RtLightHierarchy.SectionInput> sections = List.of(
+                new RtLightHierarchy.SectionInput(0, 0, 0, 0, concat(light(1f, 1f), light(1f, 2f))),
+                new RtLightHierarchy.SectionInput(1, 1, 0, 0, light(1f, 3f)));
+        RtLightHierarchy.Data first = build(sections, 0, 0, 0);
+        RtLightHierarchy.Data again = build(sections, first, 0, 0, 0);
+        RtLightGridManager.Layout empty = RtLightGridManager.Layout.of(first, first.grid() != null);
+        RtLightGridManager.Layout filled = RtLightGridManager.Layout.of(again, again.grid() != null);
+
+        assertEquals(3, again.previousToCurrent().length);
+        assertTrue(filled.translationOffset() >= empty.lightOffset() + again.lightBytes());
+        long tableBytes = (3L * Integer.BYTES + 15L) & ~15L;
+        assertEquals(tableBytes, filled.totalBytes() - empty.totalBytes());
+        assertTrue(filled.totalBytes() >= filled.translationOffset() + 3L * Integer.BYTES);
     }
 
     private static float[] light(float area, float radiance) {

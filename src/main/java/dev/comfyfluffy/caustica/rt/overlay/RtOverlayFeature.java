@@ -6,7 +6,7 @@ import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 
 /**
- * One world-space overlay effect (glow outline today; block outline, nametags, leash planned) rendered by
+ * One world-space overlay effect (entity glow, name tags, block outline) rendered by
  * {@link RtWorldOverlay} at the post-upscale seam. Implementations create their pipelines through
  * {@link RtOverlayPipelines} (reusing an existing vertex-format/blend combination where one fits) and take
  * per-frame vertex scratch from the shared {@link RtOverlayFramePool} — never own one-off pools.
@@ -37,4 +37,12 @@ public interface RtOverlayFeature {
 
     /** Destroy GPU resources (device is idle); must tolerate never-prepared and repeated calls. */
     void destroy();
+
+    /**
+     * Client resources were reloaded (F3+T, resource pack change), which can re-stitch texture atlases
+     * this feature holds GPU state against. Called after the device has been idled, so implementations
+     * may destroy and lazily recreate state keyed on old resource identities.
+     */
+    default void onResourceReload() {
+    }
 }

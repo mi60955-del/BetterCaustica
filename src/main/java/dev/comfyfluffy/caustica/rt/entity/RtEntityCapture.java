@@ -41,9 +41,21 @@ public final class RtEntityCapture implements VertexConsumer {
     // submitModel, so body + feature layers get their own texture). Stored per-prim in tint.w;
     // the hit shader samples entityAlbedoTex[texSlot].
     int currentTexSlot;
+    // Second bindless slot for submissions whose vanilla pipeline composites two textures. The end portal
+    // and gateway sum a stack of animated layers sampled from Sampler1 on top of a base sampled from
+    // Sampler0, so one slot cannot describe the surface. Written to the prim's aux1 lane as
+    // {@code layerSlot | (layerCount << 16)}; 0 means "no second texture", and the hit shader reads it only
+    // for prims flagged ENTITY_PRIM_END_PORTAL.
+    int currentLayerTexSlot;
     // Canonical MaterialHeader ID for this submission. Entity, block-entity and block-atlas geometry all
     // use the same table; albedo remains a separate bindless slot in tint.w.
     int currentMaterialId;
+    // Per-primitive emission strength for the current submission. Zero for anything the tracer should
+    // light; the collector raises it for submissions whose vanilla pipeline carries no lighting term, so
+    // their authored colour is emitted rather than re-lit.
+    float currentEmission;
+    // ENTITY_PRIM_* bits for the current submission's triangles; the hit shader reads them per primitive.
+    int currentPrimFlags;
     // Conservative default: unknown submissions retain alpha testing instead of incorrectly becoming
     // opaque. RtEntityCollector assigns this from the RenderPipeline before every known submission.
     int currentAlphaBucket = RtAccel.ENTITY_BUCKET_ANY_HIT;
@@ -81,7 +93,10 @@ public final class RtEntityCapture implements VertexConsumer {
         ensureVertexCapacity(expectedVertices);
         n = 0;
         currentTexSlot = 0;
+        currentLayerTexSlot = 0;
         currentMaterialId = 0;
+        currentEmission = 0f;
+        currentPrimFlags = 0;
         currentAlphaBucket = RtAccel.ENTITY_BUCKET_ANY_HIT;
         currentOrder = 0;
         uvRemap = false;
@@ -134,7 +149,10 @@ public final class RtEntityCapture implements VertexConsumer {
     /** Copy the per-submission material/UV state into a second capture used by the parity harness. */
     void copySubmissionStateTo(RtEntityCapture target) {
         target.currentTexSlot = currentTexSlot;
+        target.currentLayerTexSlot = currentLayerTexSlot;
         target.currentMaterialId = currentMaterialId;
+        target.currentEmission = currentEmission;
+        target.currentPrimFlags = currentPrimFlags;
         target.currentAlphaBucket = currentAlphaBucket;
         target.currentOrder = currentOrder;
         target.uvRemap = uvRemap;
@@ -305,7 +323,7 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     private void emitQuad() {
-        appendQuad(qx, qy, qz, null, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false, 0f);
+        appendQuad(qx, qy, qz, null, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false, currentEmission);
     }
 
     /**
@@ -390,6 +408,9 @@ public final class RtEntityCapture implements VertexConsumer {
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);
         float tg = ((c >> 8) & 0xFF) * (1f / 255f);
         float tb = (c & 0xFF) * (1f / 255f);
+        // Vanilla carries some surfaces' transparency in the vertex colour's alpha byte rather than in the
+        // texture — the beacon beam's glow layer is entirely opaque in its atlas and translucent only here.
+        float ta = ((c >>> 24) & 0xFF) * (1f / 255f);
         for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
             prim.add(nx);
             prim.add(ny);
@@ -400,9 +421,9 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tb);
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot
             prim.add(Float.intBitsToFloat(currentMaterialId));
-            prim.add(0f); // flags
-            prim.add(0f); // aux0
-            prim.add(0f); // aux1
+            prim.add(Float.intBitsToFloat(currentPrimFlags)); // flags
+            prim.add(ta); // aux0 = captured vertex alpha, read back with asfloat
+            prim.add(Float.intBitsToFloat(currentLayerTexSlot)); // aux1 = layer texture slot, read as uint
             alphaBuckets.add(currentAlphaBucket);
         }
     }

@@ -59,7 +59,7 @@ final class RtLightGridManager {
             throw new IllegalStateException(
                     "RtLightGridManager.request() called while a generation is still in flight");
         }
-        Input input = new Input(List.copyOf(sections), rebaseX, rebaseY, rebaseZ);
+        Input input = new Input(List.copyOf(sections), published.spans, rebaseX, rebaseY, rebaseZ);
         long requestId;
         synchronized (buildLock) {
             requestId = ++latestRequest;
@@ -142,6 +142,7 @@ final class RtLightGridManager {
     private void runWorker(Request request) {
         try {
             RtLightHierarchy.Data data = RtLightHierarchy.build(request.input.sections,
+                    request.input.previous,
                     request.input.rebaseX, request.input.rebaseY, request.input.rebaseZ,
                     () -> !isLatest(request.requestId));
             if (isLatest(request.requestId)) {
@@ -199,6 +200,11 @@ final class RtLightGridManager {
                     cursor += 16;
                 }
             }
+            cursor = upload.mapped + layout.translationOffset;
+            for (int translated : data.previousToCurrent()) {
+                MemoryUtil.memPutInt(cursor, translated);
+                cursor += 4;
+            }
             upload.flush();
 
             RtBuffer submittedUpload = upload;
@@ -254,7 +260,8 @@ final class RtLightGridManager {
     private void publish(RtContext ctx, Uploaded uploaded) {
         RtLightGrid.Data grid = uploaded.layout.hasGrid ? uploaded.data.grid() : null;
         PublishedState next = new PublishedState(uploaded.arena, uploaded.layout,
-                uploaded.data.lightCount(), uploaded.data.invGlobalPowerSum(),
+                uploaded.data.lightCount(), uploaded.data.previousToCurrent().length,
+                uploaded.data.invGlobalPowerSum(), uploaded.data.spans(),
                 grid != null ? grid.originX() : 0, grid != null ? grid.originY() : 0,
                 grid != null ? grid.originZ() : 0, grid != null ? grid.dimX() : 0,
                 grid != null ? grid.dimY() : 0, grid != null ? grid.dimZ() : 0,
@@ -276,7 +283,29 @@ final class RtLightGridManager {
                     uploaded.requestId, uploaded.data.lightCount(), uploaded.data.sectionFirstLights().length,
                     grid != null ? grid.spanFirstLights().length : 0,
                     (uploaded.layout.totalBytes + 1023L) >> 10);
+            logIndexTranslation(uploaded.requestId, uploaded.data);
         }
+    }
+
+    /**
+     * How much of the previous generation's light indexing survived this rebuild — the cost a temporal
+     * reservoir reuse would pay per republish, and whether translating is cheaper than resetting.
+     */
+    private static void logIndexTranslation(long requestId, RtLightHierarchy.Data data) {
+        int[] table = data.previousToCurrent();
+        if (table.length == 0) return;
+        int carried = 0;
+        int relocated = 0;
+        for (int i = 0; i < table.length; i++) {
+            int to = table[i];
+            if (to == RtLightHierarchy.LIGHT_NOT_PRESENT) continue;
+            carried++;
+            if (to != i) relocated++;
+        }
+        CausticaMod.LOGGER.info(
+                "RT light index translation {}: {} -> {} lights / {} carried ({} relocated, {} stable) / {} gone",
+                requestId, table.length, data.lightCount(), carried, relocated, carried - relocated,
+                table.length - carried);
     }
 
     private static void dumpNearbyLights(RtLightHierarchy.Data data) {
@@ -363,21 +392,23 @@ final class RtLightGridManager {
     }
 
     private record Input(List<RtLightHierarchy.SectionInput> sections,
+                         RtLightHierarchy.LightSpans previous,
                          int rebaseX, int rebaseY, int rebaseZ) { }
 
-    record PublishedState(RtBuffer arena, Layout layout, int lightCount,
-                          float invGlobalPowerSum,
+    record PublishedState(RtBuffer arena, Layout layout, int lightCount, int translationCount,
+                          float invGlobalPowerSum, RtLightHierarchy.LightSpans spans,
                           int originX, int originY, int originZ, int dimX, int dimY, int dimZ,
                           int rebaseX, int rebaseY, int rebaseZ, long generation) {
         private static final PublishedState EMPTY = empty(0L);
 
         private static PublishedState empty(long generation) {
             return new PublishedState(
-                    null, Layout.EMPTY, 0, 0.0f,
+                    null, Layout.EMPTY, 0, 0, 0.0f, RtLightHierarchy.LightSpans.EMPTY,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, generation);
         }
 
         long lightAddress() { return address(layout.lightOffset); }
+        long translationAddress() { return address(layout.translationOffset); }
         long globalAliasAddress() { return address(layout.globalAliasOffset); }
         long localAliasAddress() { return layout.hasGrid ? address(layout.localAliasOffset) : 0L; }
         long cellAddress() { return layout.hasGrid ? address(layout.cellOffset) : 0L; }
@@ -399,8 +430,9 @@ final class RtLightGridManager {
     }
 
     record Layout(long lightOffset, long globalAliasOffset, long localAliasOffset,
-                  long cellOffset, long spanOffset, long totalBytes, boolean hasGrid) {
-        private static final Layout EMPTY = new Layout(0, 0, 0, 0, 0, 0, false);
+                  long cellOffset, long spanOffset, long translationOffset,
+                  long totalBytes, boolean hasGrid) {
+        private static final Layout EMPTY = new Layout(0, 0, 0, 0, 0, 0, 0, false);
 
         static Layout of(RtLightHierarchy.Data data, boolean includeGrid) {
             long cursor = 0L;
@@ -417,7 +449,13 @@ final class RtLightGridManager {
                 spans = cursor;
                 cursor = align16(Math.addExact(cursor, data.grid().spanBytes()));
             }
-            return new Layout(lights, globalAliases, localAliases, cells, spans, cursor, includeGrid);
+            // Uploaded alongside the light records so a shader can never observe a new buffer under an
+            // older table: both arrive in one arena and become visible in one publication.
+            long translation = cursor;
+            cursor = align16(Math.addExact(cursor, Math.multiplyExact((long) data.previousToCurrent().length,
+                    Integer.BYTES)));
+            return new Layout(lights, globalAliases, localAliases, cells, spans, translation,
+                    cursor, includeGrid);
         }
 
         private static long align16(long value) {

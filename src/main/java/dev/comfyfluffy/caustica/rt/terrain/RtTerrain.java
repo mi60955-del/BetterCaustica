@@ -183,6 +183,8 @@ public final class RtTerrain {
     private final RtLightGridManager lightGrid = new RtLightGridManager();
     /** Sorted light-only snapshot, updated with section publication instead of rescanning all geometry. */
     private final TreeMap<Integer, RtLightHierarchy.SectionInput> lightSections = new TreeMap<>();
+    // Light generation the last traced frame used, so a translation table is consumed once per republish.
+    private long lastTracedLightGeneration = -1L;
     private boolean lightHierarchyDirty;
     private long lastLightHierarchyRequestNanos;
     private boolean windowValid;
@@ -247,6 +249,28 @@ public final class RtTerrain {
 
     public long lightLocalAliasBufferAddress() {
         return lightGrid.published().localAliasAddress();
+    }
+
+    /** previous-frame light index -> current-frame index table, or 0 while nothing is published. */
+    public long lightTranslationAddress() {
+        return lightGrid.published().translationAddress();
+    }
+
+    /** Entries in {@link #lightTranslationAddress()}, i.e. the previous generation's light count. */
+    public int lightTranslationCount() {
+        return lightGrid.published().translationCount();
+    }
+
+    /**
+     * Whether this frame's table describes a real transition. It must be consulted exactly once per
+     * traced frame: the first call after a republish consumes that transition, and every later frame
+     * reports false because the stored history indices were already written against this generation.
+     */
+    public boolean lightTranslationApplies() {
+        long generation = lightGrid.published().generation();
+        boolean applies = generation != lastTracedLightGeneration;
+        lastTracedLightGeneration = generation;
+        return applies;
     }
 
     public float lightInvGlobalPowerSum() {

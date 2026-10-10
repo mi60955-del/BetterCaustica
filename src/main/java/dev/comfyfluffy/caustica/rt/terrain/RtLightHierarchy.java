@@ -1,6 +1,9 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.CancellationException;
@@ -12,6 +15,9 @@ import java.util.function.BooleanSupplier;
  * GPU records contain only selection data.
  */
 final class RtLightHierarchy {
+    /** Table entry for a previous-generation light that the current generation does not contain. */
+    static final int LIGHT_NOT_PRESENT = -1;
+
     static final int SOURCE_FLOATS_PER_LIGHT = RtLightCollector.FLOATS_PER_LIGHT;
     /**
      * 8 floats / 32 B per GPU record: {@code {pos.xyz, packedLe} {halfU.xy, halfU.z|halfV.x, halfV.yz,
@@ -35,7 +41,8 @@ final class RtLightHierarchy {
         return Float.intBitsToFloat(bits);
     }
 
-    static Data build(List<SectionInput> sections, int rebaseX, int rebaseY, int rebaseZ,
+    static Data build(List<SectionInput> sections, LightSpans previous,
+                      int rebaseX, int rebaseY, int rebaseZ,
                       BooleanSupplier cancelled) {
         List<SectionInput> orderedSections = orderedSections(sections, cancelled);
         int sectionCapacity = 0;
@@ -59,6 +66,10 @@ final class RtLightHierarchy {
 
         int lightIndex = 0;
         double globalPower = 0.0;
+        long[] spanKeys = new long[orderedSections.size()];
+        int[] spanFirstLights = new int[orderedSections.size()];
+        int[] spanLightCounts = new int[orderedSections.size()];
+        int spanCount = 0;
         for (int sectionIndex = 0; sectionIndex < orderedSections.size(); sectionIndex++) {
             if ((sectionIndex & 63) == 0) checkCancelled(cancelled);
             SectionInput section = orderedSections.get(sectionIndex);
@@ -113,6 +124,13 @@ final class RtLightHierarchy {
             }
             sectionFirstLights[section.sectionSlot] = first;
             sectionLightCounts[section.sectionSlot] = count;
+            if (count > 0) {
+                spanKeys[spanCount] = RtTerrain.sectionKey(section.sectionX, section.sectionY,
+                        section.sectionZ);
+                spanFirstLights[spanCount] = first;
+                spanLightCounts[spanCount] = count;
+                spanCount++;
+            }
             if (sectionPower > 0.0) {
                 gridSections.add(new RtLightGrid.SectionLights(first, count,
                         section.sectionX, section.sectionY, section.sectionZ, sectionPower));
@@ -159,11 +177,47 @@ final class RtLightHierarchy {
                 packedLights[destination] = Float.intBitsToFloat(flags | x | (y << 10) | (z << 20));
             }
         }
+        LightSpans current = new LightSpans(Arrays.copyOf(spanKeys, spanCount),
+                Arrays.copyOf(spanFirstLights, spanCount), Arrays.copyOf(spanLightCounts, spanCount),
+                totalLights);
         return new Data(packedLights, globalAliases,
                 sectionFirstLights, sectionLightCounts,
                 new AliasData(localAliasIndices, localAliasAccept), grid, totalLights,
                 globalPower > 0.0 ? (float) (1.0 / globalPower) : 0.0f,
-                rebaseX, rebaseY, rebaseZ);
+                rebaseX, rebaseY, rebaseZ, current,
+                translateIndices(previous, current, cancelled));
+    }
+
+    /**
+     * previous light index -> current light index, for a generation that has just been repacked.
+     *
+     * <p>Matching is per section and then positional within it: a section's collector output is a
+     * deterministic walk over its own prims, so two generations that agree on a section agree on its
+     * local order. Sections absent from either side contribute {@link #LIGHT_NOT_PRESENT} entries, and
+     * only the shorter of the two local ranges is carried.
+     */
+    private static int[] translateIndices(LightSpans previous, LightSpans current,
+                                          BooleanSupplier cancelled) {
+        if (previous.totalLights == 0) return new int[0];
+        Long2IntOpenHashMap spanBySection = new Long2IntOpenHashMap(current.sectionKeys.length);
+        spanBySection.defaultReturnValue(-1);
+        for (int i = 0; i < current.sectionKeys.length; i++) {
+            spanBySection.put(current.sectionKeys[i], i);
+        }
+        int[] table = new int[previous.totalLights];
+        Arrays.fill(table, LIGHT_NOT_PRESENT);
+        for (int s = 0; s < previous.sectionKeys.length; s++) {
+            if ((s & 255) == 0) checkCancelled(cancelled);
+            int match = spanBySection.get(previous.sectionKeys[s]);
+            if (match < 0) continue;
+            int shared = Math.min(previous.lightCounts[s], current.lightCounts[match]);
+            int from = previous.firstLights[s];
+            int to = current.firstLights[match];
+            for (int i = 0; i < shared; i++) {
+                table[from + i] = to + i;
+            }
+        }
+        return table;
     }
 
     private static int lightCount(float[] lights) {
@@ -321,6 +375,17 @@ final class RtLightHierarchy {
         }
     }
 
+    /**
+     * Global light-index ranges of one generation, keyed by section world coordinates. The coordinates
+     * carry the identity rather than {@code SectionInput.sectionSlot}: GPU section slots are recycled
+     * when a section unloads, so a slot number can name a different place in the world across two
+     * generations. Coordinates are also rebase-invariant — a rebase shifts only the rebased positions
+     * written into the packed records.
+     */
+    record LightSpans(long[] sectionKeys, int[] firstLights, int[] lightCounts, int totalLights) {
+        static final LightSpans EMPTY = new LightSpans(new long[0], new int[0], new int[0], 0);
+    }
+
     record AliasData(int[] aliasIndices, float[] accept) {
         long bytes() {
             return Math.multiplyExact((long) aliasIndices.length, 8L);
@@ -331,7 +396,8 @@ final class RtLightHierarchy {
                 int[] sectionFirstLights, int[] sectionLightCounts,
                 AliasData localAliases, RtLightGrid.Data grid, int lightCount,
                 float invGlobalPowerSum,
-                int rebaseX, int rebaseY, int rebaseZ) {
+                int rebaseX, int rebaseY, int rebaseZ,
+                LightSpans spans, int[] previousToCurrent) {
         long lightBytes() {
             return Math.multiplyExact((long) packedLights.length, Float.BYTES);
         }

@@ -26,6 +26,13 @@ final class RtMaterialTextureData {
     private RtMaterialTextureData() {
     }
 
+    /**
+     * One canonical material level. The channel layout is shared verbatim with the page textures and
+     * the shader that samples them, so it is the single place to read it off:
+     * {@code surface0 = (roughness, metalness, emission, sss)},
+     * {@code normalAo = (nx, ny, ao, LabPBR height)},
+     * {@code surface1 = (f0.r, f0.g, f0.b, porosity)}.
+     */
     record Level(int width, int height, float[] surface0, float[] normalAo, float[] surface1) {
         Level {
             int values = Math.multiplyExact(Math.multiplyExact(width, height), CHANNELS);
@@ -49,6 +56,10 @@ final class RtMaterialTextureData {
      * Reduce already-decoded physical channels. Emission is energy-averaged, normals are averaged then
      * renormalized, and lost normal length raises roughness so distant normal detail does not become a
      * falsely smooth surface. Roughness is linear (GGX alpha) throughout — see {@link RtLabPbr}.
+     *
+     * <p>Porosity and SSS share LabPBR's blue lane but not a channel here: porosity stays on
+     * {@code surface1.a} while SSS stays on {@code surface0.a}, so both average independently and a mip
+     * that straddles the byte-64 split keeps the mix of the two its texels actually carry.
      */
     static Level reduce(Level src) {
         int width = Math.max(1, (src.width + 1) / 2);
@@ -61,7 +72,7 @@ final class RtMaterialTextureData {
                 float alphaSum = 0.0f;
                 float metal = 0.0f, emission = 0.0f, sss = 0.0f;
                 float nx = 0.0f, ny = 0.0f, nz = 0.0f, ao = 0.0f, heightValue = 0.0f;
-                float f0r = 0.0f, f0g = 0.0f, f0b = 0.0f, transmission = 0.0f;
+                float f0r = 0.0f, f0g = 0.0f, f0b = 0.0f, porosity = 0.0f;
                 int samples = 0;
                 for (int oy = 0; oy < 2; oy++) {
                     int sy = y * 2 + oy;
@@ -87,7 +98,7 @@ final class RtMaterialTextureData {
                         f0r += src.surface1[si];
                         f0g += src.surface1[si + 1];
                         f0b += src.surface1[si + 2];
-                        transmission += src.surface1[si + 3];
+                        porosity += src.surface1[si + 3];
                         samples++;
                     }
                 }
@@ -118,7 +129,7 @@ final class RtMaterialTextureData {
                 surface1[di] = clamp01(f0r * inv);
                 surface1[di + 1] = clamp01(f0g * inv);
                 surface1[di + 2] = clamp01(f0b * inv);
-                surface1[di + 3] = clamp01(transmission * inv);
+                surface1[di + 3] = clamp01(porosity * inv);
             }
         }
         return new Level(width, height, surface0, normalAo, surface1);

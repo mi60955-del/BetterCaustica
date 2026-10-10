@@ -72,9 +72,10 @@ final class RtLightCollector {
 
     /**
      * Collect one geometry bucket's emissive quads into {@code out} (packed light records,
-     * section-local) and stamp NEE membership into the bucket's prim records in place. Only the opaque
-     * and cutout buckets can emit: glass is shaded with zero emission and water never emits (lava lives
-     * in the opaque bucket).
+     * section-local) and stamp NEE membership into the bucket's prim records in place. Called for the
+     * opaque, cutout and translucent buckets — a translucent quad carries its own block light (the nether
+     * portal is level 11) and {@code world.rchit} shades it. Water never emits; lava lives in the opaque
+     * bucket.
      */
     static void collectBucket(FloatArrayList out, FloatArrayList verts, FloatArrayList prim,
                               FloatArrayList cornerUv, TextureAtlasSprite[] sprites,

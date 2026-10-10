@@ -57,6 +57,10 @@ public final class RtEntityTextures {
     // lets those dead identities be collected instead of accumulating; stable singletons (zombie.png, …)
     // stay cached and skip the costly RenderType.prepare().
     private final Map<RenderType, Long> viewCache = new WeakHashMap<>();
+    // RenderType → the image view of its SECOND texture (Sampler1). The end portal and the end gateway
+    // composite a layer stack from it (rendertype_end_portal.fsh), so a surface that looks like one
+    // texture to the primary slot really needs two bound to be reproduced.
+    private final Map<RenderType, Long> layerViewCache = new WeakHashMap<>();
     private final Map<RenderType, Identifier> locationCache = new WeakHashMap<>();
     // Resolved image-view handle → bindless slot. The slot identifies a *texture*, not a RenderType, so
     // many render types that differ only by a texture transform we don't replicate (the swirl's scroll)
@@ -75,7 +79,7 @@ public final class RtEntityTextures {
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
     // 1x1 solid-white DynamicTexture for untextured geometry (leash/line ribbons); see whiteSlot().
-    private static final Identifier WHITE_LOCATION = Identifier.fromNamespaceAndPath("caustica", "rt_white");
+    private static final Identifier WHITE_LOCATION = Identifier.fromNamespaceAndPath("bettercaustica", "rt_white");
     private boolean whiteRegistered;
 
     // Cached RenderSetup.TextureBinding#location() (the class is package-private, the method public).
@@ -97,6 +101,24 @@ public final class RtEntityTextures {
             return 0;
         }
         return slotForView(resolveView(renderType));
+    }
+
+    /**
+     * The bindless slot of {@code renderType}'s second texture ({@code Sampler1}), or 0 when it binds
+     * none. {@link #slotFor} deliberately resolves only the primary texture, which is right for every
+     * surface that is shaded from one image; the end portal's layer stack is the case that needs the
+     * other one, and the hit shader reads this slot from the prim's aux1 lane.
+     */
+    public int layerSlotFor(RenderType renderType) {
+        if (renderType == null) {
+            return 0;
+        }
+        Long cached = layerViewCache.get(renderType);
+        long view = cached != null ? cached : resolveNamedView(renderType, "Sampler1");
+        if (cached == null) {
+            layerViewCache.put(renderType, view);
+        }
+        return view == 0L ? 0 : slotForView(view);
     }
 
     /** Canonical material ID for a full entity texture, or the neutral runtime-texture fallback. */
@@ -195,6 +217,7 @@ public final class RtEntityTextures {
     public void reset(int descriptorCapacity) {
         capacity = Math.max(1, descriptorCapacity);
         viewCache.clear();
+        layerViewCache.clear();
         locationCache.clear();
         viewSlotCache.clear();
         atlasSlotCache.clear();
@@ -280,6 +303,23 @@ public final class RtEntityTextures {
         }
         viewCache.put(renderType, handle);
         return handle;
+    }
+
+    /** The Vulkan image-view handle of one named sampler of {@code renderType}, or 0 if it binds none. */
+    private long resolveNamedView(RenderType renderType, String samplerName) {
+        try {
+            for (PreparedRenderType.Texture t : renderType.prepare().textures()) {
+                if (samplerName.equals(t.name())) {
+                    return vkImageView(t.textureView());
+                }
+            }
+        } catch (Throwable t) {
+            if (!loggedFailure) {
+                loggedFailure = true;
+                CausticaMod.LOGGER.warn("RT {} resolution failed for {}", samplerName, renderType, t);
+            }
+        }
+        return 0L;
     }
 
     private static long vkImageView(GpuTextureView view) {

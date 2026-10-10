@@ -1,10 +1,10 @@
 package dev.comfyfluffy.caustica.rt.material;
 
 /**
- * CPU reference decoder for the LabPBR 1.3 specular texture. Runtime shading currently performs the
- * same decode in {@code world.rchit.slang}; keeping the source-format rules here gives the material
- * compiler and its tests one deterministic implementation to use when LabPBR is canonicalized before
- * upload.
+ * CPU decoder for the LabPBR 1.3 specular texture — the implementation {@link RtBlockMaterials} runs at
+ * pack load to canonicalize materials before upload. Runtime shading performs the same decode inline in
+ * {@code world.rchit.slang}; the two implementations must stay in agreement, since only the tests pin
+ * this one down.
  */
 public final class RtLabPbr {
     private RtLabPbr() {
@@ -64,8 +64,14 @@ public final class RtLabPbr {
         float a = clamp01(alpha) * 255.0f;
         float emission = a < 254.5f ? a / 254.0f : 0.0f;
         float b = clamp01(blue) * 255.0f;
+        // Blue is one mutually exclusive lane split at byte 64: 0..64 is porosity (how much water the
+        // surface absorbs, which darkens and smooths it while wet) and 65..255 is subsurface scattering.
+        // A texel encodes exactly one of them, so both values are decoded from the same byte and at any
+        // texel at most one is non-zero. Nothing shifts or scales subsequently: both are linear, and the
+        // byte ranges already have zero at their own endpoints (65 is 0% scattering, not 1/190).
+        float porosity = b <= 64.5f ? b / 64.0f : 0.0f;
         float sss = b > 64.5f ? (b - 65.0f) / 190.0f : 0.0f;
-        return new Specular(roughness, metalness, f0r, f0g, f0b, emission, sss);
+        return new Specular(roughness, metalness, f0r, f0g, f0b, emission, sss, porosity);
     }
 
     private static float metalF0(int metal, int channel) {
@@ -80,8 +86,14 @@ public final class RtLabPbr {
         return Math.max(0.0f, Math.min(1.0f, value));
     }
 
+    /**
+     * @param roughness linear GGX alpha (already LabPBR's (1 - perceptualSmoothness)²)
+     * @param emission  0..1 linear, 0 when the author asked for no emission (alpha 255)
+     * @param sss       0..1 linear subsurface scattering, 0 unless the blue byte is in 65..255
+     * @param porosity  0..1 linear water absorption, 0 unless the blue byte is in 0..64
+     */
     public record Specular(float roughness, float metalness,
                            float f0r, float f0g, float f0b,
-                           float emission, float sss) {
+                           float emission, float sss, float porosity) {
     }
 }

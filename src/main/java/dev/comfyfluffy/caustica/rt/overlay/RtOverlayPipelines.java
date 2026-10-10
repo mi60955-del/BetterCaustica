@@ -56,7 +56,7 @@ import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.OVERLAY_TLAS;
  * Blaze3D device bring-up) with one colour attachment, no depth, dynamic viewport/scissor.
  */
 public final class RtOverlayPipelines {
-    private static final String SHADER_DIR = "/caustica/shaders/pipelines/";
+    private static final String SHADER_DIR = "/bettercaustica/shaders/pipelines/";
 
     private RtOverlayPipelines() {
     }
@@ -246,7 +246,7 @@ public final class RtOverlayPipelines {
                 // layer has drawn onto it, even though every individual source is straight. Alpha channel
                 // correctly accumulates (outA = srcA + dstA*(1-srcA)) rather than preserving whatever was
                 // already there (srcAlphaFactor=ZERO/dstAlphaFactor=ONE would silently discard every
-                // feature's alpha contribution — bit us once already, see memory).
+                // feature's alpha contribution).
                 blendAttach.get(0).blendEnable(true)
                         .srcColorBlendFactor(VK10.VK_BLEND_FACTOR_SRC_ALPHA)
                         .dstColorBlendFactor(VK10.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA)
@@ -335,7 +335,6 @@ public final class RtOverlayPipelines {
         public final long layout;
         private final long pool;
         public final long set;
-        private long boundView;
 
         private ReadOnlyImageSet(long layout, long pool, long set) {
             this.layout = layout;
@@ -343,11 +342,16 @@ public final class RtOverlayPipelines {
             this.set = set;
         }
 
-        /** Point the overlay image binding at {@code view} (GENERAL layout); no-op when already bound. */
+        /**
+         * Point the overlay image binding at {@code view} (GENERAL layout).
+         *
+         * <p>Always writes. Skipping on a matching handle is not safe here: these sets are bound to images
+         * the owning feature destroys and recreates on a resize, and a destroyed {@code VkImageView} handle
+         * can be handed straight back for a different image — most easily the neighbouring MSAA target, which
+         * is not a valid single-sampled source. The descriptor would then keep reading the old, now
+         * unrelated object, and the composite would draw whatever memory got recycled into it.
+         */
         public void bind(RtContext ctx, long view) {
-            if (boundView == view) {
-                return;
-            }
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
                 info.get(0).imageView(view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
@@ -356,7 +360,6 @@ public final class RtOverlayPipelines {
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE).pImageInfo(info);
                 VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
             }
-            boundView = view;
         }
 
         public void destroy(VkDevice vk) {
@@ -395,88 +398,19 @@ public final class RtOverlayPipelines {
     }
 
     /**
-     * A single combined-image-sampler descriptor set (binding 0) — for overlay passes that sample a real
-     * texture (e.g. a font atlas page) rather than reading a mod-owned storage image. Same {@code
-     * VK_IMAGE_LAYOUT_GENERAL} convention as every other sampled-image binding in this codebase (Blaze3D
-     * keeps its own textures in GENERAL too — see {@code RtEntityTextures}/{@code RtPipeline}'s bindless
-     * texture arrays, which bind vanilla-owned atlases the same way).
-     */
-    public static final class SampledImageSet {
-        public final long layout;
-        private final long pool;
-        public final long set;
-        private long boundView;
-
-        private SampledImageSet(long layout, long pool, long set) {
-            this.layout = layout;
-            this.pool = pool;
-            this.set = set;
-        }
-
-        /** Point binding 0 at {@code view}, sampled with {@code sampler}; no-op when already bound. */
-        public void bind(RtContext ctx, long view, long sampler) {
-            if (boundView == view) {
-                return;
-            }
-            try (MemoryStack stack = MemoryStack.stackPush()) {
-                VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
-                info.get(0).sampler(sampler).imageView(view).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
-                VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(1, stack);
-                writes.get(0).sType$Default().dstSet(set).dstBinding(OVERLAY_SAMPLER)
-                        .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
-                VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
-            }
-            boundView = view;
-        }
-
-        public void destroy(VkDevice vk) {
-            VK10.vkDestroyDescriptorPool(vk, pool, null);
-            VK10.vkDestroyDescriptorSetLayout(vk, layout, null);
-        }
-    }
-
-    public static SampledImageSet sampledImageSet(RtContext ctx, int stageFlags, String label) {
-        VkDevice vk = ctx.vk();
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            LongBuffer p = stack.mallocLong(1);
-            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(1, stack);
-            binds.get(0).binding(OVERLAY_SAMPLER).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    .descriptorCount(1).stageFlags(stageFlags);
-            VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
-            check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout(" + label + ")");
-            long dsl = p.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
-
-            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(1);
-            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(1).pPoolSizes(poolSizes);
-            check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(" + label + ")");
-            long pool = p.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, label + " descriptor pool");
-
-            VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl));
-            LongBuffer pSet = stack.mallocLong(1);
-            check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet), "vkAllocateDescriptorSets(" + label + ")");
-            long set = pSet.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, set, label + " descriptor set");
-            return new SampledImageSet(dsl, pool, set);
-        }
-    }
-
-    /**
      * A pool of combined-image-sampler descriptor sets sharing one layout — for overlay passes that sample
      * MULTIPLE distinct textures within the same frame (e.g. one draw per font-atlas page), where a single
-     * descriptor set rewritten between draws (see {@link SampledImageSet}) is unsafe: descriptor sets are
+     * descriptor set rewritten between draws is unsafe: descriptor sets are
      * live objects, so every {@code vkCmdBindDescriptorSets} call recorded against the SAME set ends up
      * sampling whichever texture was written LAST by the time the command buffer actually executes on the
      * GPU, not whatever was bound at record time — earlier draws in the same command buffer would silently
      * end up sampling the final page's atlas instead of their own. Each distinct view gets its own
      * descriptor set instead, allocated and written EXACTLY ONCE ({@link #allocateAndBind}) — never mutated
      * again — so callers should cache the returned handle per view (e.g. an
-     * {@code IdentityHashMap<GpuTextureView, Long>}) and reuse it across frames; the underlying texture view
-     * is expected to be stable for the session (a font atlas page doesn't get recreated), so there's nothing
-     * to rebind after the first time.
+     * {@code IdentityHashMap<GpuTextureView, Long>}) and reuse it across frames; the underlying texture
+     * view is expected to be stable between resource reloads, and a set can never be rebound or freed
+     * individually — so a reload that re-stitches the atlases (making every cached view stale) must drop
+     * this pool wholesale and let the caller rebuild it while the device is idle.
      */
     public static final class SampledImageSetPool {
         public final long layout;
@@ -540,8 +474,7 @@ public final class RtOverlayPipelines {
     /**
      * A ring of descriptor sets each holding one {@code VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR}
      * binding — for overlay passes that issue an inline {@code rayQueryEXT} occlusion test against the
-     * world TLAS (e.g. block outline). A ring (not a single set, unlike {@link ReadOnlyImageSet}/
-     * {@link SampledImageSet}) is required because the TLAS handle changes most frames ({@code RtAccel
+     * world TLAS (e.g. block outline). A ring (not a single set, unlike {@link ReadOnlyImageSet}) is required because the TLAS handle changes most frames ({@code RtAccel
      * .TlasRing} cycles it every frame even when it doesn't grow) — rewriting a single set's binding while
      * an earlier frame's command buffer referencing that same set may still be executing on the GPU is the
      * same "descriptor set update while in use" hazard {@code RtPipeline.setTlas} guards against. Exact

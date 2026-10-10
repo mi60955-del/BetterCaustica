@@ -71,6 +71,12 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     // of window/render resolution — a fixed pixel width looks disproportionately thick on a smaller screen.
     private static final float LINE_WIDTH_PX_AT_REFERENCE = 2.0f;
     private static final float REFERENCE_HEIGHT = 1080f;
+    // Vanilla's high-contrast line colour, the int -11010079 (ARGB #FF57FFE1) in LevelRenderer's
+    // submitBlockOutline; the black silhouette under it is 7.0px wide at the same reference height.
+    private static final float HC_LINE_R = 0x57 / 255f;
+    private static final float HC_LINE_G = 1.0f;
+    private static final float HC_LINE_B = 0xE1 / 255f;
+    private static final float HC_BACKDROP_WIDTH_PX_AT_REFERENCE = 7.0f;
 
     private RtContext ctxRef;
     private RtOverlayPipelines.Pipeline pipeline;
@@ -84,6 +90,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     private RtBuffer vbo;
     private int vertexCount;
     private long boundSet;
+    private boolean highContrast;
 
     @Override
     public boolean prepare(RtContext ctx, RtOverlayFramePool pool, RtGpuExecutor.GraphicsUse graphicsUse,
@@ -117,6 +124,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         if (!shouldRenderForGameMode(pos)) {
             return false;
         }
+        highContrast = state.highContrast();
         VoxelShape shape = state.shape();
         float baseX = pos.getX() - terrain.blockX;
         float baseY = pos.getY() - terrain.blockY;
@@ -185,11 +193,10 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
             pipeline = new RtOverlayPipelines.Spec("block_outline/vertex.vert.spv", "block_outline/fragment.frag.spv")
                     .vertex(RtOverlayPipelines.VertexFormat.POSITION)
                     .topology(VK10.VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
-                    // NONE (straight write), not ALPHA: ALPHA's blend factors (srcAlpha=ZERO, dstAlpha=ONE)
-                    // preserve the DESTINATION's alpha, which was fine composited straight onto opaque `main`
-                    // (only RGB mattered) but is wrong now that this pass writes into a transparent scratch
-                    // mask whose alpha IS the coverage signal the composite pass reads — ALPHA here would
-                    // leave every resolved pixel's alpha stuck at the clear value (0), invisible outline.
+                    // NONE (straight write), not ALPHA: this pass writes into a transparent scratch mask
+                    // whose alpha IS the coverage signal the composite pass reads. ALPHA's factors
+                    // (srcAlpha=ZERO, dstAlpha=ONE) preserve the destination's alpha, which would leave
+                    // every resolved pixel's alpha stuck at the clear value (0) — an invisible outline.
                     .blend(RtOverlayPipelines.Blend.NONE)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .samples(RtDeviceBringup.overlayMsaaSamples())
@@ -203,16 +210,22 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                     .descriptorSetLayout(compositeSet.layout)
                     .build(ctx, "block outline composite");
         }
-        if (msaaImage == null || msaaImage.width != width || msaaImage.height != height) {
+        // A resolve attachment on a single-sample color attachment is invalid usage, so the 1-sample
+        // fallback renders straight into the resolved mask and skips the MSAA scratch entirely.
+        boolean msaa = RtDeviceBringup.overlayMsaaSamples() > 1;
+        if (msaa && (msaaImage == null || msaaImage.width != width || msaaImage.height != height)) {
             if (msaaImage != null) {
-                msaaImage.destroy();
+                // The previous frame's passes were the last thing using this image; destroy only once
+                // that frame's graphics work has completed, never inline (resize can happen while a
+                // submit is still in flight).
+                ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), msaaImage::destroy);
             }
             msaaImage = ctx.createTransientMsaaColorImage(width, height, RtWorldOverlay.TARGET_FORMAT,
                     RtDeviceBringup.overlayMsaaSamples(), "block outline msaa " + width + "x" + height);
         }
         if (resolvedMask == null || resolvedMask.width != width || resolvedMask.height != height) {
             if (resolvedMask != null) {
-                resolvedMask.destroy();
+                ctx.gpuExecutor().retireAfterGraphics(ctx.gpuExecutor().latestGraphicsUse(), resolvedMask::destroy);
             }
             resolvedMask = ctx.createStorageImage(width, height, RtWorldOverlay.TARGET_FORMAT,
                     "block outline resolved mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
@@ -224,7 +237,11 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     public void record(VkCommandBuffer cmd, long targetView, int width, int height) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline mask")) {
-                RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
+                if (RtDeviceBringup.overlayMsaaSamples() > 1) {
+                    RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
+                } else {
+                    RtWorldOverlay.beginColorRendering(cmd, stack, resolvedMask.view, width, height, true);
+                }
                 VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
                 VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
                         stack.longs(boundSet), null);
@@ -232,13 +249,27 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                 float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
                 float lineWidth = RtDeviceBringup.wideLinesEnabled()
                         ? Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()) : 1.0f;
-                VK10.vkCmdSetLineWidth(cmd, lineWidth);
                 ByteBuffer push = stack.malloc(PUSH_BYTES);
                 viewProj.get(0, push);
                 RtEntities entities = RtEntities.INSTANCE;
                 push.putFloat(64, entities.glowCamOffsetX()).putFloat(68, entities.glowCamOffsetY())
                         .putFloat(72, entities.glowCamOffsetZ());
-                push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
+                if (highContrast) {
+                    // Mirror vanilla's two-pass high-contrast outline: a thick black silhouette under
+                    // the bright line. Blend is NONE (straight write), so the second pass simply
+                    // overwrites the first wherever both cover the pixel.
+                    VK10.vkCmdSetLineWidth(cmd, Math.min(HC_BACKDROP_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT),
+                            RtDeviceBringup.wideLinesEnabled() ? RtDeviceBringup.maxLineWidth() : 1.0f));
+                    push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, 1.0f);
+                    VK10.vkCmdPushConstants(cmd, pipeline.layout,
+                            VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
+                    VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+                    VK10.vkCmdSetLineWidth(cmd, lineWidth);
+                    push.putFloat(80, HC_LINE_R).putFloat(84, HC_LINE_G).putFloat(88, HC_LINE_B).putFloat(92, 1.0f);
+                } else {
+                    VK10.vkCmdSetLineWidth(cmd, lineWidth);
+                    push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
+                }
                 VK10.vkCmdPushConstants(cmd, pipeline.layout,
                         VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
                 VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);

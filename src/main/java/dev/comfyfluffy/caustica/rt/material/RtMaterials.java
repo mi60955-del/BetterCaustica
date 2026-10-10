@@ -50,7 +50,7 @@ public final class RtMaterials {
     public static final float WATER_ROUGH = Profile.WATER.roughness();
     /** Lava: opaque emitter, moderately rough. */
     public static final float LAVA_ROUGH = Profile.LAVA.roughness();
-    /** Default entity roughness (linear; s = 0.11). */
+    /** Default entity roughness (linear; perceptual smoothness s = 0.20, i.e. (1 - s)^2 = 0.64). */
     public static final float ENTITY_ROUGH = 0.64f;
 
     private static final Set<Block> SMOOTH = Set.of(

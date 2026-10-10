@@ -18,21 +18,31 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Resource-epoch proof that an atlas sprite is used by at least one light-emitting block state. */
 public final class RtEmissionSemantics {
     private static final Direction[] DIRECTIONS = Direction.values();
+    /**
+     * Random variants sampled per emissive state. A weighted multipart part that can appear with
+     * probability under 1/{@code VARIANT_PROBES} can escape every probe and lose its emission mask;
+     * raising this trades reload time for coverage of ever-rarer variants.
+     */
     private static final int VARIANT_PROBES = 8;
 
-    private final Map<TextureAtlasSprite, Integer> maxStateLight;
-    private final int emittingStates;
-    private final int failedStates;
+    /**
+     * Sprites that emit uniformly across their whole surface, so their block light IS the emission and no
+     * spatial mask should be inferred for them. The heuristic asks "which part of this texture glows" and
+     * answers with the cube of the texel's linear luminance, so it gives up on a dark, fully saturated
+     * emitter outright: the nether portal's purple averages 0.16 linear luminance, which masks down to
+     * about 0.003 — a block vanilla lights at level 11 would render almost black.
+     */
+    private static final Set<String> UNIFORM_EMITTER_SPRITES = Set.of("block/nether_portal");
 
-    private RtEmissionSemantics(Map<TextureAtlasSprite, Integer> maxStateLight,
-                                int emittingStates, int failedStates) {
+    private final Map<TextureAtlasSprite, Integer> maxStateLight;
+
+    private RtEmissionSemantics(Map<TextureAtlasSprite, Integer> maxStateLight) {
         this.maxStateLight = maxStateLight;
-        this.emittingStates = emittingStates;
-        this.failedStates = failedStates;
     }
 
     public static RtEmissionSemantics analyze() {
@@ -55,27 +65,27 @@ public final class RtEmissionSemantics {
         Map<TextureAtlasSprite, Integer> frozen = Collections.unmodifiableMap(new IdentityHashMap<>(sprites));
         CausticaMod.LOGGER.info("RT emission semantics: emittingStates={}, sprites={}, failedStates={}",
                 states, frozen.size(), failures);
-        return new RtEmissionSemantics(frozen, states, failures);
+        return new RtEmissionSemantics(frozen);
     }
 
+    /**
+     * True when {@code sprite} should compile an albedo-derived emission mask. A sprite that emits
+     * uniformly is deliberately excluded: its block light is already the whole answer, and masking it by
+     * texture luminance only dims it.
+     */
     public boolean permits(TextureAtlasSprite sprite) {
+        if (!maxStateLight.containsKey(sprite)) return false;
+        return !UNIFORM_EMITTER_SPRITES.contains(sprite.contents().name().getPath());
+    }
+
+    /**
+     * Whether some light-emitting block state's model can resolve {@code sprite}, i.e. the sprite can be
+     * shaded with a state-uniform emission source and therefore needs a uniform emission summary and
+     * albedo grid compiled. Sprites the variant probes missed degrade here the same way their heuristic
+     * masks already do (see {@link #permits}).
+     */
+    public boolean mayResolveAsStateUniform(TextureAtlasSprite sprite) {
         return maxStateLight.containsKey(sprite);
-    }
-
-    public int maxStateLight(TextureAtlasSprite sprite) {
-        return maxStateLight.getOrDefault(sprite, 0);
-    }
-
-    public int spriteCount() {
-        return maxStateLight.size();
-    }
-
-    public int emittingStates() {
-        return emittingStates;
-    }
-
-    public int failedStates() {
-        return failedStates;
     }
 
     private static void collectState(BlockState state, int light,

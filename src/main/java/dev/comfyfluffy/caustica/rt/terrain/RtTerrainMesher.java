@@ -104,14 +104,16 @@ final class RtTerrainMesher {
             return new CpuSection(null, null);
         }
         // RIS emitter-NEE light collection — BEFORE packing: it also stamps NEE membership into the prim
-        // records, which packSection then copies out. Only opaque + cutout can emit (glass is shaded
-        // emission-free, water never emits; lava lives in the opaque bucket).
+        // records, which packSection then copies out. Opaque, cutout and translucent can all emit — a
+        // translucent quad carries its own block light (the nether portal burns at level 11) — while water
+        // never does (lava lives in the opaque bucket).
         float[] lights = EMPTY_LIGHTS;
         if (CausticaConfig.Rt.Lights.RIS_CANDIDATES.value() > 0) {
             FloatArrayList collected = new FloatArrayList();
             float minFill = CausticaConfig.Rt.Lights.MIN_FILL_RATIO.value();
             collectLights(collected, mesh.opaque, materials, minFill);
             collectLights(collected, mesh.cutout, materials, minFill);
+            collectLights(collected, mesh.translucent, materials, minFill);
             if (!collected.isEmpty()) {
                 lights = collected.toFloatArray();
             }
@@ -439,9 +441,17 @@ final class RtTerrainMesher {
             if (len > 1.0e-6f) { nx /= len; ny /= len; nz /= len; }
             q.nx = nx; q.ny = ny; q.nz = nz;
 
+            // Vanilla derives the chunk layer from the sprite's Transparency alone, so a cutout sprite that
+            // happens to carry semi-transparent texels too (a pack's frogspawn: 0 / 170 / 255) lands in
+            // TRANSLUCENT. Geometrically it is still a cutout: its holes must let the ray through, which the
+            // dielectric volume model cannot express — it would resolve the whole quad as one clear slab.
+            // Only a sprite with no fully transparent texel is a volume (stained glass, ice, slime), and only
+            // those become dielectrics. A null sprite keeps the layer's own answer: nothing contradicts it.
+            TextureAtlasSprite sprite = spriteFinder.find(quad);
             ChunkSectionLayer layer = quad.chunkLayer();
             q.cutout = layer != ChunkSectionLayer.SOLID;
-            q.translucent = layer == ChunkSectionLayer.TRANSLUCENT;
+            q.translucent = layer == ChunkSectionLayer.TRANSLUCENT
+                    && (sprite == null || !sprite.transparency().hasTransparent());
 
             // Fabric colors are authored albedo. Continuity uses them for already-resolved overlay tint;
             // ordinary biome-tinted quads retain tintIndex and are multiplied by the world tint below.
@@ -469,7 +479,6 @@ final class RtTerrainMesher {
             q.tr = tr; q.tg = tg; q.tb = tb;
 
             q.emission = quad.emissive() ? 1f : (state != null ? state.getLightEmission() / 15f : 0f);
-            TextureAtlasSprite sprite = spriteFinder.find(quad);
             q.sprite = sprite;
             q.materialId = materials.resolve(sprite, state, q.translucent);
         }
