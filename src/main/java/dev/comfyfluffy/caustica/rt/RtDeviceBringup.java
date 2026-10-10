@@ -239,10 +239,6 @@ public final class RtDeviceBringup {
         return serBackend.worldPrimaryRaygenShader;
     }
 
-    public static boolean serExtEnabled() {
-        return serBackend == SerBackend.EXT;
-    }
-
     /** True if {@code VK_EXT_opacity_micromap} was enabled on the device (gate on + device support). */
     public static boolean ommEnabled() {
         return ommEnabled;
@@ -546,6 +542,8 @@ public final class RtDeviceBringup {
         // Core features merge into vanilla's VK10/VK12 structs; extension features create their matching
         // pNext structs. Every boolean here was verified by queryFeatureSupport above.
         features.addAll(REQUIRED_RT_FEATURES);
+        // This device can do RT, so a future device that cannot should warn again.
+        loggedUnavailable = false;
         // Bindless entity textures: a runtime-sized sampler2D[] indexed non-uniformly in the hit shader,
         // with partially-bound + update-after-bind slots (a growing per-RenderType registry). Core on the
         // VK 1.4 device; just needs enabling alongside bufferDeviceAddress on the same struct.

@@ -38,6 +38,7 @@ public final class RtFrameStats {
                     "terrain.drainCompletion",
                     "terrain.snapshotDispatch",
                     "terrain.publish",
+                    "terrain.lightGridPublish",
                     "entity.capture",
                     "entity.capture.extract",
                     "entity.capture.submit",
@@ -257,6 +258,9 @@ public final class RtFrameStats {
             return sorted[historyCount / 2];
         }
 
+        private static final long FLUSH_INTERVAL_NANOS = 1_000_000_000L;
+        private long lastFlushNanos;
+
         private void writeCsvRow(long total, long median, boolean hitch, long gcCount, long gcMs) {
             ensureCsv();
             if (csv == null) {
@@ -274,7 +278,13 @@ public final class RtFrameStats {
                 row.append(',').append(gcCount).append(',').append(gcMs);
             }
             csv.println(row);
-            csv.flush();
+            // Flush on a cadence, not per frame: a render-thread disk flush is itself a potential
+            // hitch, which is exactly what this file is measuring.
+            long now = System.nanoTime();
+            if (now - lastFlushNanos > FLUSH_INTERVAL_NANOS) {
+                lastFlushNanos = now;
+                csv.flush();
+            }
         }
 
         /** Opens (or gives up on) this profile's CSV file at most once per session. */

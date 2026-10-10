@@ -3,9 +3,11 @@ package dev.comfyfluffy.caustica.rt;
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
+import dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg;
 
 import it.unimi.dsi.fastutil.longs.LongList;
 
@@ -51,7 +53,11 @@ import java.nio.LongBuffer;
 public final class RtFramePresenter {
     public static final RtFramePresenter INSTANCE = new RtFramePresenter();
 
-    private static final long ACQUIRE_TIMEOUT_NS = 5_000_000_000L;
+    // Non-blocking on purpose. The presents that would release an image are queued later in the same frame,
+    // so a waiting acquire cannot be satisfied by anything this frame still has to do: with a long timeout an
+    // over-subscribed frame stalls for the whole timeout and the frame rate collapses to one frame per
+    // timeout. Returning VK_TIMEOUT immediately instead skips the extra present for this frame.
+    private static final long ACQUIRE_TIMEOUT_NS = 0L;
 
     private static final long LOG_INTERVAL_NS = 1_000_000_000L;
 
@@ -71,14 +77,89 @@ public final class RtFramePresenter {
     private int generatedFramesInWindow;
     private int interpOkInWindow;
     private int interpFallbackInWindow;
+    private int acquireFailsInWindow;
+    private int lastAcquireResult = VK10.VK_SUCCESS;
+    private long presentFailures;
+    private int lastPresentResult = VK10.VK_SUCCESS;
+    private int swapchainImageCount = -1;
+    // The presenter's own share of the frame. Comparing these against the flush-to-flush interval says
+    // whether a long frame is spent here or inside Minecraft's frame (its own acquire or fence wait).
+    private long prepareNanosSum;
+    private long prepareNanosMax;
+    private long flushNanosSum;
+    private long flushNanosMax;
+    private long acquireNanosSum;
+    private long acquireNanosMax;
+    private long lastFlushEntryNs;
+    private long flushIntervalNanosMax;
+    private int acquireNotReady;
+    private int acquireTimeout;
+    private int acquireOtherFail;
+    private int requestedGeneratedInWindow;
 
     private RtFramePresenter() {
     }
 
-    /** Whether FG extra-present should run this frame (enabled, available, in a world). */
+    /**
+     * The configured frame-generation backend, as one of the {@link CausticaConfig.Rt.Fg} names.
+     * The setting sanitises anything unrecognised to {@code dlss}, so this never has to.
+     */
+    public static String backend() {
+        return CausticaConfig.Rt.Fg.BACKEND.get();
+    }
+
+    /**
+     * Whether the chosen backend wants a pre-UI copy of the frame. Both vendor backends use it to
+     * keep screen-fixed content out of the motion estimate; {@code self} has no input for it and
+     * {@code duplicate} generates nothing, so capturing it would be a full-resolution copy per
+     * frame for nobody.
+     */
+    public static boolean hudlessInputWanted() {
+        String backend = backend();
+        return CausticaConfig.Rt.Fg.DLSS.equals(backend) || CausticaConfig.Rt.Fg.FSR.equals(backend);
+    }
+
+    /**
+     * Generated frames per rendered frame. FSR 3.1.x emits one per dispatch however large the
+     * request is, so it clamps itself rather than presenting the same generated frame twice.
+     */
+    public static int generatedFramesPerRendered() {
+        if (CausticaConfig.Rt.Fg.FSR.equals(backend())) {
+            return Math.min(1, CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value());
+        }
+        return RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+    }
+
+    /** Whether FG extra-present should run this frame (enabled, a backend that can, in a world). */
     public boolean isActive() {
-        return !failed && RtDlssFg.enabled() && RtDlssFg.INSTANCE.isAvailable()
-                && Minecraft.getInstance().level != null;
+        if (failed || !RtDlssFg.enabled() || Minecraft.getInstance().level == null) {
+            return false;
+        }
+        return switch (backend()) {
+            case CausticaConfig.Rt.Fg.DUPLICATE, CausticaConfig.Rt.Fg.SELF -> true;
+            case CausticaConfig.Rt.Fg.FSR -> RtFsrFg.INSTANCE.isAvailable();
+            default -> RtDlssFg.INSTANCE.isAvailable();
+        };
+    }
+
+    /**
+     * Produce generated frame {@code index} of {@code count}, or null when this index has no
+     * generated content and the real frame is presented again for it. Each backend is an
+     * alternative to the others, which is how the extra-present path can be exercised with no
+     * interpolation at all.
+     */
+    private static RtImage generateFrame(VulkanCommandEncoder enc, long backbufferView, long srcImage,
+            int srcW, int srcH, int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {
+        return switch (backend()) {
+            case CausticaConfig.Rt.Fg.DUPLICATE -> null;
+            case CausticaConfig.Rt.Fg.SELF -> RtComposite.INSTANCE.fgInterpolateSelf(enc, backbufferView,
+                    srcImage, swapW, swapH, hdrBackbuffer);
+            case CausticaConfig.Rt.Fg.FSR -> index == 1
+                    ? RtComposite.INSTANCE.fgInterpolateFsr(enc, srcImage, srcW, srcH, hdrBackbuffer)
+                    : null;
+            default -> RtComposite.INSTANCE.fgInterpolate(enc, backbufferView, srcImage, swapW, swapH,
+                    index, count, hdrBackbuffer);
+        };
     }
 
     /**
@@ -100,20 +181,41 @@ public final class RtFramePresenter {
         if (failed || swapchain == 0L || srcImage == 0L || generatedCount <= 0) {
             return;
         }
+        if (swapchainImages.size() != swapchainImageCount) {
+            // Each frame needs one image for Minecraft's own present plus one per generated frame, all held
+            // at once, so the image count bounds how many extra presents a single frame can carry.
+            CausticaMod.LOGGER.info("FG present engine: swapchain image count {} -> {}",
+                    swapchainImageCount, swapchainImages.size());
+            swapchainImageCount = swapchainImages.size();
+        }
+        // Minecraft holds its own acquired image for the whole frame and every generated frame needs one
+        // more, all at once, so the swapchain must be able to supply 1 + generatedCount images. Measured on
+        // a 3-image swapchain: one extra present is absorbed with no failures, two exhaust it.
+        requestedGeneratedInWindow = generatedCount;
+        generatedCount = Math.min(generatedCount, swapchainImages.size() - 2);
+        if (generatedCount <= 0) {
+            return;
+        }
+        final long prepareStartNs = System.nanoTime();
         try {
             ensureCapacity(device, swapchainImages.size() + 1, generatedCount);
             for (int i = 0; i < generatedCount; i++) {
-                // null = no captured RT frame this tick (menu/loading/transition — routine, not a bug): fall
-                // back to duplicating the real frame for just this one frame. A genuine FG failure instead
-                // throws, caught below, which disables FG for the session.
-                RtImage interp = RtComposite.INSTANCE.fgInterpolate(enc, backbufferView, srcImage,
-                        swapW, swapH, i + 1, generatedCount, hdrBackbuffer);
+                // null = no generated frame for this index, so the real frame is presented again for it.
+                // Routine when there is no captured RT frame to interpolate from (menu/loading/transition),
+                // and also what duplicate-only asks for. A genuine failure throws instead, caught below,
+                // which disables FG for the session.
+                RtImage interp = generateFrame(enc, backbufferView, srcImage, srcW, srcH, swapW, swapH, i + 1,
+                        generatedCount, hdrBackbuffer);
                 if (interp != null) {
                     interpOkInWindow++;
                 } else {
                     interpFallbackInWindow++;
                 }
                 long blitSrc = interp != null ? interp.image : srcImage;
+                // Clip to the smaller of swapchain and source exactly as Blaze3D's own blitFromTexture does
+                // (it computes min(swapchainWidth, view.getWidth(0)) and min(swapchainHeight, ...), and blits
+                // with VK_FILTER_NEAREST). A different region here would put the generated frame on another
+                // vertical scale than the real frame, and the two are presented on alternate vsyncs.
                 int copyW = Math.min(swapW, interp != null ? interp.width : srcW);
                 int copyH = Math.min(swapH, interp != null ? interp.height : srcH);
 
@@ -123,9 +225,24 @@ public final class RtFramePresenter {
                 int imageIndex;
                 try (MemoryStack stack = MemoryStack.stackPush()) {
                     IntBuffer pIndex = stack.callocInt(1);
+                    long acquireStartNs = System.nanoTime();
                     int r = KHRSwapchain.vkAcquireNextImageKHR(device.vkDevice(), swapchain, ACQUIRE_TIMEOUT_NS, acquireSem, 0L, pIndex);
+                    long acquireNs = System.nanoTime() - acquireStartNs;
+                    acquireNanosSum += acquireNs;
+                    if (acquireNs > acquireNanosMax) {
+                        acquireNanosMax = acquireNs;
+                    }
                     if (r != VK10.VK_SUCCESS && r != 1000001003 /* SUBOPTIMAL */) {
-                        return; // out-of-date/timeout: present what we have, let MC recover
+                        acquireFailsInWindow++;
+                        lastAcquireResult = r;
+                        if (r == VK10.VK_NOT_READY) {
+                            acquireNotReady++;
+                        } else if (r == VK10.VK_TIMEOUT) {
+                            acquireTimeout++;
+                        } else {
+                            acquireOtherFail++;
+                        }
+                        return; // no image available: present what we have, let MC recover
                     }
                     imageIndex = pIndex.get(0);
                 }
@@ -141,6 +258,12 @@ public final class RtFramePresenter {
             failed = true;
             pendingCount = 0;
             CausticaMod.LOGGER.error("DLSS-FG present-record failed; frame generation disabled", t);
+        } finally {
+            long spentNs = System.nanoTime() - prepareStartNs;
+            prepareNanosSum += spentNs;
+            if (spentNs > prepareNanosMax) {
+                prepareNanosMax = spentNs;
+            }
         }
     }
 
@@ -150,6 +273,14 @@ public final class RtFramePresenter {
      * frame, giving generated-then-real order).
      */
     public void flushPendingPresents(long swapchain, VkQueue presentQueue) {
+        long flushStartNs = System.nanoTime();
+        if (lastFlushEntryNs != 0L) {
+            long intervalNs = flushStartNs - lastFlushEntryNs;
+            if (intervalNs > flushIntervalNanosMax) {
+                flushIntervalNanosMax = intervalNs;
+            }
+        }
+        lastFlushEntryNs = flushStartNs;
         int presentedThisFrame = 0;
         if (!failed && pendingCount != 0) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -159,7 +290,15 @@ public final class RtFramePresenter {
                     present.swapchainCount(1);
                     present.pSwapchains(stack.longs(swapchain));
                     present.pImageIndices(stack.ints(pendingImageIndex[i]));
-                    KHRSwapchain.vkQueuePresentKHR(presentQueue, present);
+                    int result = KHRSwapchain.vkQueuePresentKHR(presentQueue, present);
+                    if (result != VK10.VK_SUCCESS) {
+                        // OUT_OF_DATE and friends mean this generated frame silently vanished; surface
+                        // it in the same diagnostic line that already tracks acquire results.
+                        presentFailures++;
+                        lastPresentResult = result;
+                        CausticaMod.LOGGER.warn("DLSS-FG generated-frame present returned {}; the frame is lost",
+                                result);
+                    }
                     presentedThisFrame++;
                 }
             } catch (Throwable t) {
@@ -168,6 +307,11 @@ public final class RtFramePresenter {
             } finally {
                 pendingCount = 0;
             }
+        }
+        long flushSpentNs = System.nanoTime() - flushStartNs;
+        flushNanosSum += flushSpentNs;
+        if (flushSpentNs > flushNanosMax) {
+            flushNanosMax = flushSpentNs;
         }
         if (RtDlssFg.enabled()) {
             logPresentRate(presentedThisFrame);
@@ -196,16 +340,42 @@ public final class RtFramePresenter {
         double realFps = realFramesInWindow / seconds;
         double totalFps = (realFramesInWindow + generatedFramesInWindow) / seconds;
         CausticaMod.LOGGER.info(
-                "[FG present-rate] real={} gen={} realFps={} totalPresentFps={} configuredMultiFrameCount={} "
-                        + "interpOk={} interpFallbackDuplicate={}",
-                realFramesInWindow, generatedFramesInWindow,
+                "[FG present-rate] real={} gen={} requestedGen={} realFps={} totalPresentFps={} configuredMultiFrameCount={} "
+                        + "interpOk={} interpFallbackDuplicate={} backend={} acquireFails={} notReady={} "
+                        + "timeout={} otherFail={} lastAcquireResult={} presentFails={} lastPresentResult={} "
+                        + "swapchainImages={} windowFocused={} "
+                        + "maxFlushGapMs={} prepareMs(sum/max)={}/{} flushMs(sum/max)={}/{} "
+                        + "acquireMs(sum/max)={}/{}",
+                realFramesInWindow, generatedFramesInWindow, requestedGeneratedInWindow,
                 String.format("%.1f", realFps), String.format("%.1f", totalFps),
-                RtDlssFg.INSTANCE.effectiveMultiFrameCount(), interpOkInWindow, interpFallbackInWindow);
+                generatedFramesPerRendered(), interpOkInWindow, interpFallbackInWindow,
+                backend(), acquireFailsInWindow, acquireNotReady, acquireTimeout,
+                acquireOtherFail, lastAcquireResult, presentFailures, lastPresentResult,
+                swapchainImageCount,
+                Minecraft.getInstance().getWindow().isFocused(),
+                String.format("%.1f", flushIntervalNanosMax / 1e6),
+                String.format("%.1f", prepareNanosSum / 1e6), String.format("%.1f", prepareNanosMax / 1e6),
+                String.format("%.1f", flushNanosSum / 1e6), String.format("%.1f", flushNanosMax / 1e6),
+                String.format("%.1f", acquireNanosSum / 1e6), String.format("%.1f", acquireNanosMax / 1e6));
         logWindowStartNs = now;
         realFramesInWindow = 0;
         generatedFramesInWindow = 0;
         interpOkInWindow = 0;
         interpFallbackInWindow = 0;
+        acquireFailsInWindow = 0;
+        lastAcquireResult = VK10.VK_SUCCESS;
+        presentFailures = 0;
+        lastPresentResult = VK10.VK_SUCCESS;
+        acquireNotReady = 0;
+        acquireTimeout = 0;
+        acquireOtherFail = 0;
+        prepareNanosSum = 0;
+        prepareNanosMax = 0;
+        flushNanosSum = 0;
+        flushNanosMax = 0;
+        acquireNanosSum = 0;
+        acquireNanosMax = 0;
+        flushIntervalNanosMax = 0;
     }
 
     private void recordBlit(VulkanCommandEncoder enc, long srcImage, long dstImage, int copyW, int copyH,

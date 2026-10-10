@@ -63,6 +63,15 @@ public final class RtReflex {
     private int lastMinIntervalUs;
     private boolean failed;
 
+    // Diagnostics for logDiagIfDue(): how many frames were paced, how many were dropped for want of an
+    // applied swapchain, and how long the driver actually held the game thread.
+    private static final long DIAG_LOG_INTERVAL_NANOS = 2_000_000_000L;
+    private long sleptFrames;
+    private long timedOutFrames;
+    private long skippedFrames;
+    private long waitedNanos;
+    private long lastDiagNanos;
+
     private RtReflex() {
     }
 
@@ -126,16 +135,40 @@ public final class RtReflex {
     }
 
     /**
+     * Forget which swapchain the sleep mode was applied to, so the next
+     * {@link #applySleepMode} really applies.
+     *
+     * <p>Call before {@code VulkanGpuSurface.configure()} builds a new swapchain. That path destroys the
+     * old one first, and Vulkan is free to hand the same handle value straight back for the new object —
+     * {@link #applySleepMode} keys its idempotence on the handle, so a recycled swapchain would otherwise be
+     * mistaken for one that is already configured and Reflex would quietly stop pacing frames after a
+     * fullscreen/windowed toggle or a resize. Latency state belongs to the swapchain object, so every new
+     * object needs the call.
+     */
+    public void forgetSwapchain() {
+        sleepModeSwapchain = 0L;
+    }
+
+    /**
      * Per-frame pacing: increment the frame counter, ask the driver to signal the timeline semaphore at the
      * paced frame-start time, then block this (the game) thread until it does. Call once, near the top of
      * the frame, before input sampling/simulation. No-op (returns immediately) unless {@link #applySleepMode}
      * has already been applied for this exact {@code swapchain}.
      */
     public void sleep(VkDevice device, long swapchain) {
-        if (!enabled() || failed || swapchain == 0L || swapchain != sleepModeSwapchain || timelineSemaphore == 0L) {
+        if (!enabled() || failed) {
+            return;
+        }
+        if (swapchain == 0L || swapchain != sleepModeSwapchain || timelineSemaphore == 0L) {
+            // Reflex is switched on and the device supports it, yet this frame was not paced. The usual
+            // reason is that no sleep mode has been applied for the swapchain currently in use.
+            skippedFrames++;
+            logDiagIfDue();
             return;
         }
         counter++;
+        long started = System.nanoTime();
+        boolean timedOut = false;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkLatencySleepInfoNV sleepInfo = VkLatencySleepInfoNV.calloc(stack).sType$Default()
                     .signalSemaphore(timelineSemaphore).value(counter);
@@ -152,11 +185,44 @@ public final class RtReflex {
                 // it happens constantly (would mean the driver never signals, which needs investigating).
                 CausticaMod.LOGGER.warn("Reflex: vkWaitSemaphores({}) returned {}; pacing skipped this frame",
                         counter, r);
+                timedOut = true;
             }
         } catch (Throwable t) {
             failed = true;
             CausticaMod.LOGGER.error("Reflex: sleep failed; Reflex disabled for session", t);
         }
+        if (timedOut) {
+            // Timed-out frames burn the whole timeout without telling us anything about pacing, so
+            // they are counted apart; folding them into meanWaitUs would inflate exactly the frames
+            // where pacing already failed.
+            timedOutFrames++;
+        } else if (!failed) {
+            sleptFrames++;
+            waitedNanos += System.nanoTime() - started;
+        }
+        logDiagIfDue();
+    }
+
+    /**
+     * Throttled proof of what pacing is actually doing, on the same gate and cadence as the other RT
+     * diagnostics. {@code meanWaitUs} is the part of the frame the driver held the game thread for: with
+     * {@code minimum-interval-us = 0} it is near zero by design, because Reflex then only submits late and
+     * the game's own framerate cap supplies the delay — which is why that reading, not the presence of log
+     * lines, is what shows whether pacing is in play.
+     */
+    private void logDiagIfDue() {
+        if (!CausticaConfig.Rt.FrameStats.ENABLED.value()) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (now - lastDiagNanos < DIAG_LOG_INTERVAL_NANOS) {
+            return;
+        }
+        lastDiagNanos = now;
+        CausticaMod.LOGGER.info("RT reflex diag: slept={} skipped={} timedOut={} minIntervalUs={} boost={} meanWaitUs={}",
+                sleptFrames, skippedFrames, timedOutFrames, CausticaConfig.Rt.Reflex.MINIMUM_INTERVAL_US.value(),
+                CausticaConfig.Rt.Reflex.LOW_LATENCY_BOOST.value(),
+                sleptFrames == 0 ? 0 : waitedNanos / sleptFrames / 1000);
     }
 
     /**
@@ -204,5 +270,9 @@ public final class RtReflex {
         counter = 0L;
         presentCounter = 0L;
         failed = false;
+        sleptFrames = 0L;
+        timedOutFrames = 0L;
+        skippedFrames = 0L;
+        waitedNanos = 0L;
     }
 }

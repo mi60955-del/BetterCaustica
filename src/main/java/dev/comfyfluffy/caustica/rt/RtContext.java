@@ -39,6 +39,8 @@ import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 
 import java.nio.LongBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.function.Consumer;
 
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
@@ -68,6 +70,12 @@ public final class RtContext {
     private final int accelerationStructureScratchAlignment;
     private final long updateAfterBindCombinedImageSamplerLimit;
     private long commandPool;
+    /** Non-null while a batch opened by {@link #beginImageInitBatch()} is collecting init barriers. */
+    private List<ImageInit> imageInitBatch;
+
+    /** One deferred image-init barrier: UNDEFINED -> GENERAL for one image on the render thread. */
+    private record ImageInit(long image, int dstAccessMask, int dstStageMask) {
+    }
 
     private RtContext(VulkanDevice device, long vma, int handleSize, int baseAlign, int handleAlign,
                       int maxSbtStride, int scratchAlign, long updateAfterBindCombinedImageSamplerLimit) {
@@ -377,20 +385,85 @@ public final class RtContext {
             RtDebugLabels.nameImageView(this, view, label + " view");
         }
         long imageFinal = image;
+        recordImageInit(imageFinal,
+                VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT
+                        | VK10.VK_ACCESS_TRANSFER_READ_BIT | VK10.VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, label);
+        return new RtImage(vma, vk, image, allocation, view, width, height);
+    }
+
+    /**
+     * Record the image's UNDEFINED -> GENERAL init barrier — into the open init batch when one is
+     * collecting, otherwise as its own synchronous submit. Callers on the batch path must guarantee
+     * nothing executes the new images before {@link #endImageInitBatch()} runs.
+     */
+    private void recordImageInit(long image, int dstAccessMask, int dstStageMask, String label) {
+        if (imageInitBatch != null) {
+            imageInitBatch.add(new ImageInit(image, dstAccessMask, dstStageMask));
+            return;
+        }
         submitSync(cmd -> {
             try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
                 VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
                 b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT
-                                | VK10.VK_ACCESS_TRANSFER_READ_BIT | VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                        .srcAccessMask(0).dstAccessMask(dstAccessMask)
                         .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
-                        .image(imageFinal);
+                        .image(image);
                 b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
-                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dstStageMask,
                         0, null, null, b);
             }
         });
-        return new RtImage(vma, vk, image, allocation, view, width, height);
+    }
+
+    /**
+     * Defer the UNDEFINED -> GENERAL init barrier of every image created until
+     * {@link #endImageInitBatch()}, which records all of them in one synchronous submit instead of one
+     * submit per image — a resize brings up 15+ storage images, and the callers that create them in bulk
+     * hold the device idle around the whole stretch anyway. Render-thread only: image creation and the
+     * begin/end pair must happen on the same thread, and no other thread may create images while a
+     * batch is open.
+     */
+    public void beginImageInitBatch() {
+        if (imageInitBatch != null) {
+            throw new IllegalStateException("RT image init batch is already open");
+        }
+        imageInitBatch = new ArrayList<>();
+    }
+
+    /**
+     * Flush the batch opened by {@link #beginImageInitBatch()}: one submit records every deferred
+     * barrier (per-image destination access masks are kept; the shared destination stage widens to
+     * ALL_COMMANDS, a superset of every per-image stage used here). Images created while the batch was
+     * open are layout-valid only after this returns.
+     */
+    public void endImageInitBatch() {
+        List<ImageInit> batch = imageInitBatch;
+        if (batch == null) {
+            throw new IllegalStateException("No RT image init batch is open");
+        }
+        imageInitBatch = null;
+        if (batch.isEmpty()) {
+            return;
+        }
+        submitSync(cmd -> {
+            try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init image batch")) {
+                VkImageMemoryBarrier.Buffer barriers = VkImageMemoryBarrier.calloc(batch.size(), stack);
+                for (int i = 0; i < batch.size(); i++) {
+                    ImageInit init = batch.get(i);
+                    barriers.get(i).sType$Default()
+                            .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                            .srcAccessMask(0).dstAccessMask(init.dstAccessMask())
+                            .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                            .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                            .image(init.image());
+                    barriers.get(i).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                            .levelCount(1).layerCount(1);
+                }
+                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, null, null, barriers);
+            }
+        });
     }
 
     private void requireStorageImageSupport(int width, int height, int format, int usage, String label) {
@@ -465,18 +538,8 @@ public final class RtContext {
             RtDebugLabels.nameImageView(this, view, label + " view");
         }
         long imageFinal = image;
-        submitSync(cmd -> {
-            try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
-                VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
-                b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
-                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
-                        .image(imageFinal);
-                b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
-                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK10.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                        0, null, null, b);
-            }
-        });
+        recordImageInit(imageFinal, VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK10.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, label);
         return new RtImage(vma, vk, image, allocation, view, width, height);
     }
 

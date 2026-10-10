@@ -162,7 +162,13 @@ public final class RtHdr {
             }
             int n = count.get(0);
             VkSurfaceFormatKHR.Buffer formats = VkSurfaceFormatKHR.calloc(n, stack);
-            KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, count, formats);
+            int read = KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, count, formats);
+            if (read < 0) {
+                // The surface state can change between the count query and the fill; an unchecked
+                // second call would log whatever happened to be in the buffer.
+                CausticaMod.LOGGER.warn("HDR: failed to read surface formats (result={})", read);
+                return;
+            }
 
             boolean anyHdr = false;
             CausticaMod.LOGGER.info("HDR: chosen swapchain image format={} ({}); surface advertises {} (format,colorSpace) pair(s):",

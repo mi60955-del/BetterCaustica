@@ -226,9 +226,15 @@ public final class RtUiOverlay {
         RenderSystem.outputDepthTextureOverride = null;
         usedThisFrame = false;
         overlayClearedThisFrame = false;
+        compositeFailed = false;
         if (overlay != null) {
             overlay.destroyBuffers();
             overlay = null;
         }
+    }
+
+    /** Clear the composite failure latch so a render-state invalidation (F3+A) retries the overlay. */
+    public static void resetFailureLatch() {
+        compositeFailed = false;
     }
 }

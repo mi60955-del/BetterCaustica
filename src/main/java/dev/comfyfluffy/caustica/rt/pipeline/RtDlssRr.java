@@ -64,6 +64,10 @@ public final class RtDlssRr {
     private boolean resetHistory;
     private long lastFrameNanos;
 
+    private boolean refreshRequested;
+    private boolean loggedQueryUnavailable;
+    private boolean loggedNativeSize;
+
     private RtDlssRr() {
     }
 
@@ -127,10 +131,14 @@ public final class RtDlssRr {
 
     /**
      * Asks NGX what render resolution the current quality mode expects for the given display size.
-     * Returns {@code null} only when RR is off (or already disabled from an earlier failure elsewhere)
-     * — in that state there is no feature to query and the caller should trace at full resolution.
-     * Once RR is active, a failed query (stale shim, old driver, bad NGX result) throws instead of
-     * silently falling back, so a broken render/display sync is never masked.
+     * Returns {@code null} when RR is off or unavailable — and also when the query itself fails,
+     * which includes the normal pre-first-create state: the DLSSD feature library registers its
+     * optimal-settings callback into the capability parameter block only once loaded, so
+     * {@code NGX_DLSSD_GET_OPTIMAL_SETTINGS} returns {@code FAIL_OutOfDate} (0xBAD0000C) until the
+     * first feature creation. In that state the caller traces at full resolution (the shim maps a
+     * 1:1 create to DLAA), and {@link #ensureFeature} re-queries after creating and requests a
+     * render-size rebuild once the true optimal size becomes known. Never throws: a failed query
+     * must not take the RT composite down with it.
      */
     public int[] queryOptimalRenderSize(int displayWidth, int displayHeight) {
         if (!enabled() || failed) {
@@ -139,9 +147,22 @@ public final class RtDlssRr {
         if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
             return null;
         }
-        ensureInitialized(device);
+        try {
+            ensureInitialized(device);
+        } catch (Throwable t) {
+            if (!loggedQueryUnavailable) {
+                loggedQueryUnavailable = true;
+                CausticaMod.LOGGER.warn("DLSS-RR unavailable ({}); RT will trace at full resolution without it",
+                        t.toString());
+            }
+            return null;
+        }
         if (!lib.hasQueryOptimalDlssd()) {
-            throw new IllegalStateException("ngxshim is missing ngxshim_query_optimal_dlssd (stale native shim)");
+            if (!loggedQueryUnavailable) {
+                loggedQueryUnavailable = true;
+                CausticaMod.LOGGER.warn("ngxshim is missing ngxshim_query_optimal_dlssd (stale native shim); tracing at full resolution until RR is created");
+            }
+            return null;
         }
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment outWidth = arena.allocate(ValueLayout.JAVA_INT);
@@ -149,16 +170,39 @@ public final class RtDlssRr {
             MemorySegment outSharpness = arena.allocate(ValueLayout.JAVA_FLOAT);
             int rc = lib.queryOptimalDlssd(displayWidth, displayHeight, quality(), outWidth, outHeight, outSharpness);
             if (NgxRuntime.ngxFailed(rc)) {
-                throw new IllegalStateException("ngxshim_query_optimal_dlssd failed: 0x" + Integer.toHexString(rc));
+                // Expected before the first create (callback not yet registered, FAIL_OutOfDate) or on
+                // driver/library combos that never expose it; see the javadoc above.
+                if (!loggedQueryUnavailable) {
+                    loggedQueryUnavailable = true;
+                    CausticaMod.LOGGER.warn("ngxshim_query_optimal_dlssd failed: 0x{}; tracing at full resolution until RR is created",
+                            Integer.toHexString(rc));
+                }
+                return null;
             }
             int renderWidth = outWidth.get(ValueLayout.JAVA_INT, 0);
             int renderHeight = outHeight.get(ValueLayout.JAVA_INT, 0);
             if (renderWidth <= 0 || renderHeight <= 0) {
-                throw new IllegalStateException(
-                        "ngxshim_query_optimal_dlssd returned invalid render size " + renderWidth + "x" + renderHeight);
+                if (!loggedQueryUnavailable) {
+                    loggedQueryUnavailable = true;
+                    CausticaMod.LOGGER.warn("ngxshim_query_optimal_dlssd returned invalid render size {}x{}; tracing at full resolution",
+                            renderWidth, renderHeight);
+                }
+                return null;
             }
+            loggedQueryUnavailable = false;
             return new int[] { renderWidth, renderHeight };
         }
+    }
+
+    /**
+     * One-shot render-size refresh request for the RT composite: set when a freshly created feature
+     * made the optimal-size query succeed with a render size other than the one just created (e.g.
+     * we created 1:1 DLAA as the pre-create fallback and NGX now reports the true optimal size).
+     */
+    public boolean takeRefreshRequest() {
+        boolean request = refreshRequested;
+        refreshRequested = false;
+        return request;
     }
 
     /**
@@ -197,6 +241,20 @@ public final class RtDlssRr {
                 resetHistory = true; // a fresh feature has no temporal history
                 CausticaMod.LOGGER.info("DLSS-RR feature created: {}x{} -> {}x{} (quality {}, preset {})",
                         renderWidth, renderHeight, displayWidth, displayHeight, quality, preset);
+                // The first successful create loads the DLSSD feature library, which is what registers
+                // the optimal-settings callback the pre-create query needs (it fails with
+                // FAIL_OutOfDate before this). Re-query: if NGX now reports a render size other than
+                // the one just created (e.g. we created 1:1 DLAA as the pre-create fallback), ask the
+                // composite to rebuild at it. A still-failing query just keeps the current size.
+                int[] optimal = queryOptimalRenderSize(displayWidth, displayHeight);
+                if (optimal == null) {
+                    if (!loggedNativeSize) {
+                        loggedNativeSize = true;
+                        CausticaMod.LOGGER.info("DLSS-RR optimal-size query unavailable after feature creation; keeping current render size");
+                    }
+                } else if (optimal[0] != renderWidth || optimal[1] != renderHeight) {
+                    refreshRequested = true;
+                }
             }
             return true;
         } catch (Throwable t) {
@@ -204,6 +262,20 @@ public final class RtDlssRr {
             CausticaMod.LOGGER.error("DLSS-RR setup failed; RT composite continues without it", t);
             return false;
         }
+    }
+
+    /**
+     * Drop a latched failure so the next render-state invalidation (F3+A, dimension change) retries
+     * RR. No-op while healthy, so an invalidation never releases a working feature. The feature is
+     * released so {@link #ensureFeature} recreates it from a clean state; NGX itself stays up,
+     * owned by the shared {@link NgxRuntime}.
+     */
+    public void resetFailure() {
+        if (!failed) {
+            return;
+        }
+        destroy();
+        failed = false;
     }
 
     private void ensureInitialized(VulkanDevice device) {

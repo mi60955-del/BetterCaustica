@@ -275,9 +275,14 @@ public final class VulkanDiagnostics {
         BUFFERS.computeIfPresent(address, (ignored, range) -> range.handle == handle ? null : range);
     }
 
+    /** Guard so concurrent device-loss reports log the checkpoint dump once. */
+    private static final AtomicBoolean CHECKPOINTS_REPORTED = new AtomicBoolean();
+
     /** Query fault details once, immediately after a device-loss result is observed. */
     public static void reportDeviceLost(VulkanDevice device, String operation) {
-        if (FAULT_REPORTED.get()) {
+        // A separate latch from FAULT_REPORTED: the vendor query below must still run for whichever
+        // caller wins this one, while duplicate concurrent entries skip the checkpoint dump.
+        if (!CHECKPOINTS_REPORTED.compareAndSet(false, true)) {
             return;
         }
         VkQueue queue = lastCausticaQueue;
@@ -463,7 +468,10 @@ public final class VulkanDiagnostics {
 
     private static void writeVendorBinary(ByteBuffer binary, long reportedSize) {
         int size = (int) Math.min(binary.capacity(), reportedSize);
-        Path path = Path.of("caustica-device-fault-" + Instant.now().toString().replace(':', '-') + ".bin")
+        // The game directory, not the process CWD: launchers routinely run Minecraft from somewhere
+        // else, and a fault dump nobody can find is worthless.
+        Path path = net.fabricmc.loader.api.FabricLoader.getInstance().getGameDir()
+                .resolve("caustica-device-fault-" + Instant.now().toString().replace(':', '-') + ".bin")
                 .toAbsolutePath();
         ByteBuffer data = binary.duplicate().position(0).limit(size);
         try (FileChannel channel = FileChannel.open(path, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {

@@ -1,11 +1,9 @@
 package dev.comfyfluffy.caustica.ngx;
 
-import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
-import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 
 import net.fabricmc.loader.api.FabricLoader;
 
@@ -31,7 +29,7 @@ import java.util.stream.Stream;
 /**
  * Shared NVIDIA NGX lifetime for the mod. Loads the native shim, extracts the bundled NGX feature DLLs,
  * and runs {@code ngxshim_init} / {@code ngxshim_shutdown} exactly once per Vulkan device. Multiple NGX
- * features (DLSS Ray Reconstruction, and later Frame Generation) share this single initialized
+ * features (DLSS Ray Reconstruction and DLSS Frame Generation) share this single initialized
  * {@link NgxLibrary}; each feature owns only its own create/evaluate/release. NGX is shut down only at
  * device teardown (so releasing one feature can't tear NGX down while another still holds a handle).
  */
@@ -40,9 +38,18 @@ public final class NgxRuntime {
 
     private static final PlatformNatives PLATFORM_NATIVES = PlatformNatives.current();
 
+    // One shim load per resolved path, reused across init/shutdown cycles: the global-arena lookup
+    // keeps the DLL loaded for the JVM's life anyway, so a second load would only grow the OS
+    // reference count and strand the previous method handles. This also keeps the natives
+    // re-extraction contract intact — an already-correct file on disk is never rewritten, so the
+    // loader never has to open a file another module has mapped.
+    private static volatile NgxLibrary cachedLibrary;
+    private static volatile Path cachedLibraryPath;
+
     private NgxLibrary lib;
     private boolean initialized;
     private boolean failed;
+    private long initializedDevice;
 
     private NgxRuntime() {
     }
@@ -50,11 +57,17 @@ public final class NgxRuntime {
     /**
      * Ensure NGX is loaded and initialized for {@code device}, returning the shared {@link NgxLibrary}, or
      * {@code null} if it is unavailable. Idempotent; latches failure so it isn't retried every frame
-     * (cleared by {@link #shutdown()} so a fresh device can re-init).
+     * (cleared by {@link #shutdown()} so a fresh device can re-init). A device other than the one NGX was
+     * initialized against first shuts the old state down and re-initializes, so a rebuilt render device
+     * never receives a library still bound to the previous {@code VkDevice}.
      */
     public synchronized NgxLibrary acquire(VulkanDevice device) {
         if (initialized) {
-            return lib;
+            if (initializedDevice == device.vkDevice().address()) {
+                return lib;
+            }
+            CausticaMod.LOGGER.info("NGX device changed; re-initializing for the new Vulkan device");
+            shutdown();
         }
         if (failed) {
             return null;
@@ -81,14 +94,14 @@ public final class NgxRuntime {
     }
 
     /**
-     * Shut down NGX. Call only at device teardown, after every feature has been released. Resolves the
-     * device from the current render backend; no-op if NGX was never initialized.
+     * Shut down NGX. Call only at device teardown, after every feature has been released. Uses the device
+     * handle recorded at init time rather than resolving one from the render backend, which may already be
+     * gone when this runs. No-op if NGX was never initialized.
      */
     public synchronized void shutdown() {
-        if (lib != null && initialized
-                && ((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
+        if (lib != null && initialized && initializedDevice != 0L) {
             try {
-                lib.shutdown(device.vkDevice().address());
+                lib.shutdown(initializedDevice);
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("NGX shutdown failed", t);
             }
@@ -96,11 +109,34 @@ public final class NgxRuntime {
         initialized = false;
         failed = false;
         lib = null;
+        initializedDevice = 0L;
+    }
+
+    /**
+     * Extract the bundled natives and load the shim ahead of the first frame that needs it, so the file
+     * IO and dlopen do not land on the render thread inside an {@link #acquire} call. Never initializes
+     * NGX; safe to call before a device exists, and cheap to repeat.
+     */
+    public void prewarm() {
+        if (!PLATFORM_NATIVES.supported()) {
+            return;
+        }
+        Path shim = locateShim();
+        if (shim == null) {
+            return;
+        }
+        try {
+            loadShim(shim);
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.debug("NGX shim prewarm did not complete ({})", t.toString());
+        }
     }
 
     /** NVSDK_NGX_Result: failure when the top 12 bits == 0xBAD. Shared by all NGX feature wrappers. */
     public static boolean ngxFailed(int result) {
-        return (result & 0xFFF00000) == 0xBAD00000;
+        // Negative values are shim-side sentinels rather than NVSDK_NGX_Result codes, and their top
+        // bits do not spell 0xBAD; every negative is a failure.
+        return result < 0 || (result & 0xFFF00000) == 0xBAD00000;
     }
 
     private void init(VulkanDevice device) {
@@ -121,9 +157,9 @@ public final class NgxRuntime {
             }
         }
 
-        lib = NgxLibrary.load(shim);
+        lib = loadShim(shim);
 
-        Path dataPath = FabricLoader.getInstance().getGameDir().resolve("caustica-ngx");
+        Path dataPath = FabricLoader.getInstance().getGameDir().resolve("bettercaustica-ngx");
         try {
             Files.createDirectories(dataPath);
         } catch (Exception e) {
@@ -144,7 +180,19 @@ public final class NgxRuntime {
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
         }
+        initializedDevice = device.vkDevice().address();
         CausticaMod.LOGGER.info("NGX initialized (shim {})", shim);
+    }
+
+    private static NgxLibrary loadShim(Path shim) {
+        NgxLibrary cached = cachedLibrary;
+        if (cached != null && shim.equals(cachedLibraryPath)) {
+            return cached;
+        }
+        NgxLibrary loaded = NgxLibrary.load(shim);
+        cachedLibrary = loaded;
+        cachedLibraryPath = shim;
+        return loaded;
     }
 
     private static Path locateShim() {
@@ -160,7 +208,7 @@ public final class NgxRuntime {
     }
 
     private static Path extractBundledNatives() {
-        Path dir = FabricLoader.getInstance().getGameDir().resolve("caustica-ngx")
+        Path dir = FabricLoader.getInstance().getGameDir().resolve("bettercaustica-ngx")
                 .resolve("natives").resolve(PLATFORM_NATIVES.platformDir());
         try {
             Files.createDirectories(dir);
@@ -199,8 +247,8 @@ public final class NgxRuntime {
 
     private static List<String> bundledFeatureLibraryNames() {
         List<String> names = new ArrayList<>();
-        FabricLoader.getInstance().getModContainer("caustica").ifPresent(container -> {
-            String nativeDir = "caustica/natives/" + PLATFORM_NATIVES.platformDir();
+        FabricLoader.getInstance().getModContainer("bettercaustica").ifPresent(container -> {
+            String nativeDir = "bettercaustica/natives/" + PLATFORM_NATIVES.platformDir();
             for (Path root : container.getRootPaths()) {
                 Path dir = root.resolve(nativeDir);
                 if (!Files.isDirectory(dir)) {
@@ -248,12 +296,11 @@ public final class NgxRuntime {
     }
 
     // Native wchar_t width differs by platform: 2 bytes (UTF-16) on Windows, 4 bytes (UTF-32)
-    // on Linux. Encode paths to the platform width expected by the NGX C ABI.
-    private static final boolean WCHAR_IS_UTF16 =
-            System.getProperty("os.name", "").toLowerCase().contains("win");
+    // on Linux. Encode paths to the platform width expected by the NGX C ABI, per the same probe
+    // that selected the natives bundle.
     private static final Charset WCHAR_CHARSET =
-            WCHAR_IS_UTF16 ? StandardCharsets.UTF_16LE : Charset.forName("UTF-32LE");
-    private static final int WCHAR_SIZE = WCHAR_IS_UTF16 ? 2 : 4;
+            PLATFORM_NATIVES.wcharUtf16() ? StandardCharsets.UTF_16LE : Charset.forName("UTF-32LE");
+    private static final int WCHAR_SIZE = PLATFORM_NATIVES.wcharUtf16() ? 2 : 4;
 
     private static MemorySegment wideString(Arena arena, String s) {
         byte[] data = s.getBytes(WCHAR_CHARSET);
@@ -266,24 +313,25 @@ public final class NgxRuntime {
     }
 
     private record PlatformNatives(String platformDir, String shimName, List<String> exactFeatureNames,
-                                   List<String> featureNamePrefixes, boolean supported) {
+                                   List<String> featureNamePrefixes, boolean wcharUtf16, boolean supported) {
         private static PlatformNatives current() {
             String os = System.getProperty("os.name", "").toLowerCase();
             String arch = System.getProperty("os.arch", "").toLowerCase();
             boolean x64 = arch.equals("x86_64") || arch.equals("amd64");
             if (os.contains("win") && x64) {
                 return new PlatformNatives("windows-x64", "ngxshim.dll",
-                        List.of("nvngx_dlssd.dll", "nvngx_dlssg.dll"), List.of(), true);
+                        List.of("nvngx_dlssd.dll", "nvngx_dlssg.dll"), List.of(), true, true);
             }
             if (os.contains("linux") && x64) {
                 return new PlatformNatives("linux-x64", "libngxshim.so", List.of(),
-                        List.of("libnvidia-ngx-dlssd.so", "libnvidia-ngx-dlssg.so"), true);
+                        List.of("libnvidia-ngx-dlssd.so", "libnvidia-ngx-dlssg.so"), false, true);
             }
-            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"), List.of(), List.of(), false);
+            return new PlatformNatives(os + "/" + arch, System.mapLibraryName("ngxshim"), List.of(), List.of(),
+                    false, false);
         }
 
         private String resourceDir() {
-            return "/caustica/natives/" + platformDir + "/";
+            return "/bettercaustica/natives/" + platformDir + "/";
         }
 
         private boolean isFeatureLibrary(String name) {

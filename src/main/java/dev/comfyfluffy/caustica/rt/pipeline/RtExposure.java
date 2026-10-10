@@ -41,8 +41,10 @@ public final class RtExposure {
     private ExposureCurve cachedCurve;
     private boolean resetRequested = true;
     private int resetSequence;
-    /** This frame's latched pre-exposure; see {@link #beginFrame(RtGpuExecutor.GraphicsUseWaiter)}. */
+    /** This frame's latched pre-exposure; see {@link #beginFrame(RtGpuExecutor.GraphicsUseWaiter, float)}. */
     private float framePreExposure = 1.0f;
+    /** This frame's latched night lift in EV; see {@link #beginFrame} for why it is latched too. */
+    private float frameNightLift;
 
     private static final long DIAG_LOG_INTERVAL_NANOS = 1_000_000_000L;
     private static final int STATE_READBACK_RING = 6;
@@ -64,6 +66,15 @@ public final class RtExposure {
 
     public boolean ready() {
         return image != null;
+    }
+
+    /**
+     * Whether the controller is metering the scene. {@code ExposureState.evScene} is only refreshed
+     * while auto exposure runs; in manual mode the histogram and resolve are not dispatched at all, so
+     * the field keeps its seed value and anything that adapts to scene luminance would key on noise.
+     */
+    public boolean isAuto() {
+        return mode() == Mode.AUTO;
     }
 
     public RtBuffer stateBuffer() {
@@ -162,8 +173,9 @@ public final class RtExposure {
         }
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure manual write")) {
             VkClearColorValue color = VkClearColorValue.calloc(stack);
-            // Residual, not absolute: raygen already applied preExposure (which in manual mode IS
-            // manualExposureScale, making this exactly 1.0). See preExposure().
+            // Residual, not absolute: raygen already applied preExposure. With PRE_EXPOSURE enabled the
+            // manual scale is folded into preExposure, which leaves this clear value at exactly 1.0;
+            // without it the residual scale is written here. See preExposure().
             color.float32(0, manualExposureScale() / Math.max(preExposure(), 1.0e-12f));
             VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
             range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
@@ -201,6 +213,10 @@ public final class RtExposure {
         pendingStateReadback = null;
         completedState = null;
         framePreExposure = 1.0f;
+        frameNightLift = 0.0f;
+        logged = false;
+        cachedCurveSpec = null;
+        cachedCurve = null;
     }
 
     // Manual mode's exposure scale, also used as the auto-history seed (resetAutoHistory) so the very
@@ -299,11 +315,11 @@ public final class RtExposure {
         CausticaMod.LOGGER.info(
                 "RT exposure diag: evScene(EV100)={} evTarget={}{} evApplied={} preExposure={} "
                         + "clipLow={}% clipHigh={}% skyScale={} skyWeight={}% emissiveScale={} "
-                        + "emissiveWeight={}% curveComp={} effectiveSlope={}",
+                        + "emissiveWeight={}% curveComp={} effectiveSlope={} nightLift={}",
                 fmt(evScene), fmt(evTarget), pinnedLow ? " (at minEv clamp)" : pinnedHigh ? " (at maxEv clamp)" : "",
                 fmt(evApplied), fmt(preExposure()), fmt(clipLowFrac * 100.0f), fmt(clipHighFrac * 100.0f),
                 fmt(skyScale), fmt(skyFrac * 100.0f), fmt(emissiveScale),
-                fmt(emissiveFrac * 100.0f), fmt(curveCompensation), fmt(effectiveSlope));
+                fmt(emissiveFrac * 100.0f), fmt(curveCompensation), fmt(effectiveSlope), fmt(frameNightLift));
     }
 
     private static String fmt(float v) {
@@ -380,12 +396,20 @@ public final class RtExposure {
                 + ", centerWeight=" + autoConfig.centerWeightSigma + "/" + autoConfig.centerWeightFloor
                 + ", skyCap=" + autoConfig.skyWeightCap
                 + ", emissiveCap=" + autoConfig.emissiveWeightCap
+                + ", nightLift=" + CausticaConfig.Rt.Exposure.NIGHT_LIFT.value()
                 + ", curve=" + CausticaConfig.Rt.Exposure.curve() + ")"
                 : Float.toString(manualExposureScale());
-        CausticaMod.LOGGER.info("RT display exposure: mode={}, exposure={}, "
-                        + "tonemap=aces2.0(lookPackage={},gamma={}), DLSS-RR exposure=NGX auto",
-                mode.configName, exposureText, RtLookPackage.current().id(),
-                CausticaConfig.Rt.Tonemap.GAMMA.value());
+        CausticaMod.LOGGER.info("RT display exposure: mode={}, exposure={}, grading={}, gamma={}, "
+                        + "DLSS-RR exposure=NGX auto",
+                mode.configName, exposureText, gradingText(), CausticaConfig.Rt.Tonemap.GAMMA.value());
+    }
+
+    /** Which display chain the frame will use, and the knobs that only that chain reads. */
+    private static String gradingText() {
+        return CausticaConfig.Rt.Tonemap.ADVANCED_GRADING.value()
+                ? "agx(gain=" + CausticaConfig.Rt.Tonemap.AGX_GAIN.value()
+                        + ",saturation=" + CausticaConfig.Rt.Tonemap.AGX_SATURATION.value() + ")"
+                : "aces2.0-look(lookPackage=" + RtLookPackage.current().id() + ")";
     }
 
     private static Mode mode() {
@@ -400,7 +424,10 @@ public final class RtExposure {
         return new AutoConfig(
                 CausticaConfig.Rt.Exposure.KEY.value(),
                 CausticaConfig.Rt.Exposure.minEv(),
-                CausticaConfig.Rt.Exposure.maxEv(),
+                // The night offset moves the demand by its own amount in either direction, so the ceiling
+                // travels with it; left where it is, it eats exactly the stops the player dialled in. It
+                // must never dip below the floor, or the resolver's clamp inverts.
+                Math.max(CausticaConfig.Rt.Exposure.minEv(), CausticaConfig.Rt.Exposure.maxEv() + frameNightLift),
                 CausticaConfig.Rt.Exposure.ADAPT_DARKEN.value(),
                 CausticaConfig.Rt.Exposure.ADAPT_BRIGHTEN.value(),
                 manualEv(),
@@ -411,21 +438,26 @@ public final class RtExposure {
                 CausticaConfig.Rt.Exposure.CENTER_WEIGHT_FLOOR.value(),
                 CausticaConfig.Rt.Exposure.SKY_WEIGHT_CAP.value(),
                 CausticaConfig.Rt.Exposure.EMISSIVE_WEIGHT_CAP.value(),
-                curveConfig(),
+                curveConfig().withNightLift(frameNightLift),
                 preExposure(),
                 resetSequence);
     }
 
     /**
-     * Latches this frame's pre-exposure. MUST be called once per frame before the world push
-     * constants are written, and must not be re-latched afterwards.
+     * Latches this frame's pre-exposure and night lift. MUST be called once per frame before the world
+     * push constants are written, and must not be re-latched afterwards.
      *
      * <p>The raygen multiply and the resolve's divide have to use the <em>same</em> value or they
      * stop cancelling and the frame comes out mis-scaled. Both read {@link #preExposure()}, but at
      * different points in CPU time. The completed readback can be several frames old, so latching once
      * ensures both consumers use one prediction; the residual absorbs whatever it failed to predict.
+     *
+     * <p>{@code nightFactor} is how dark the world's sky is, 0 at midday and 1 at full night. It arrives
+     * from the caller because it is camera state, and this class owns the exposure controller rather
+     * than the world.
      */
-    public void beginFrame(RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter) {
+    public void beginFrame(RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter, float nightFactor) {
+        frameNightLift = CausticaConfig.Rt.Exposure.NIGHT_LIFT.value() * Math.clamp(nightFactor, 0.0f, 1.0f);
         Mode currentMode = mode();
         boolean reset = currentMode == Mode.AUTO && resetRequested;
         if (reset) {
@@ -585,6 +617,19 @@ public final class RtExposure {
 
     record ExposureCurve(float scene0, float compensation0, float scene1, float compensation1,
                          float scene2, float compensation2, float scene3, float compensation3) {
+        /**
+         * The night offset folded in. Both night control points move together, so the offset is full at and
+         * below {@code scene0}, keeps its full strength through {@code scene1}, and tapers to nothing where
+         * the first day point takes over. Doing it here rather than in the resolve keeps the shader's curve
+         * a plain piecewise-linear read of these eight numbers, and lets the ceiling in
+         * {@link AutoConfig#maxEv()} move by the same amount.
+         */
+        ExposureCurve withNightLift(float lift) {
+            return lift == 0.0f ? this
+                    : new ExposureCurve(scene0, compensation0 + lift, scene1, compensation1 + lift,
+                            scene2, compensation2, scene3, compensation3);
+        }
+
         float compensationAt(float sceneEv) {
             if (sceneEv <= scene0) {
                 return compensation0;

@@ -143,6 +143,12 @@ public final class RtGpuExecutor {
         return new GraphicsUse(latestGraphicsUseValue.get());
     }
 
+    /** Latest frame token observed complete on the graphics timeline, without blocking. */
+    public long completedGraphicsUseValue() {
+        assertRenderThread();
+        return queryTimeline(graphicsTimeline);
+    }
+
     /** Rethrow a latched executor failure on the calling thread. */
     public void throwIfFailed() {
         checkExecutorFailure();
@@ -200,12 +206,16 @@ public final class RtGpuExecutor {
         }
     }
 
-    public synchronized void shutdown() {
-        if (closed) {
-            return;
+    public void shutdown() {
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            jobs.add(STOP);
         }
-        closed = true;
-        jobs.add(STOP);
+        // The monitor must be released before joining: the executor thread takes this same monitor in
+        // failQueuedJobs() on its way out, so joining while holding it would deadlock both threads.
         try {
             thread.join();
         } catch (InterruptedException e) {
@@ -242,6 +252,10 @@ public final class RtGpuExecutor {
                 return;
             }
             if (first == STOP) {
+                // Draining here gives every queued job's owner its terminal callback, so ownership
+                // unwinds instead of stranding tasks behind a stopped executor. A normal stop is not
+                // an executor failure: latching it would make shutdown() throw below.
+                cancelQueuedJobs(new CancellationException("RT GPU executor stopped"));
                 return;
             }
             if (first == WAKE) {
@@ -298,6 +312,7 @@ public final class RtGpuExecutor {
                 return;
             }
             if (stopAfterBatch) {
+                cancelQueuedJobs(new CancellationException("RT GPU executor stopped"));
                 return;
             }
         }
@@ -325,10 +340,19 @@ public final class RtGpuExecutor {
     private synchronized void failQueuedJobs(Throwable failure) {
         Throwable terminal = failure != null ? failure : new IllegalStateException("RT GPU executor stopped");
         latchFailure(terminal);
+        cancelQueuedJobs(terminal);
+    }
+
+    /**
+     * Give every queued job's owner its terminal callback without latching an executor failure. This
+     * is the normal-stop path: the cancellation reaches the owners, but {@code executorFailure} stays
+     * null so {@link #flushDestroysAfterDeviceIdle} treats the shutdown as clean.
+     */
+    private synchronized void cancelQueuedJobs(Throwable failure) {
         Job job;
         while ((job = jobs.poll()) != null) {
             if (job != STOP && job != WAKE) {
-                finishJob(job, terminal);
+                finishJob(job, failure);
             }
         }
     }
@@ -529,6 +553,11 @@ public final class RtGpuExecutor {
         public void mark(GraphicsUse graphicsUse) {
             assertRenderThread();
             value = Math.max(value, graphicsUse.value);
+        }
+
+        /** The most recently marked frame token; 0 before the first mark. */
+        public long value() {
+            return value;
         }
     }
 

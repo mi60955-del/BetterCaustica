@@ -1,13 +1,13 @@
 package dev.comfyfluffy.caustica.rt;
 
+import org.lwjgl.vulkan.EXTOpacityMicromap;
+import org.lwjgl.vulkan.KHRAccelerationStructure;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
 
 /** Thin wrapper over Minecraft's VK_EXT_debug_utils integration for RT-owned raw Vulkan objects. */
 public final class RtDebugLabels {
     private static final String PREFIX = "RT ";
-    private static final int VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR = 1000150000;
-    private static final int VK_OBJECT_TYPE_MICROMAP_EXT = 1000396000;
 
     private RtDebugLabels() {}
 
@@ -31,11 +31,11 @@ public final class RtDebugLabels {
     }
 
     public static void nameAccelerationStructure(RtContext ctx, long handle, String label) {
-        name(ctx, VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, handle, label);
+        name(ctx, KHRAccelerationStructure.VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, handle, label);
     }
 
     public static void nameMicromap(RtContext ctx, long handle, String label) {
-        name(ctx, VK_OBJECT_TYPE_MICROMAP_EXT, handle, label);
+        name(ctx, EXTOpacityMicromap.VK_OBJECT_TYPE_MICROMAP_EXT, handle, label);
     }
 
     public static Scope scope(RtContext ctx, VkCommandBuffer cmd, String label) {

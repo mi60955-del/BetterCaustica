@@ -20,7 +20,6 @@ import java.nio.file.Path;
 public final class NgxLibrary {
 	private static final Linker LINKER = Linker.nativeLinker();
 
-	private final MethodHandle requiredExtensions;
 	private final MethodHandle init;
 	private final MethodHandle dlssAvailable;
 	private final MethodHandle queryOptimal;
@@ -39,9 +38,6 @@ public final class NgxLibrary {
 	private final MethodHandle lastResult;
 
 	private NgxLibrary(SymbolLookup lookup) {
-		// int ngxshim_required_extensions(int wantDevice, char* outBuf, int bufLen)
-		this.requiredExtensions = handle(lookup, "ngxshim_required_extensions",
-				FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
 		// int ngxshim_init(u64 appId, wchar* dataPath, VkInstance, VkPhysicalDevice, VkDevice, void* gipa, void* gdpa, wchar* dllPath)
 		this.init = handle(lookup, "ngxshim_init",
 				FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS,
@@ -146,14 +142,6 @@ public final class NgxLibrary {
 		return lookup.find(name).map(sym -> LINKER.downcallHandle(sym, desc)).orElse(null);
 	}
 
-	public int requiredExtensions(boolean wantDevice, MemorySegment outBuf, int bufLen) {
-		try {
-			return (int) this.requiredExtensions.invokeExact(wantDevice ? 1 : 0, outBuf, bufLen);
-		} catch (Throwable t) {
-			throw new RuntimeException("ngxshim_required_extensions failed", t);
-		}
-	}
-
 	public int init(long appId, MemorySegment dataPath, long vkInstance, long vkPhysicalDevice, long vkDevice,
 	                long getInstanceProcAddr, long getDeviceProcAddr, MemorySegment dllPath) {
 		try {
@@ -226,6 +214,10 @@ public final class NgxLibrary {
 		return queryOptimalDlssd != null;
 	}
 
+	/**
+	 * Safe default of {@code -1} when the loaded shim predates the query; callers treat every negative
+	 * through {@link NgxRuntime#ngxFailed} as failure.
+	 */
 	public int queryOptimalDlssd(int displayWidth, int displayHeight, int quality,
 	                             MemorySegment outRenderWidth, MemorySegment outRenderHeight, MemorySegment outSharpness) {
 		if (queryOptimalDlssd == null) {
@@ -282,11 +274,17 @@ public final class NgxLibrary {
 		}
 	}
 
-	/** Whether the loaded shim exposes the DLSSG ABI at all (false for a stale shim built before FG). */
+	/**
+	 * Whether the loaded shim exposes the DLSSG ABI at all (false for a stale shim built before FG).
+	 * The other DLSSG entries build on it: the queries answer with safe defaults when it is false,
+	 * while create/evaluate throw, so a stale shim degrades to "FG unavailable" rather than to a
+	 * mis-typed call.
+	 */
 	public boolean hasDlssg() {
 		return dlssgAvailable != null && createDlssg != null && evaluateDlssg != null;
 	}
 
+	/** Safe default of {@code false} when the loaded shim predates the DLSSG ABI. */
 	public boolean dlssgAvailable() {
 		if (dlssgAvailable == null) {
 			return false;
@@ -298,6 +296,7 @@ public final class NgxLibrary {
 		}
 	}
 
+	/** Safe default of {@code 0} ("multi-frame generation not on offer") when the shim predates DLSSG. */
 	public int dlssgMultiFrameCountMax() {
 		if (dlssgMultiFrameCountMax == null) {
 			return 0;
@@ -309,8 +308,14 @@ public final class NgxLibrary {
 		}
 	}
 
+	/**
+	 * Create the DLSSG feature. Requires {@link #hasDlssg()}: the shim must expose the DLSSG ABI.
+	 */
 	public MemorySegment createDlssg(long cmd, int width, int height, int renderWidth, int renderHeight,
 	                                 int nativeBackbufferFormat) {
+		if (createDlssg == null) {
+			throw new IllegalStateException("ngxshim_create_dlssg is absent; the loaded shim predates the DLSSG ABI");
+		}
 		try {
 			return (MemorySegment) this.createDlssg.invokeExact(cmd, width, height, renderWidth, renderHeight,
 					nativeBackbufferFormat);
@@ -319,6 +324,9 @@ public final class NgxLibrary {
 		}
 	}
 
+	/**
+	 * Evaluate the DLSSG feature. Requires {@link #hasDlssg()} and a feature from {@link #createDlssg}.
+	 */
 	public int evaluateDlssg(long cmd, MemorySegment feature,
 	                         long backbufferView, long backbufferImage, int backbufferFormat,
 	                         long depthView, long depthImage, int depthFormat,
@@ -333,6 +341,9 @@ public final class NgxLibrary {
 	                         int depthInverted, int colorBuffersHDR, int cameraMotionIncluded, int reset,
 	                         MemorySegment cameraViewToClip, MemorySegment clipToCameraView,
 	                         MemorySegment clipToPrevClip, MemorySegment prevClipToClip) {
+		if (evaluateDlssg == null) {
+			throw new IllegalStateException("ngxshim_evaluate_dlssg is absent; the loaded shim predates the DLSSG ABI");
+		}
 		try {
 			return (int) this.evaluateDlssg.invokeExact(cmd, feature,
 					backbufferView, backbufferImage, backbufferFormat,
