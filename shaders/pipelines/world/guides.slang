@@ -106,8 +106,10 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
     float3 specDir = reflect(primaryDir, n);
 
     // Pass A stops radiance traversal at the first split, so reflection motion keeps one dedicated,
-    // deterministic guide probe.
-    traceGuide(CULL_SECONDARY,
+    // deterministic guide probe. CULL_SPECULAR must match the mask the reflected radiance ray will take
+    // in the indirect pass: if the probe excluded particles while the reflected image includes them, the
+    // motion vectors here would reproject a different scene than the one being denoised.
+    traceGuide(CULL_SECONDARY | CULL_SPECULAR,
             offsetSurfaceOrigin(surfacePos, surface.biasNormal, specDir, SURF_BIAS),
             RAY_TMIN, specDir, 10000.0,
             max(length(surface.camRel) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
@@ -202,13 +204,14 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
             float waterFootprint = rayConeWidth
                     / max(abs(dot(-direction, geometricNormal)), 0.2);
             interfaceNormal = applyWaterWaves(geometricNormal,
-                    interfacePos.xz + worldPush.waterAnchor.xy,
-                    worldPush.waterParams.w, waterFootprint);
+                    float3(interfacePos.xz + worldPush.waterAnchor.xy, interfacePos.y),
+                    direction, worldPush.waterParams.w, waterFootprint);
         }
 
         float transmission = clamp(payloadTransmission(), 0.0, 1.0);
         Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0),
-                                              payloadAlbedo(), transmission);
+                                              payloadAlbedo(), transmission,
+                                              worldPush.waterOpacity);
         float etaT = entering ? entered.ior : medium.outer.ior;
         float3 nextDirection = refract(direction, interfaceNormal, medium.current.ior / etaT);
         if (dot(nextDirection, nextDirection) <= 0.0) {

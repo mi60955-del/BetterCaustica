@@ -9,6 +9,12 @@ import bindings;
 
 public static const uint CULL_SECONDARY = 0x01u;
 public static const uint CULL_PRIMARY = 0x02u;
+// Rays leaving a specular or dielectric interface. Only particles opt into this bit: they are excluded
+// from plain secondary rays so smoke and dust never cast hard shadows from any light, but a mirror,
+// still water or glass must still show them. Any ray that takes this bit must also take it in the
+// matching guide probe, or the reflection motion vectors are computed against a different scene than
+// the radiance they reproject.
+public static const uint CULL_SPECULAR = 0x04u;
 public static const uint TERRAIN_BUCKETS = 4u;
 public static const uint SBT_RADIANCE = 0u;
 public static const uint SBT_SHADOW = TERRAIN_BUCKETS;
@@ -55,10 +61,14 @@ public Payload makeRadiancePayload(uint flags, uint rayCone) {
 }
 
 // Ordinary radiance trace for latency-sensitive, coherent work such as Pass A. It invokes hit/miss
-// shaders directly and therefore requires no invocation-reorder capability.
+// shaders directly and therefore requires no invocation-reorder capability. `guideStable` marks a trace
+// whose result only feeds the guide buffers (see PAYLOAD_GUIDE_STABLE): alpha coverage must then resolve
+// deterministically, or the guide flips per frame and DLSS-RR has nothing to demodulate against.
 public void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float tmax,
-                    bool showCelestial, float rayConeWidth, float rayConeSpread) {
-    payload = makeRadiancePayload(showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u,
+                    bool showCelestial, float rayConeWidth, float rayConeSpread,
+                    bool guideStable) {
+    payload = makeRadiancePayload((showCelestial ? PAYLOAD_SHOW_CELESTIAL : 0u)
+                    | (guideStable ? PAYLOAD_GUIDE_STABLE : 0u),
             packHalf2(float2(rayConeWidth, rayConeSpread)));
     TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask,
             SBT_RADIANCE, SBT_STRIDE_BUCKET, MISS_RADIANCE,
@@ -68,10 +78,10 @@ public void traceRadiance(uint cullMask, float3 ro, float tmin, float3 rd, float
 // Auxiliary RR probes deliberately use ordinary TraceRay. They are one-off, incoherent rays whose
 // result is consumed immediately, so paying a reorder barrier and carrying guide state across it only
 // adds latency. The dedicated miss record also avoids the atmosphere march: guides need hit-vs-miss,
-// not sky radiance.
+// not sky radiance. Every probe is guide-only work, so coverage resolves deterministically.
 public void traceGuide(uint cullMask, float3 ro, float tmin, float3 rd, float tmax,
                 float rayConeWidth, float rayConeSpread) {
-    payload = makeRadiancePayload(0u, packHalf2(float2(rayConeWidth, rayConeSpread)));
+    payload = makeRadiancePayload(PAYLOAD_GUIDE_STABLE, packHalf2(float2(rayConeWidth, rayConeSpread)));
     TraceRay(topLevelAS, RAY_FLAG_NONE, cullMask, SBT_RADIANCE, SBT_STRIDE_BUCKET,
             MISS_GUIDE, makeRay(ro, tmin, rd, tmax), payload);
 }

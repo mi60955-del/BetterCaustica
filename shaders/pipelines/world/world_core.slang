@@ -33,6 +33,7 @@ public uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
 // travelling into the volume (vs. out of it) at this hit's face.
 public bool payloadDielectricEntering() { return (payload.flags & PAYLOAD_DIELECTRIC_ENTERING) != 0u; }
 public bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
+public bool payloadUnlit() { return (payload.flags & PAYLOAD_UNLIT) != 0u; }
 // LINEAR roughness, i.e. GGX alpha directly — NOT perceptual roughness. This is the one convention used
 // end to end: LabPBR defines roughness = (1 - perceptualSmoothness)^2 and RtLabPbr.decode stores exactly
 // that, RtMaterials.Profile carries the same units, and DLSS-RR wants linear roughness in its guide. So

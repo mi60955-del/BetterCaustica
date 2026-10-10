@@ -10,6 +10,10 @@ import math;
 import trace;
 
 public struct Reservoir {
+    public uint   lightIndex; // survivor's record in pc.lightBufAddr, so the sample can be re-derived
+                              // against a later frame instead of shipping its geometry across frames
+    public float2 suv;        // survivor's coordinates on the emitter rectangle, [-1,1]^2. Persisted
+                              // alongside the index so a later frame re-derives the SAME point
     public float3 pos;  // light sample point (rebased world space)
     public float3 lnrm; // emitter outward normal
     public float3 le;   // emitter radiance
@@ -22,6 +26,8 @@ public struct Reservoir {
 
 public Reservoir resEmpty() {
     Reservoir r;
+    r.lightIndex = 0u;
+    r.suv = float2(0.0, 0.0);
     r.pos = float3(0.0, 0.0, 0.0);
     r.lnrm = float3(0.0, 0.0, 0.0);
     r.le = float3(0.0, 0.0, 0.0);
@@ -280,6 +286,8 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
         float w = phat / max(sourcePdf, 1.0e-20);
         r.wSum += w;
         if (rndf(seed) * r.wSum < w) { // weighted reservoir update
+            r.lightIndex = li;
+            r.suv = float2(s, t);
             r.pos = sp;
             r.lnrm = lightNormal;
             r.le = le;
@@ -289,6 +297,183 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
     }
     r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;
     return r;
+}
+
+// Reproject a current-frame pixel into last frame's reservoir image, in texels. False when it leaves the
+// image, which is also the case on the frame after a resize if the motion buffer has not been refilled.
+public bool prevTexelOf(uint2 pix, inout float2 prevTexel) {
+    uint2 size;
+    gMotion.GetDimensions(size.x, size.y);
+    // gMotion holds (previous - current) in render-resolution pixels, so the history texel lies ahead of
+    // this one by exactly that offset.
+    prevTexel = float2(pix) + gMotion[pix].xy + 0.5;
+    return prevTexel.x >= 0.0 && prevTexel.y >= 0.0
+            && prevTexel.x < float(size.x) && prevTexel.y < float(size.y);
+}
+
+// One texel of last frame's reservoir, re-expanded and re-evaluated for the current shading point, or an
+// empty reservoir when it cannot be used. The image lanes are (light index as float, W, M, linear depth of
+// the point that was shaded) and the companion pair holds the survivor's (s,t) on the emitter rectangle.
+//
+// The stored index is remapped through pc.lightTranslationAddr before it is dereferenced, because a global
+// light index carries no meaning across a republish. The sample point is then re-derived from this frame's
+// emitter record rather than re-drawn: re-drawing it would leave W and p-hat describing different samples.
+//
+// Depth rejects a surface that has slid in front of or behind this one: absolute at close range, relative
+// far away, since a fixed epsilon rejects every distant surface and a purely relative one accepts a wall
+// moving through the frame. The normal catches what depth cannot — a reprojection that stayed on one plane
+// but crossed a feature edge, where the history carries a different lobe and reusing it reads as grain
+// rather than as blur.
+public bool storedReservoirAt(uint2 texel, float depth, float3 hitPos, float3 n, float3 v, float3 rd,
+                             float3 diffAlb, float3 F0, float rough, float sss, inout Reservoir stream) {
+    stream = resEmpty();
+    float4 stored = reservoirPrev[texel];
+    if (stored.z <= 0.0 || stored.y <= 0.0) {
+        return false;
+    }
+    if (abs(stored.w - depth) > max(0.25, 0.02 * depth) || dot(gNormal[texel].xyz, n) <= 0.8) {
+        return false;
+    }
+    uint historyIndex = uint(stored.x);
+    int translated = -1;
+    if (worldPush.lightTranslationValid != 0u) {
+        if (historyIndex < worldPush.lightTranslationCount) {
+            translated = ConstPtr<int>(pc.lightTranslationAddr)[historyIndex];
+        }
+    } else if (historyIndex < worldPush.lightCount) {
+        // No republish since the frame that wrote this history: its index is already current.
+        translated = int(historyIndex);
+    }
+    if (translated < 0 || uint(translated) >= worldPush.lightCount) {
+        return false;
+    }
+    Light lg = ConstPtr<Light>(pc.lightBufAddr)[uint(translated)];
+    float2 histSuv = reservoirSamplePrev[texel].xy;
+    stream.lightIndex = uint(translated);
+    stream.suv = histSuv;
+    stream.pos = lg.pos + worldPush.lightRebase.xyz
+            + histSuv.x * lightHalfU(lg) + histSuv.y * lightHalfV(lg);
+    stream.lnrm = lightGeometricNormal(lg);
+    stream.le = lightRadiance(lg);
+    stream.area = lightArea(lg);
+    stream.M = stored.z;
+    stream.W = stored.y;
+    evalSampleContrib(stream.pos, stream.lnrm, stream.le, stream.area, hitPos, n, v, rd,
+            diffAlb, F0, rough, false, sss, stream.phat);
+    return stream.phat > 0.0;
+}
+
+// Admit one reused stream into a running reservoir.
+//
+// The stream enters as p-hat_now(y) * W_stream * admitted rather than as a stored weight sum. W_stream is
+// the normalisation the stream itself was selected under, so this divides that p-hat out and this frame's
+// in, which is what accounts for a texel that over- or under-sampled the survivor relative to the current
+// shading point. Where the two p-hats agree — a still camera over an unchanged emitter record — the product
+// is exactly that stream's weight sum.
+//
+// `admitted` is how many of the stream's own candidates this pixel trusts. Admitting an unbounded history
+// while the caller's ceiling stops M growing makes W = wSum / (M * p-hat) climb without bound the longer a
+// pixel stands still, which reads as fireflies that worsen over time.
+public void reuseInto(inout Reservoir best, Reservoir stream, float admitted, inout uint seed) {
+    if (admitted <= 0.0) {
+        return;
+    }
+    float w = stream.W * stream.phat * admitted;
+    if (w <= 0.0) {
+        return;
+    }
+    float wSum = best.wSum + w;
+    float m = best.M + admitted;
+    if (rndf(seed) * wSum < w) {
+        stream.M = m;
+        stream.wSum = wSum;
+        stream.W = wSum / (m * stream.phat);
+        best = stream;
+    } else {
+        // best.phat is positive whenever best.wSum is: a candidate with no contribution is skipped before
+        // it can enter the weight sum, and only a contributing candidate becomes the survivor.
+        best.M = m;
+        best.wSum = wSum;
+        best.W = wSum / (m * best.phat);
+    }
+}
+
+// Screen-space temporal reuse of the bounce-0 diffuse reservoir, and the write-back that feeds next frame.
+// The ceiling never drops below this frame's own candidate count: at that point the history contributes
+// zero and the merge degenerates exactly to single-frame shading.
+public Reservoir risTemporal(Reservoir cur, uint2 pix, float depth, float3 hitPos, float3 n, float3 v,
+                            float3 rd, float3 diffAlb, float3 F0, float rough, float sss,
+                            inout uint seed) {
+    Reservoir best = cur;
+    if (worldPush.risTemporalReuse != 0u) {
+        float2 prevTexel;
+        Reservoir hist;
+        if (prevTexelOf(pix, prevTexel)
+                && storedReservoirAt(int2(prevTexel), depth, hitPos, n, v, rd, diffAlb, F0, rough, sss,
+                        hist)) {
+            reuseInto(best, hist, min(hist.M, max(float(worldPush.risTemporalHistory), cur.M) - cur.M),
+                    seed);
+        }
+    }
+    reservoirCur[pix] = float4(float(best.lightIndex), best.W, best.M, depth);
+    reservoirSampleCur[pix] = best.suv;
+    return best;
+}
+
+// How many of last frame's neighbouring reservoirs one pixel borrows from, and the radius of that
+// neighbourhood in render-resolution texels.
+public static const uint RIS_SPATIAL_NEIGHBOURS = 3u;
+public static const float RIS_SPATIAL_RADIUS_PX = 20.0;
+
+// Spatial reuse: merge last frame's reservoirs from RIS_SPATIAL_NEIGHBOURS random texels inside a disc of
+// RIS_SPATIAL_RADIUS_PX around this pixel's reprojected texel, so a pixel that drew a poor candidate this
+// frame can still end up on the emitter its surroundings agreed on.
+//
+// Neighbours come from the PREVIOUS frame's image, not this one's: a raygen dispatch has no global barrier,
+// so this frame's neighbours may not have written their reservoir yet. Every borrowed sample therefore
+// crosses the same generation boundary the temporal merge does, and goes through the translation table for
+// the same reason.
+//
+// Each neighbour is trusted with at most one frame's worth of its own candidates, so no single neighbour
+// can dominate the survivor and the accumulated W cannot run away the way an uncapped history's does.
+//
+// This is the biased form of spatial reuse, matching ReSTIR's biased mode: a neighbour's proposal pdf
+// covers its own cell of the light grid rather than this pixel's, and no visibility ray is traced for a
+// borrowed sample, so the survivor can be one the neighbour could see and this point cannot. The visible
+// cost of that trade is darkening at occlusion boundaries, which is what the depth and normal gates in
+// storedReservoirAt limit.
+//
+// worldPush.risTemporalReuse gates this too, not just risTemporal: every borrowed sample comes from a
+// previous frame, so the switch means "reuse last frame's reservoirs at all" and turning it off has to
+// leave a pixel with nothing but this frame's own candidates.
+public Reservoir risSpatial(Reservoir cur, uint2 pix, float depth, float3 hitPos, float3 n, float3 v,
+                           float3 rd, float3 diffAlb, float3 F0, float rough, float sss,
+                           inout uint seed) {
+    Reservoir best = cur;
+    if (worldPush.risTemporalReuse == 0u) {
+        return best;
+    }
+    float2 centre;
+    uint2 size;
+    gMotion.GetDimensions(size.x, size.y);
+    if (!prevTexelOf(pix, centre)) {
+        return best;
+    }
+    for (uint j = 0u; j < RIS_SPATIAL_NEIGHBOURS; j++) {
+        // A random point in the disc rather than a fixed box around the pixel: deterministic neighbour
+        // patterns read as tile-shaped lighting noise.
+        float angle = rndf(seed) * 6.28318530718;
+        float radius = RIS_SPATIAL_RADIUS_PX * sqrt(rndf(seed));
+        int2 texel = int2(centre + float2(cos(angle), sin(angle)) * radius);
+        if (texel.x < 0 || texel.y < 0 || texel.x >= int(size.x) || texel.y >= int(size.y)) {
+            continue;
+        }
+        Reservoir stream;
+        if (storedReservoirAt(texel, depth, hitPos, n, v, rd, diffAlb, F0, rough, sss, stream)) {
+            reuseInto(best, stream, min(stream.M, cur.M), seed);
+        }
+    }
+    return best;
 }
 
 // Shade a finalized reservoir: recompute the survivor's contribution at (hitPos,n,v), cast ONE shadow

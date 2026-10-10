@@ -63,8 +63,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         Prim epr = ConstPtr<Prim>(g.primAddr)[pid];
         int texSlot = int(epr.tint.w + 0.5);
         float4 texel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0);
+        // Vanilla puts some surfaces' transparency in the vertex colour instead of the texture, and the
+        // capture carries it in the prim's aux0 lane. The beacon beam's glow layer is the case that
+        // matters: its atlas is solid everywhere, so without this the layer resolves as an opaque sheet
+        // and hides the core it is supposed to be a halo of.
+        float entityAlpha = clamp(texel.a, 0.0, 1.0) * clamp(asfloat(epr.aux0), 0.0, 1.0);
         bool stochasticAlpha = false;
-        MaterialHeader materialHeader;
+        MaterialHeader materialHeader = MaterialHeader();
         if (instanceKind == ENTITY_BIT) {
             materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[epr.materialId];
             stochasticAlpha = (materialHeader.features & MATERIAL_FEATURE_STOCHASTIC_ALPHA) != 0u;
@@ -73,10 +78,16 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             uint salt = pid * 1664525u
                     ^ (InstanceID() & IDX_MASK) * 1013904223u
                     ^ asuint(RayTCurrent());
-            if (alphaDitherThreshold(salt) >= clamp(texel.a, 0.0, 1.0)) {
+            // A guide-only trace resolves coverage deterministically: what the dither leaves in the
+            // diffuse-albedo guide is a per-frame coin flip, and DLSS-RR has nothing to demodulate a
+            // translucent sheet's noise against — it smears instead of averaging. The radiance pass keeps
+            // the dither, whose mean is the same composite (see PAYLOAD_GUIDE_STABLE). Cutout keeps its
+            // fixed threshold either way, that decision being deterministic already.
+            if ((payload.flags & PAYLOAD_GUIDE_STABLE) == 0u
+                    && alphaDitherThreshold(salt) >= entityAlpha) {
                 IgnoreHit();
             }
-        } else if (texel.a < ENTITY_ALPHA_CUTOFF) {
+        } else if (entityAlpha < ENTITY_ALPHA_CUTOFF) {
             IgnoreHit();
         }
 

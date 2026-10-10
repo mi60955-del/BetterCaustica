@@ -32,6 +32,9 @@ public void traceRadianceReordered(uint cullMask, float3 ro, float tmin, float3 
     // pre-roulette, roulette-active, or guaranteed terminal after this hit.
     uint materialHint = hObj.GetShaderTableIndex() & (TERRAIN_BUCKETS - 1u);
     uint coherenceHint = (pathPhaseHint << 2u) | materialHint;
+    // The second operand reorders hits and the third reorders misses, so a miss is grouped by its own key
+    // and never competes with the hit atoms above. Every radiance miss resolves to the same sky record, so
+    // they are already coherent and one constant atom is all they need.
     ReorderThread(hObj, coherenceHint, 4u);
     payload = makeRadiancePayload(flags, rayCone);
     HitObject::Invoke(topLevelAS, hObj, payload);
