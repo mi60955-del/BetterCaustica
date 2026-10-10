@@ -77,6 +77,24 @@ public struct DisplayPush {
     // SUM of every band, so RtComposite folds the 1/levelCount normalisation into this value: the authored
     // look-package strength then means the same thing whichever level count the resolution supports.
     public float bloomStrength;
+    // 0 = the default grading: the look package's scene-referred LMT followed by the baked ACES 2.0
+    // output transform. 1 = the advanced grading: AgX on the exposed image, with no look package.
+    public int advancedGrading;
+    // AgX incident-exposure gain: the scale applied to scene-linear ACEScg before the log2 encoding step.
+    // It has to replace the exposure offset the authored LMT supplies, so it is paired with the
+    // auto-exposure key/EV-compensation curve rather than being a general brightness control.
+    public float agxGain;
+    // Chroma scale about BT.709 luminance, applied to AgX's linear output. AgX spends its range on the
+    // highlight shoulder, so it lands well below the authored look's saturation on a photometric scene.
+    public float agxSaturation;
+    // 0 = leave the image alone; 1 = apply the Purkinje (dark-adaptation) brightness shift to the
+    // exposed scene-linear image, before either display transform. Read per frame, so it is a live
+    // toggle and rebuilds nothing.
+    public int purkinjeEnabled;
+    // Scale on the shift's per-pixel brightness deviation: 0 leaves every pixel untouched, 1 is the
+    // CIE mesopic response itself, and above 1 deepens the shift. See purkinjeGain() in the display
+    // pass.
+    public float purkinjeStrength;
 };
 
 public struct BloomPush {

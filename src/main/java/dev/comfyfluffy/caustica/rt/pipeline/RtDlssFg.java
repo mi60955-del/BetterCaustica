@@ -19,9 +19,9 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * DLSS Frame Generation (DLSSG) backend. Shares the NGX instance with DLSS-RR via {@link NgxRuntime};
- * owns only the DLSSG feature handle. This turn provides availability detection and the feature
- * create/destroy lifecycle — the per-frame {@code evaluate} + the multi-present loop that consumes it land
- * with the present-path refactor. Gated by {@code caustica.rt.fg} (default off) and hardware/driver support.
+ * owns only the DLSSG feature handle: availability detection, the feature create/destroy lifecycle,
+ * and the per-frame {@code evaluate} that the extra-present loop consumes. Gated by
+ * {@code caustica.rt.fg} (default off) and hardware/driver support.
  */
 public final class RtDlssFg {
     public static final RtDlssFg INSTANCE = new RtDlssFg();
@@ -232,6 +232,32 @@ public final class RtDlssFg {
         }
         initialized = false;
         lib = null;
+    }
+
+    /**
+     * Drop a latched failure so the next render-state invalidation (F3+A, dimension change) retries
+     * frame generation. No-op while healthy, so an invalidation never releases a working feature.
+     * On a real reset the feature is released too: the failure that latched may have left it in a
+     * state the driver rejects, and {@link #ensureFeature} recreates it from scratch.
+     */
+    public void resetFailure() {
+        if (!failed) {
+            return;
+        }
+        destroy();
+        failed = false;
+        probed = false;
+        available = false;
+    }
+
+    /**
+     * Release the feature when the frame-generation backend setting no longer names DLSS, so
+     * switching to FSR does not leave this feature holding device memory. No-op otherwise.
+     */
+    public void destroyUnlessSelected() {
+        if (!isNull(feature) && !CausticaConfig.Rt.Fg.DLSS.equals(CausticaConfig.Rt.Fg.BACKEND.get())) {
+            destroy();
+        }
     }
 
     private void releaseFeature(VulkanDevice device) {
