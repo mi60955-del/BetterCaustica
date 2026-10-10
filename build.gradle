@@ -20,6 +20,17 @@ repositories {
 		name = "Fabric"
 		url = "https://maven.fabricmc.net/"
 	}
+	// Sodium's config API (sodium:config_api_user entry point) and Mod Menu's ModMenuApi. Both are
+	// compile-only: the integration is discovered by entry point at runtime, so neither is a hard
+	// dependency and the mod loads normally without them.
+	maven {
+		name = "CaffeineMC"
+		url = "https://maven.caffeinemc.net/releases"
+	}
+	maven {
+		name = "Terraformers"
+		url = "https://maven.terraformersmc.com/releases"
+	}
 	mavenCentral()
 }
 
@@ -63,10 +74,20 @@ dependencies {
 	testImplementation "org.junit.jupiter:junit-jupiter"
 	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 
-	// Layered TOML config (config/caustica.toml) — NightConfig, the same library NeoForge's
+	// Layered TOML config (config/bettercaustica.toml) — NightConfig, the same library NeoForge's
 	// ModConfigSpec is built on.
 	include implementation("com.electronwill.night-config:core:3.8.3")
 	include implementation("com.electronwill.night-config:toml:3.8.3")
+
+	// Optional integration targets. compileOnly: neither is on the runtime classpath of the shipped jar,
+	// and both are reached only through their own Fabric entry point, so the mod loads normally when the
+	// player has neither installed.
+	compileOnly "net.caffeinemc:sodium-fabric:0.9.1+mc26.2"
+	compileOnly "com.terraformersmc:modmenu:20.0.1"
+
+	// Sodium rejects an incomplete option by crashing the client while it registers configs, so the test
+	// source set builds the real option tree. The shipped jar still carries neither as a runtime dep.
+	testImplementation "net.caffeinemc:sodium-fabric:0.9.1+mc26.2"
 }
 
 processResources {
@@ -79,7 +100,7 @@ processResources {
 
 // Compile Slang sources to SPIR-V at build time instead of tracking binaries. Requires slangc and
 // spirv-val from the Vulkan SDK or PATH.
-def shaderGenRoot = layout.buildDirectory.dir("generated/shaders") // classpath root -> /caustica/shaders/*.spv
+def shaderGenRoot = layout.buildDirectory.dir("generated/shaders") // classpath root -> /bettercaustica/shaders/*.spv
 
 def resolveVulkanTool = { String name ->
 	def exe = org.gradle.internal.os.OperatingSystem.current().windows ? ".exe" : ""
@@ -184,7 +205,7 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 	group = "build"
 	description = "Compiles shaders/** shader sources to SPIR-V and validates them."
 	srcDir = file("shaders")
-	outDir = layout.buildDirectory.dir("generated/shaders/caustica/shaders")
+	outDir = layout.buildDirectory.dir("generated/shaders/bettercaustica/shaders")
 	spirvVal = resolveVulkanTool("spirv-val")
 	slangc = resolveVulkanTool("slangc")
 }
@@ -216,7 +237,7 @@ sourceSets.main.java.srcDir(files(layout.buildDirectory.dir("generated/sources/s
 sourceSets.main.java.srcDir(files(rtBindingsGenRoot).builtBy(generateRtBindings))
 
 // Emit the .spv into the main resources so they land in the jar / on the runClient classpath at the
-// same /caustica/shaders/ path the pipeline loaders read. builtBy wires the dependency.
+// same /bettercaustica/shaders/ path the pipeline loaders read. builtBy wires the dependency.
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
 def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
@@ -349,16 +370,55 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 			throw new GradleException("Missing NGX native inputs:\n - " + missing.join("\n - "))
 		}
 
+		// Two platforms' vendor globs resolving to the same bytes means one of the libraries was copied
+		// over the other (a DLSS SDK directory has shipped nvngx_dlssd.dll as a copy of nvngx_dlssg.dll).
+		// Such a jar carries no Ray Reconstruction library: the runtime RR setup fails, and the bundled
+		// extraction pass overwrites any RR library already installed under <game>/caustica-ngx.
+		def ngxNativeDigest = { File nativeFile ->
+			def digest = java.security.MessageDigest.getInstance("SHA-256")
+			nativeFile.withInputStream { stream ->
+				byte[] buffer = new byte[64 * 1024]
+				int read
+				while ((read = stream.read(buffer)) > 0) {
+					digest.update(buffer, 0, read)
+				}
+			}
+			java.util.HexFormat.of().formatHex(digest.digest())
+		}
+		def digestedVendorNatives = [:]
+		def duplicateVendorNatives = []
+		selectedNgxNativePlatforms.each { platform ->
+			def platformVendorRoot = platform.vendorRoot(dlssSdkRoot, ngxVendorConfig)
+			platform.vendorIncludes.sort().each { vendorInclude ->
+				fileTree(platformVendorRoot) {
+					include vendorInclude
+				}.files.sort { it.name }.each { nativeFile ->
+					def digest = ngxNativeDigest(nativeFile)
+					def previous = digestedVendorNatives[digest]
+					if (previous != null && previous != vendorInclude) {
+						duplicateVendorNatives += "${nativeFile} and the ${previous} library are byte-identical"
+					}
+					digestedVendorNatives[digest] = vendorInclude
+				}
+			}
+		}
+		if (!duplicateVendorNatives.empty) {
+			throw new GradleException("Duplicate NGX vendor libraries in the ${ngxVendorConfig} DLSS SDK:\n - "
+					+ duplicateVendorNatives.join("\n - ")
+					+ "\nEach Ray Reconstruction / Frame Generation library must come from its own " +
+					"package; rename a copy of one into the other's name and RR stops working.")
+		}
+
 		copy {
 			selectedNgxNativePlatforms.each { platform ->
 				from(fileTree(ngxShimOutDir) {
 					include platform.shimIncludes
 				}) {
-					into "caustica/natives/${platform.name}"
+					into "bettercaustica/natives/${platform.name}"
 				}
 				from(fileTree(platform.vendorRoot(dlssSdkRoot, ngxVendorConfig))) {
 					include platform.vendorIncludes
-					into "caustica/natives/${platform.name}"
+					into "bettercaustica/natives/${platform.name}"
 				}
 			}
 			into ngxNativeGenRoot
@@ -367,6 +427,77 @@ def bundleNgxNatives = tasks.register("bundleNgxNatives") {
 }
 
 sourceSets.main.resources.srcDir(files(ngxNativeGenRoot).builtBy(bundleNgxNatives))
+
+// FidelityFX: the flat-C shim plus AMD's runtime, so that FSR frame generation works without an
+// NVIDIA driver. Unlike NGX there is one platform (AMD ships no Linux build of the Vulkan
+// frame-generation backend) and one library configuration, so there is no vendor-config axis and
+// nothing to cross-check for duplicated bytes.
+def ffxNativeGenRoot = layout.buildDirectory.dir("generated/ffx-natives")
+def ffxShimConfig = (findProperty("ffxShimConfig") ?: "release")
+		.toString().toLowerCase(java.util.Locale.ROOT)
+def ffxShimOutDir = new File(layout.buildDirectory.dir("native/ffx_shim").get().asFile, ffxShimConfig)
+def ffxSdkRootProvider = providers.environmentVariable("FFX_SDK").map { file(it) }
+def ffxShimLibrary = "ffxshim.dll"
+def ffxSdkLibrary = "amd_fidelityfx_vk.dll"
+// Both the official SDK layout and a flat vendored copy of the two files have to work, because
+// the spike under third_party/ is the latter.
+def ffxSdkLibraryRoots = { File sdkRoot ->
+	[
+		new File(sdkRoot, "bin/Windows_x86_64/retail"),
+		new File(sdkRoot, "bin/Windows_x86_64/release"),
+		new File(sdkRoot, "bin/Windows_x86_64/relwithdebinfo"),
+		sdkRoot,
+	]
+}
+def findFfxSdkLibrary = { File sdkRoot ->
+	ffxSdkLibraryRoots(sdkRoot).collect { new File(it, ffxSdkLibrary) }.find { it.isFile() }
+}
+
+def bundleFfxNatives = tasks.register("bundleFfxNatives") {
+	group = "build"
+	description = "Bundles the FidelityFX shim and AMD's FFX runtime into the mod resources, when FFX_SDK is set."
+
+	inputs.property "ffxShimConfig", ffxShimConfig
+	outputs.dir(ffxNativeGenRoot)
+	outputs.upToDateWhen { false }
+
+	doLast {
+		delete(ffxNativeGenRoot)
+		def sdkRoot = ffxSdkRootProvider.orNull
+		if (sdkRoot == null) {
+			logger.lifecycle("FFX_SDK is not set: FSR frame generation will not be bundled into this jar.")
+			return
+		}
+		def shimFile = new File(ffxShimOutDir, ffxShimLibrary)
+		def sdkFile = findFfxSdkLibrary(sdkRoot)
+		def missing = []
+		if (!shimFile.isFile()) {
+			missing += "shim library in ${ffxShimOutDir} (build it with native\\_dev_build_ffx.bat shim)"
+		}
+		if (sdkFile == null) {
+			missing += "${ffxSdkLibrary} under ${ffxSdkLibraryRoots(sdkRoot).join(', ')}"
+		}
+		if (!missing.empty) {
+			throw new GradleException("FFX_SDK is set but FidelityFX native inputs are missing:\n - "
+					+ missing.join("\n - "))
+		}
+
+		copy {
+			from(shimFile.parent) {
+				include ffxShimLibrary
+				into "bettercaustica/natives/windows-x64"
+			}
+			from(sdkFile.parent) {
+				include ffxSdkLibrary
+				into "bettercaustica/natives/windows-x64"
+			}
+			into ffxNativeGenRoot
+		}
+		logger.lifecycle("Bundled FidelityFX natives from ${sdkFile} and ${shimFile}.")
+	}
+}
+
+sourceSets.main.resources.srcDir(files(ffxNativeGenRoot).builtBy(bundleFfxNatives))
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25

@@ -1,0 +1,648 @@
+// One-sample-per-iteration path tracer for previewing decoded LabPBR materials.
+//
+// This is not a beauty renderer and it is not a replica of Caustica's pipeline topology. It
+// exists to answer "what does this material actually look like" for a texture the caller
+// pointed at, with the same decode the game uses, so a judgement made here transfers.
+//
+// The four pages are the CPU-decoded result (see material.cpp), not the raw LabPBR bytes:
+//   albedoPage   RGBA8  sRGB albedo in .rgb
+//   surface0Page RGBA8  r=roughness (linear GGX alpha) g=metalness b=emission a=sss
+//   surface1Page RGBA8  rgb=F0 (linear) a=porosity
+//   normalAoPage RGBA8  rg=tangent normal xy (0..1 encoded) b=AO a=height
+//
+// That split matches the game: closest_hit.rchit.slang samples the same channels, so nothing
+// here re-decodes a byte the way the game does not.
+//
+// Vertex attributes are separate float arrays indexed arithmetically rather than an
+// interleaved struct, because vec3 in std430 has 16-byte alignment rules that are easy to get
+// subtly wrong between C++ and GLSL.
+
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+
+layout(std140, set = 0, binding = 1) uniform Frame {
+    vec4 camPos;       // xyz = position
+    vec4 camRight;     // xyz = right, w = tanHalfFovX
+    vec4 camUp;        // xyz = up,    w = tanHalfFovY
+    vec4 camFwd;       // xyz = forward
+    vec4 renderSize;   // xy = render W/H, z = samples per pixel, w = debug channel
+    vec4 sunDir;       // xyz = direction toward the sun, w = sun intensity
+    vec4 sunColor;     // rgb = sun tint, w = sky intensity
+    vec4 tuning;       // x = uv repeat, y = emission scale, z = AO strength, w = parallax depth
+    vec4 march;        // x = layer count, y = min |vTS.z| floor, z = unused, w = clamp the march slope
+} F;
+
+layout(set = 0, binding = 2) uniform sampler2D albedoPage;
+layout(set = 0, binding = 3) uniform sampler2D surface0Page;
+layout(set = 0, binding = 4) uniform sampler2D surface1Page;
+layout(set = 0, binding = 5) uniform sampler2D normalAoPage;
+
+layout(rgba16f, set = 0, binding = 6) uniform writeonly image2D outColor;
+
+layout(std430, set = 0, binding = 7)  readonly buffer Positions { float v[]; } positions;
+layout(std430, set = 0, binding = 8)  readonly buffer Normals   { float v[]; } normalBuf;
+layout(std430, set = 0, binding = 9)  readonly buffer Uvs       { float v[]; } uvBuf;
+layout(std430, set = 0, binding = 10) readonly buffer Indices   { uint  v[]; } indices;
+layout(std430, set = 0, binding = 11) readonly buffer Slots     { uint  v[]; } primSlots;
+layout(std430, set = 0, binding = 12) readonly buffer Rects     { float v[]; } materialRects;
+// One bit per material. Bit 0 is "this material's _n actually carries a height field", which is
+// what keeps the parallax march off every material that would only pay for it and gain nothing.
+layout(std430, set = 0, binding = 13) readonly buffer Flags     { uint  v[]; } materialFlags;
+
+const uint MATERIAL_FLAG_HEIGHT = 1u;
+
+const float PI = 3.14159265359;
+const float RAY_TMIN = 1.0e-3;
+const float RAY_TMAX = 1.0e5;
+const float SURF_BIAS = 0.004;
+// LabPBR's _n occlusion is kept mild because the tracer already computes sky visibility;
+// matching the game's NORMAL_AO_STRENGTH keeps the preview from double-darkening.
+const float NORMAL_AO_STRENGTH = 0.5;
+
+// --- rng ------------------------------------------------------------------------------
+
+uint g_state;
+
+uint pcg(uint v) {
+    uint s = v * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+float rnd() {
+    g_state = pcg(g_state);
+    return float(g_state) * (1.0 / 4294967296.0);
+}
+
+// --- math -----------------------------------------------------------------------------
+
+float srgbToLinear(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+vec3 srgbToLinear(vec3 c) {
+    return vec3(srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b));
+}
+
+// A basis from the geometric normal alone. It is exact on the plates below (their UV runs
+// along the same axes), and consistent enough on a sphere that a normal map still reads as
+// relief rather than as noise. Avoiding a vertex tangent attribute keeps the vertex buffers
+// the same shape as rtprobe's.
+void orthoBasis(vec3 n, out vec3 t, out vec3 b) {
+    vec3 helper = abs(n.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    t = normalize(cross(helper, n));
+    b = cross(n, t);
+}
+
+// The surface frame a normal map and the parallax march both work in, built from the hit
+// triangle's own positions and UVs — the port of tangentFrame in closest_hit.rchit.slang.
+//
+// It cannot be derived from the normal: a basis built that way has no idea which way the UV's V
+// axis runs, and a plate's V runs downward (v = 0 at the top, as Minecraft's block faces store
+// it). Ortho-basis B comes out +y while the UV's V points -y, which inverts a normal map's
+// vertical relief and flips the vertical half of the parallax march.
+//
+// `n` must already face the viewer, since the basis is built in that hemisphere. Returns false
+// on a degenerate UV triangle, where the caller falls back to the ortho basis.
+bool tangentFrame(vec3 n, vec3 p0, vec3 p1, vec3 p2, vec2 t0, vec2 t1, vec2 t2,
+                  out vec3 T, out vec3 B) {
+    T = vec3(0.0);
+    B = vec3(0.0);
+    vec2 g1 = t1 - t0;
+    vec2 g2 = t2 - t0;
+    float det = g1.x * g2.y - g1.y * g2.x;
+    if (abs(det) <= 1.0e-12) {
+        return false;
+    }
+    float r = 1.0 / det;
+    vec3 traw = ((p1 - p0) * g2.y - (p2 - p0) * g1.y) * r;
+    T = normalize(traw - n * dot(n, traw));       // Gram-Schmidt against the viewer-oriented normal
+    B = cross(n, T) * (det < 0.0 ? -1.0 : 1.0);   // handedness from the UV winding
+    return true;
+}
+
+vec3 toWorld(vec3 n, vec3 localDir) {
+    vec3 t, b;
+    orthoBasis(n, t, b);
+    return normalize(t * localDir.x + b * localDir.y + n * localDir.z);
+}
+
+vec2 pixelNdc(vec2 pixel, vec2 size) {
+    vec2 p = pixel / size;
+    return vec2(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0);
+}
+
+// --- scene ----------------------------------------------------------------------------
+
+struct Hit {
+    bool hit;
+    vec3 pos;
+    vec3 nrm;
+    vec2 uv;         // sprite-local, may run outside [0,1) when tiling
+    vec2 cellOrigin; // page UV of the material cell this triangle belongs to
+    vec2 cellSize;
+    vec2 spriteTexels; // the cell's own texel count, i.e. the grid a displaced sample snaps to
+    uint slot;       // material index, for the per-material flags
+    vec3 tangent;    // UV-aligned frame, from the triangle's positions and UVs
+    vec3 bitangent;
+};
+
+Hit traceGeometry(vec3 ro, vec3 rd, float tmax) {
+    Hit h;
+    h.hit = false;
+    h.pos = vec3(0.0);
+    h.nrm = vec3(0.0);
+    h.uv = vec2(0.0);
+    h.cellOrigin = vec2(0.0);
+    h.cellSize = vec2(1.0);
+    h.spriteTexels = vec2(1.0);
+    h.slot = 0u;
+    h.tangent = vec3(1.0, 0.0, 0.0);
+    h.bitangent = vec3(0.0, 1.0, 0.0);
+
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, ro, RAY_TMIN, rd, tmax);
+    while (rayQueryProceedEXT(rq)) {}
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return h;
+    }
+
+    h.hit = true;
+    h.pos = ro + rd * rayQueryGetIntersectionTEXT(rq, true);
+
+    uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    uint i0 = indices.v[prim * 3u + 0u];
+    uint i1 = indices.v[prim * 3u + 1u];
+    uint i2 = indices.v[prim * 3u + 2u];
+
+    // Materials are uniform across a triangle, so only the normal and UV are interpolated.
+    // Barycentrics are (u, v); the first vertex weight is 1 - u - v.
+    float w0 = 1.0 - bary.x - bary.y;
+    vec3 n0 = vec3(normalBuf.v[i0 * 3u + 0u], normalBuf.v[i0 * 3u + 1u], normalBuf.v[i0 * 3u + 2u]);
+    vec3 n1 = vec3(normalBuf.v[i1 * 3u + 0u], normalBuf.v[i1 * 3u + 1u], normalBuf.v[i1 * 3u + 2u]);
+    vec3 n2 = vec3(normalBuf.v[i2 * 3u + 0u], normalBuf.v[i2 * 3u + 1u], normalBuf.v[i2 * 3u + 2u]);
+    h.nrm = normalize(n0 * w0 + n1 * bary.x + n2 * bary.y);
+
+    vec2 uv0 = vec2(uvBuf.v[i0 * 2u + 0u], uvBuf.v[i0 * 2u + 1u]);
+    vec2 uv1 = vec2(uvBuf.v[i1 * 2u + 0u], uvBuf.v[i1 * 2u + 1u]);
+    vec2 uv2 = vec2(uvBuf.v[i2 * 2u + 0u], uvBuf.v[i2 * 2u + 1u]);
+    h.uv = uv0 * w0 + uv1 * bary.x + uv2 * bary.y;
+
+    // The span's own UVs decide the frame, so a material's normal map and its parallax march
+    // agree with the texture's orientation rather than with a guess made from the normal.
+    vec3 p0 = vec3(positions.v[i0 * 3u + 0u], positions.v[i0 * 3u + 1u], positions.v[i0 * 3u + 2u]);
+    vec3 p1 = vec3(positions.v[i1 * 3u + 0u], positions.v[i1 * 3u + 1u], positions.v[i1 * 3u + 2u]);
+    vec3 p2 = vec3(positions.v[i2 * 3u + 0u], positions.v[i2 * 3u + 1u], positions.v[i2 * 3u + 2u]);
+    if (!tangentFrame(h.nrm, p0, p1, p2, uv0, uv1, uv2, h.tangent, h.bitangent)) {
+        orthoBasis(h.nrm, h.tangent, h.bitangent);
+    }
+
+    uint slot = primSlots.v[prim];
+    h.slot = slot;
+    h.cellOrigin = vec2(materialRects.v[slot * 6u + 0u], materialRects.v[slot * 6u + 1u]);
+    h.cellSize = vec2(materialRects.v[slot * 6u + 2u], materialRects.v[slot * 6u + 3u]);
+    h.spriteTexels = vec2(materialRects.v[slot * 6u + 4u], materialRects.v[slot * 6u + 5u]);
+    return h;
+}
+
+bool occluded(vec3 ro, vec3 rd, float tmax) {
+    if (tmax <= RAY_TMIN) {
+        return false;
+    }
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, ro, RAY_TMIN, rd, tmax);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Gradient sky only. The sun is deliberately absent here and handled as an analytic
+// direction light instead, so the highlight is not counted twice and stays sharp enough to
+// show the roughness it is bouncing off.
+vec3 skyRadiance(vec3 dir) {
+    vec3 horizon = vec3(0.72, 0.78, 0.90);
+    vec3 zenith  = vec3(0.16, 0.31, 0.70);
+    vec3 ground  = vec3(0.085, 0.082, 0.080);
+    float up = dir.y;
+    vec3 c = up > 0.0 ? mix(horizon, zenith, pow(up, 0.55))
+                      : mix(horizon, ground, clamp(-up * 2.5, 0.0, 1.0));
+    return c * F.sunColor.w;
+}
+
+// --- material -------------------------------------------------------------------------
+
+struct Surface {
+    vec3 albedo;      // linear
+    float roughness;  // linear GGX alpha
+    float metalness;
+    vec3 f0;
+    float emission;
+    float sss;
+    float porosity;
+    vec3 normal;
+    float ao;
+    float height;
+};
+
+// --- parallax -------------------------------------------------------------------------
+// A port of closest_hit.rchit.slang's parallaxLocalUv: steep parallax through the LabPBR height
+// field, then a bisection of the last interval so the crossing lands between layers instead of
+// snapping to one. Same layer count, same Z floor, same clamp — so a divergence between this and
+// the game is a bug rather than a modelling choice.
+//
+// On top of that port sit three opt-in behaviours (F.march.z), all of which are candidates for the
+// game and none of which change the march itself — only what it hands back:
+//   1 MARCH_TEXEL_SNAP   round the displaced UV onto the sprite's texel grid
+//   2 MARCH_STEP_NORMAL  report a vertical wall normal for the band a step exposes
+//   4 MARCH_CLAMP_SLOPE  bound the lateral reach so it can never exceed parallaxDepth
+// The first two are what iterationRP's POM does and Caustica's does not; they are the difference
+// between a displaced surface reading as blocks and reading as a smeared sheet.
+
+// The march's own constants. The game fixes these at 12 layers, 4 refine steps and a 0.2 Z
+// floor; the layer count and the floor are uniforms here so a change can be evaluated in the
+// probe before anything is baked into the mod. The loop bound stays a compile-time constant
+// because GLSL requires one, and the live count simply breaks out of it early.
+const int PARALLAX_MAX_LAYERS = 64;
+const int PARALLAX_REFINE_STEPS = 4;
+
+// F.march.z carries these. They are the two things the game's march does not do that make a
+// displaced surface read as geometry instead of as a smear.
+const int MARCH_TEXEL_SNAP = 1;
+const int MARCH_STEP_NORMAL = 2;
+const int MARCH_CLAMP_SLOPE = 4;
+
+// The height drop across one texel, measured along the view's lateral direction, at which a displaced
+// band counts as a full vertical wall. A binary height field (height 255 next to 0) reaches this; the
+// shallow fields most packs author land well under it and keep most of their normal map.
+const float WALL_SLOPE_REFERENCE = 0.35;
+
+// A clamp and not a wrap: an offset that steps a fraction of a texel past the edge would
+// otherwise fold to the opposite side of the sprite, turning a sub-texel shift into a jump
+// across the whole face.
+vec2 clampSpriteUv(vec2 uv) {
+    return clamp(uv, vec2(0.0, 0.0), vec2(1.0, 1.0));
+}
+
+// Depth is measured inward from the flat surface, so a stored height of 1 (flush) is depth 0.
+float parallaxHeightAt(vec2 localUv, vec2 cellOrigin, vec2 cellSize) {
+    return 1.0 - texture(normalAoPage, cellOrigin + clampSpriteUv(localUv) * cellSize).a;
+}
+
+vec2 parallaxLocalUv(vec2 localUv, vec2 cellOrigin, vec2 cellSize, vec2 spriteTexels,
+                       vec3 n, vec3 t, vec3 b, vec3 vdir, float depthScale, out vec3 stepNormal) {
+    // x,y = unit wall direction, z = how much of a wall (0 = none, so an unchanged return leaves the
+    // caller's normal alone).
+    stepNormal = vec3(0.0, 0.0, 0.0);
+    int layers = clamp(int(F.march.x), 1, PARALLAX_MAX_LAYERS);
+    int flags = int(F.march.z + 0.5);
+    // Dividing the view's XY by Z projects it onto the surface, and a grazing view would
+    // stretch that to infinity without a floor.
+    float minVz = max(F.march.y, 1.0e-3);
+    vec3 vTS = vec3(dot(vdir, t), dot(vdir, b), dot(vdir, n));
+    float vz = max(abs(vTS.z), minVz);
+    vec2 slope = vTS.xy / vz;
+    // The march's total lateral travel is |slope| * depthScale sprite UVs, so |slope| is what decides
+    // how far a face gets eroded. The 1/Z projection is the honest reading of the height field only
+    // while it stays under 1; past that the reach exceeds parallaxDepth itself and the "wall" turns
+    // into a band smeared over a large part of the sprite. MARCH_CLAMP_SLOPE bounds it.
+    if ((flags & MARCH_CLAMP_SLOPE) != 0) {
+        float slopeLen = length(slope);
+        if (slopeLen > 1.0) {
+            slope *= 1.0 / slopeLen;
+        }
+    }
+    vec2 depthStep = slope * (depthScale / float(layers));
+    float layerDepth = 1.0 / float(layers);
+
+    vec2 uv = localUv;
+    float depth = 0.0;
+    float surface = parallaxHeightAt(uv, cellOrigin, cellSize);
+    vec2 prevUv = localUv;
+    float prevDepth = 0.0;
+    for (int i = 0; i < PARALLAX_MAX_LAYERS; ++i) {
+        if (i >= layers || depth >= surface) {
+            break;
+        }
+        prevUv = uv;
+        prevDepth = depth;
+        uv -= depthStep;
+        depth += layerDepth;
+        surface = parallaxHeightAt(uv, cellOrigin, cellSize);
+    }
+    // Never crossed the field, i.e. a flush surface, which keeps the flat mapping.
+    if (depth <= layerDepth) {
+        return localUv;
+    }
+
+    // Bisect between prevUv (still in front of the surface) and uv (already behind it).
+    vec2 lo = prevUv;
+    vec2 hi = uv;
+    float dLo = prevDepth;
+    float dHi = depth;
+    for (int j = 0; j < PARALLAX_REFINE_STEPS; ++j) {
+        vec2 mid = (lo + hi) * 0.5;
+        float dMid = (dLo + dHi) * 0.5;
+        if (parallaxHeightAt(mid, cellOrigin, cellSize) < dMid) {
+            hi = mid;
+            dHi = dMid;
+        } else {
+            lo = mid;
+            dLo = dMid;
+        }
+    }
+    vec2 result = (lo + hi) * 0.5;
+
+    // Quantise the *displacement*, not the resulting UV.
+    //
+    // Snapping the UV itself drags an undisplaced sample onto the texel lattice, so the whole surface
+    // renders as a grid of flat texels — and worst exactly where the displacement is smallest, because
+    // there a sub-texel offset rounds the sample onto the nearest centre instead of leaving it alone.
+    // That reads as the surface being cut into diamonds whose shading hides the relief inside them.
+    // Rounding the offset keeps the flat mapping untouched and still makes every step a whole texel.
+    if ((flags & MARCH_TEXEL_SNAP) != 0) {
+        vec2 offsetTexels = floor((result - localUv) * spriteTexels + vec2(0.5));
+        if (all(equal(offsetTexels, vec2(0.0)))) {
+            return localUv; // sub-texel: the sample did not move, so there is no step to report
+        }
+        result = clampSpriteUv(localUv + offsetTexels / spriteTexels);
+    }
+
+    // The sample moved away from the viewer, so the band we are looking at is the near wall of the
+    // step. Reported in tangent space, with `z` as how much of a wall it is, from the height field's
+    // own gradient across one texel: a binary field (brick against mortar) reads full strength, a
+    // gently sloped one reads near zero and keeps its normal map.
+    //
+    // The direction is quantised to the texel axis the walk crossed, and the whole term is scaled by
+    // how far the sample actually moved. Both matter: `vTS.xy` shrinks to zero as the view turns to
+    // face the normal, so its *direction* is ill-conditioned exactly where the ray is most
+    // perpendicular to the surface. Taking it raw there spins the wall through a full turn around that
+    // point and fans the shading into a pinwheel — the UV sample from a snapped texel centre lands one
+    // texel away, which is precisely on a texel boundary, so which neighbour it reads flips as the
+    // direction rotates. Quantising makes the direction one of four; the movement scale keeps a
+    // sub-texel displacement from claiming a wall it never exposed.
+    if ((flags & MARCH_STEP_NORMAL) != 0) {
+        float lateralLen = length(vTS.xy);
+        if (lateralLen > 1.0e-5) {
+            vec2 lateralDir = vTS.xy / lateralLen;
+            vec2 texelStep = lateralDir / max(spriteTexels, vec2(1.0));
+            float here = parallaxHeightAt(result, cellOrigin, cellSize);
+            float ahead = parallaxHeightAt(result - texelStep, cellOrigin, cellSize);
+            stepNormal = vec3(lateralDir, clamp(abs(ahead - here) / WALL_SLOPE_REFERENCE, 0.0, 1.0));
+        }
+    }
+    return clampSpriteUv(result);
+}
+
+// Rotate a LabPBR _n tangent-space normal into world space. Clamps the result above the
+// horizon so grazing perturbations cannot invert it through the surface (the game's
+// black-spot fix).
+vec3 perturbNormal(vec3 n, vec3 t, vec3 b, vec3 vdir, vec2 nxy01) {
+    vec2 nxy = nxy01 * 2.0 - 1.0;
+    float nz = sqrt(max(0.0, 1.0 - dot(nxy, nxy)));
+    vec3 nm = normalize(nxy.x * t + nxy.y * b + nz * n);
+    float nov = dot(nm, vdir);
+    if (nov < 0.02) {
+        nm = normalize(nm + vdir * (0.02 - nov));
+    }
+    return nm;
+}
+
+Surface evalSurface(Hit h, vec3 vdir) {
+    Surface s;
+    vec2 uv = fract(h.uv * F.tuning.x);
+    vec3 t = h.tangent;
+    vec3 b = h.bitangent;
+    // Tangent-space wall normal reported by the march, applied to s.normal at the end so it
+    // replaces the normal map only where a step was actually crossed.
+    vec3 displacedNormal = vec3(0.0, 0.0, 0.0);
+    bool hasDisplacedNormal = false;
+
+    // Parallax comes first: it moves where the surface actually is, so every channel below has
+    // to be read from the displaced UV rather than the flat one. The flag skips materials whose
+    // _n carries no height field, which is what keeps this from costing every surface sixteen
+    // extra fetches for nothing.
+    if ((materialFlags.v[h.slot] & MATERIAL_FLAG_HEIGHT) != 0u && F.tuning.w > 0.0) {
+        vec3 stepNormal;
+        vec2 displaced = parallaxLocalUv(uv, h.cellOrigin, h.cellSize, h.spriteTexels,
+                                         h.nrm, t, b, vdir, F.tuning.w, stepNormal);
+        // Only take the displaced UV when the march actually moved the sample; a flush texel
+        // returns the flat mapping unchanged, and treating that as a move would be noise.
+        if (length(displaced - uv) > 1.0e-5) {
+            uv = displaced;
+            displacedNormal = stepNormal;
+            hasDisplacedNormal = true;
+        }
+    }
+
+    vec2 pageUv = h.cellOrigin + uv * h.cellSize;
+
+    vec4 albedoTexel = texture(albedoPage, pageUv);
+    vec4 s0 = texture(surface0Page, pageUv);
+    vec4 s1 = texture(surface1Page, pageUv);
+    vec4 nAo = texture(normalAoPage, pageUv);
+
+    s.albedo = srgbToLinear(albedoTexel.rgb);
+    s.roughness = s0.r;
+    s.metalness = s0.g;
+    s.emission = s0.b * F.tuning.y;
+    s.sss = s0.a;
+    s.f0 = s1.rgb;
+    s.porosity = s1.a;
+    s.height = nAo.a;
+    s.ao = mix(1.0, nAo.b, NORMAL_AO_STRENGTH * F.tuning.z);
+
+    s.normal = perturbNormal(h.nrm, t, b, vdir, nAo.rg);
+    // A crossed step is a vertical face, so its normal is horizontal in the tangent frame. Blended by
+    // how much of a wall the height gradient says it is, so a smooth height field keeps its map.
+    if (hasDisplacedNormal && displacedNormal.z > 0.0) {
+        vec3 wallDir = normalize(displacedNormal.x * t + displacedNormal.y * b);
+        s.normal = normalize(mix(s.normal, wallDir, clamp(displacedNormal.z, 0.0, 1.0)));
+    }
+    return s;
+}
+
+// --- brdf -----------------------------------------------------------------------------
+
+float distributionGGX(float ndoth, float a) {
+    float a2 = a * a;
+    float d = ndoth * ndoth * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1.0e-8);
+}
+float smithG1(float ndotv, float a) {
+    float k = (a * a) * 0.5;
+    return ndotv / max(ndotv * (1.0 - k) + k, 1.0e-6);
+}
+vec3 fresnelSchlick(float cosTheta, vec3 f0) {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 sampleGgxHalf(float a, vec3 n, out float pdfHalf) {
+    float u1 = rnd(), u2 = rnd();
+    float phi = 2.0 * PI * u1;
+    float cosTheta = sqrt((1.0 - u2) / (1.0 + (a * a - 1.0) * u2));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    vec3 hv = toWorld(n, vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+    pdfHalf = distributionGGX(cosTheta, a) * cosTheta;
+    return hv;
+}
+
+vec3 sampleCosineHemisphere(vec3 n, out float pdf) {
+    float u1 = rnd(), u2 = rnd();
+    float phi = 2.0 * PI * u1;
+    float r = sqrt(u2);
+    vec3 d = toWorld(n, vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - u2))));
+    pdf = max(dot(d, n), 0.0) / PI;
+    return d;
+}
+
+vec3 directSun(vec3 p, vec3 n, vec3 wo, vec3 f0, float rough, float metal, vec3 albedo) {
+    vec3 wi = normalize(F.sunDir.xyz);
+    float ndotl = dot(n, wi);
+    if (ndotl <= 0.0) {
+        return vec3(0.0);
+    }
+    if (occluded(p + n * SURF_BIAS, wi, RAY_TMAX)) {
+        return vec3(0.0);
+    }
+    vec3 hv = normalize(wi + wo);
+    float ndotv = max(dot(n, wo), 1.0e-4);
+    float a = max(rough * rough, 1.0e-4);
+    vec3 fr = fresnelSchlick(max(dot(hv, wo), 0.0), f0);
+    float spec = distributionGGX(max(dot(n, hv), 0.0), a) * smithG1(ndotv, a) * smithG1(ndotl, a)
+               / (4.0 * ndotv * ndotl);
+    vec3 diffuse = (1.0 - fr) * (1.0 - metal) * albedo / PI;
+    vec3 radiance = F.sunColor.rgb * F.sunDir.w;
+    return (diffuse + fr * spec) * radiance * ndotl;
+}
+
+// Primary hit: analytic sun plus one stochastic bounce against the sky or the scene. Sampling
+// a single lobe per iteration is what keeps each iteration cheap; the frame loop averages
+// enough of them that the result converges instead of staying noisy.
+vec3 shadePrimary(Hit h, vec3 wo) {
+    Surface s = evalSurface(h, wo);
+    vec3 emissionTerm = s.albedo * s.emission * 8.0;
+    if (s.emission > 0.0) {
+        return s.albedo * s.emission * 8.0;
+    }
+
+    vec3 n = s.normal;
+    vec3 f0 = s.f0;
+    vec3 albedo = s.albedo * s.ao;
+    vec3 L = directSun(h.pos, n, wo, f0, s.roughness, s.metalness, albedo);
+
+    float a = max(s.roughness * s.roughness, 1.0e-4);
+    float specWeight = clamp(max(f0.r, max(f0.g, f0.b)) + s.metalness * 0.5, 0.04, 0.96);
+    float ndotv = max(dot(n, wo), 1.0e-4);
+
+    vec3 wi, f;
+    float pdf;
+    if (rnd() < specWeight) {
+        float pdfHalf;
+        vec3 hv = sampleGgxHalf(a, n, pdfHalf);
+        wi = reflect(-wo, hv);
+        float ndotl = dot(n, wi);
+        float vdh = dot(hv, wo);
+        if (ndotl <= 0.0 || pdfHalf <= 1.0e-6 || vdh <= 1.0e-6) {
+            return L + emissionTerm;
+        }
+        vec3 fr = fresnelSchlick(vdh, f0);
+        float spec = distributionGGX(max(dot(n, hv), 0.0), a) * smithG1(ndotv, a)
+                   * smithG1(ndotl, a) / (4.0 * ndotv * max(ndotl, 1.0e-4));
+        f = fr * spec;
+        pdf = (pdfHalf / (4.0 * vdh)) * specWeight;
+    } else {
+        wi = sampleCosineHemisphere(n, pdf);
+        vec3 fr = fresnelSchlick(max(dot(n, wi), 0.0), f0);
+        f = (1.0 - fr) * (1.0 - s.metalness) * albedo / PI;
+        pdf *= (1.0 - specWeight);
+    }
+
+    if (dot(wi, n) <= 0.0 || pdf <= 1.0e-8) {
+        return L + emissionTerm;
+    }
+
+    Hit h2 = traceGeometry(h.pos + n * SURF_BIAS, wi, RAY_TMAX);
+    vec3 Li;
+    if (h2.hit) {
+        Surface s2 = evalSurface(h2, -wi);
+        Li = s2.emission > 0.0
+                ? s2.albedo * s2.emission * 8.0
+                : directSun(h2.pos, s2.normal, -wi, s2.f0, s2.roughness, s2.metalness,
+                            s2.albedo * s2.ao);
+    } else {
+        Li = skyRadiance(wi);
+    }
+    return L + f * Li * dot(n, wi) / pdf + emissionTerm;
+}
+
+// --- debug channels -------------------------------------------------------------------
+// Channel numbers are the --debug names in main.cpp; the mapping is duplicated there for the
+// report, so a new channel has to be added in both places.
+vec3 debugValue(vec3 ro, vec3 rd, Hit h) {
+    int channel = int(F.renderSize.w);
+    if (!h.hit) {
+        return vec3(0.05);
+    }
+    Surface s = evalSurface(h, -rd);
+    if (channel == 1) return s.albedo;
+    if (channel == 2) return s.normal * 0.5 + 0.5;
+    if (channel == 3) return vec3(s.roughness);
+    if (channel == 4) return vec3(s.metalness);
+    if (channel == 5) return s.f0;
+    if (channel == 6) return vec3(s.emission);
+    if (channel == 7) return vec3(s.sss);
+    if (channel == 8) return vec3(s.porosity);
+    if (channel == 9) return vec3(s.height);
+    if (channel == 10) return vec3(s.ao);
+    return vec3(0.0);
+}
+
+// --- main -----------------------------------------------------------------------------
+
+vec3 rayDir(vec2 ndc) {
+    return normalize(F.camFwd.xyz
+            + F.camRight.xyz * (ndc.x * F.camRight.w)
+            + F.camUp.xyz * (ndc.y * F.camUp.w));
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    int rw = int(F.renderSize.x);
+    int rh = int(F.renderSize.y);
+    if (pix.x >= rw || pix.y >= rh) {
+        return;
+    }
+
+    vec2 size = vec2(rw, rh);
+    vec3 ro = F.camPos.xyz;
+
+    if (int(F.renderSize.w) > 0) {
+        vec2 ndc = pixelNdc(vec2(pix) + 0.5, size);
+        vec3 rd = rayDir(ndc);
+        Hit h = traceGeometry(ro, rd, RAY_TMAX);
+        imageStore(outColor, pix, vec4(debugValue(ro, rd, h), 1.0));
+        return;
+    }
+
+    int samples = max(1, int(F.renderSize.z));
+    vec3 sum = vec3(0.0);
+    for (int s = 0; s < samples; ++s) {
+        // A fresh seed per (pixel, iteration) keeps the average unbiased; the pixel and
+        // iteration terms are the same decorrelation the game's jitter follows.
+        g_state = pcg(uint(pix.x) * 1973u + uint(pix.y) * 9277u + uint(s) * 26699u + 1u);
+        vec2 jitter = vec2(rnd(), rnd()) - 0.5;
+        vec2 ndc = pixelNdc(vec2(pix) + 0.5 + jitter, size);
+        vec3 rd = rayDir(ndc);
+
+        Hit h = traceGeometry(ro, rd, RAY_TMAX);
+        if (!h.hit) {
+            sum += skyRadiance(rd);
+        } else {
+            sum += shadePrimary(h, -rd);
+        }
+    }
+    imageStore(outColor, pix, vec4(sum / float(samples), 1.0));
+}

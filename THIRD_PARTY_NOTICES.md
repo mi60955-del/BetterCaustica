@@ -30,3 +30,23 @@ Bundled NVIDIA SDK runtime libraries may include files matching:
 
 Caustica's `ngxshim` native library is project-owned glue code and follows
 Caustica's project license unless otherwise noted.
+
+## CIE photometric and colorimetric data
+
+Caustica's dark-adaptation (Purkinje) shift is baked from two CIE data tables vendored under
+`tools/data/cie/`:
+
+- Colour-matching functions of the CIE 1931 standard colorimetric observer (2 degree observer,
+  1 nm, CIE 018:2019 Table 6) — <https://doi.org/10.25039/CIE.DS.xvudnb9b>
+- CIE spectral luminous efficiency for scotopic vision, V'(lambda) (1 nm, CIE 018:2019 Table 2) —
+  <https://doi.org/10.25039/CIE.DS.gr6w4b5g>
+
+Both are published by the International Commission on Illumination (CIE), Vienna, under the
+Creative Commons Attribution-ShareAlike 4.0 International licence
+(<https://creativecommons.org/licenses/by-sa/4.0/>). `tools/bake_scotopic_basis.py` verifies each
+vendored file against the SHA-256 published with it, and the scotopic luminance basis derived from
+them carries its provenance in `shaders/pipelines/display/main.comp.slang`.
+
+The mesopic adaptation-coefficient rule used by the same shift is quoted from BIPM,
+`Principles Governing Photometry`, 2nd edition (Metrologia 56, 2019), equations (1) and (11),
+which reproduce CIE 191:2010.

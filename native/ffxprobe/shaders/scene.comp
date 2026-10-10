@@ -1,0 +1,122 @@
+#version 450
+
+// Synthetic scene for the frame-generation probe.
+//
+// Everything here is chosen so that the right answer to "what should the interpolated frame
+// look like" is computable on the CPU without reference to FSR:
+//
+//   * the world is a vertical stripe pattern shifted by `pan`, so every background pixel has
+//     the same, exactly known displacement;
+//   * one opaque red bar sits at `objX` at a nearer depth, with its own exactly known
+//     displacement, so a bar landing halfway between its previous and current centre is only
+//     achievable by interpreting the vectors the way the shaders do;
+//   * a green square is fixed to the screen and written only into the HUD-present colour
+//     buffer, which is the shape of a real heads-up display and what HUDLessColor exists to
+//     separate.
+//
+// Scene positions are given in *normalised* units and multiplied by the size of whatever is
+// being written, because colour is rendered at display resolution while depth and motion are
+// rendered at a smaller render resolution - the same split the game uses. A displacement that
+// is half the screen must come out as half the width in pixels on a 1920-wide target and as
+// half of 960 on the guide target, and only the pixel count of each is correct for its own
+// resolution.
+//
+// The vectors written default to the convention this renderer already produces - previous
+// position minus current position - and the probe scales or negates them from the CPU rather
+// than by recompiling.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) uniform writeonly image2D colorHud;      // presented buffer
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D colorHudless;  // world only
+layout(set = 0, binding = 2, r32f)  uniform writeonly image2D depthOut;      // reversed: 1 near
+layout(set = 0, binding = 3, rg16f) uniform writeonly image2D motionOut;     // see above
+
+// Deliberately all scalars: a vec4 here would need 16-byte alignment in the push-constant
+// block, which the C++ side does not reproduce.
+layout(push_constant) uniform Push {
+    vec2  displaySize;      // colour target extent
+    vec2  guideSize;        // depth / motion target extent
+    float writeColor;       // 1 = this dispatch fills the colour pair
+    float writeGuides;      // 1 = this dispatch fills depth and motion
+    vec2  mvOutScale;       // applied to the motion vector before storing
+    float mvOutSign;
+    float panX;             // all scene positions are normalised, 0..1 of the target width
+    float panPrevX;
+    float objX;
+    float objPrevX;
+    float objHalfW;
+    float stripePeriod;
+    float hudLeft;
+    float hudTop;
+    float hudW;
+    float hudH;
+    // Per-frame, per-pixel colour noise. A path-traced frame carries denoise residual that
+    // changes every frame without corresponding to any motion, and FSR weights both of its
+    // vector fields by colour agreement between the two frames - so this is the one input the
+    // clean synthetic scene omitted and the game always has.
+    float noiseAmp;
+    float frameSeed;
+} pc;
+
+// Cheap integer hash, good enough to decorrelate colour between frames without a buffer.
+float hash12(ivec2 p, float seed) {
+    uint q = uint(p.x) * 73856093u ^ uint(p.y) * 19349663u ^ uint(seed * 8388617.0);
+    q ^= q >> 13;
+    q *= 1274126177u;
+    q ^= q >> 16;
+    return float(q) / 4294967295.0;
+}
+
+const float DEPTH_FAR = 0.04;
+const float DEPTH_BAR = 0.80;
+const float DEPTH_HUD = 0.99;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (pc.writeColor > 0.5) {
+        if (p.x >= int(pc.displaySize.x) || p.y >= int(pc.displaySize.y)) {
+            return;
+        }
+        float x = float(p.x) + 0.5;
+        float y = float(p.y) + 0.5;
+        float u = x / pc.displaySize.x;
+
+        // A world feature lands on screen at worldU + pan, so this pixel shows worldU = u - pan.
+        float phase = fract((u - pc.panX) / pc.stripePeriod);
+        float band = phase < 0.5 ? 0.10 : 0.30;
+        // The vertical gradient keeps the pattern from being two-valued, which optical flow can
+        // otherwise lock onto at several offsets at once.
+        float vshade = 0.06 * (y / pc.displaySize.y);
+        vec3 color = vec3(band + vshade);
+        if (abs(u - pc.objX) <= pc.objHalfW) {
+            color = vec3(1.0, 0.0, 0.0);
+        }
+        bool inHud = x >= pc.hudLeft * pc.displaySize.x && x < (pc.hudLeft + pc.hudW) * pc.displaySize.x
+                  && y >= pc.hudTop  * pc.displaySize.y && y < (pc.hudTop  + pc.hudH) * pc.displaySize.y;
+        // Noise is added to the world content only, in both buffers alike: what FSR must judge
+        // is whether the same surface agrees between frames, and the UI is not part of that.
+        float grain = (hash12(p, pc.frameSeed) - 0.5) * pc.noiseAmp;
+        vec3 noisy = clamp(color + grain, 0.0, 1.0);
+        // The HUD stays exact so hudFill keeps measuring recomposition, not noise.
+        imageStore(colorHud, p, vec4(inHud ? vec3(0.0, 1.0, 0.0) : noisy, 1.0));
+        imageStore(colorHudless, p, vec4(noisy, 1.0));
+        return;
+    }
+
+    if (p.x >= int(pc.guideSize.x) || p.y >= int(pc.guideSize.y)) {
+        return;
+    }
+    float u = (float(p.x) + 0.5) / pc.guideSize.x;
+    float v = (float(p.y) + 0.5) / pc.guideSize.y;
+
+    bool onBar = abs(u - pc.objX) <= pc.objHalfW;
+    bool inHud = u >= pc.hudLeft && u < pc.hudLeft + pc.hudW && v >= pc.hudTop && v < pc.hudTop + pc.hudH;
+    // Displacement in normalised units, converted to this target's pixels.
+    vec2 motion = vec2((pc.panPrevX - pc.panX) * pc.guideSize.x, 0.0);
+    if (onBar) {
+        motion = vec2((pc.objPrevX - pc.objX) * pc.guideSize.x, 0.0);
+    }
+    imageStore(motionOut, p, vec4(motion * pc.mvOutScale * pc.mvOutSign, 0.0, 0.0));
+    imageStore(depthOut, p, vec4(inHud ? DEPTH_HUD : (onBar ? DEPTH_BAR : DEPTH_FAR), 0.0, 0.0, 0.0));
+}
