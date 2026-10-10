@@ -31,6 +31,11 @@ public abstract class MinecraftMixin {
 	@Inject(method = "close", at = @At("HEAD"))
 	private void caustica$destroyUiOverlayBeforeRendererShutdown(CallbackInfo ci) {
 		RtUiOverlay.destroy();
+		// The render loop has stopped by close(); this is the first point where every native RT
+		// resource can be destroyed without racing frames that still allocate on the shared device
+		// (FastQuit's save screen, title-screen font atlases). Blaze3D shuts the Vulkan device down
+		// later inside close(), so the RT-owned objects still have a live parent here.
+		dev.comfyfluffy.caustica.client.CausticaClient.destroyRtNative();
 	}
 
 	@Inject(method = "runTick", at = @At("HEAD"))

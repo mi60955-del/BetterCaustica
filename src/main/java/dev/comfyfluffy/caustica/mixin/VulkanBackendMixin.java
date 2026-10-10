@@ -61,7 +61,10 @@ public abstract class VulkanBackendMixin {
 			"VK_KHR_dedicated_allocation",
 			// NGX (DLSS) — NVIDIA-only; skipped on other vendors. (The NGX instance
 			// extension VK_KHR_get_physical_device_properties2 needs an instance hook;
-			// DLSS relies on it being core/enabled at instance level.)
+			// DLSS relies on it being core/enabled at instance level.) This list must
+			// mirror what the bundled NGX SDK build requires: the shim's
+			// ngxshim_required_extensions query is not consulted here, because device
+			// creation runs long before the shim is loaded.
 			"VK_NVX_binary_import",
 			"VK_NVX_image_view_handle",
 			"VK_KHR_push_descriptor");

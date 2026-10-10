@@ -52,4 +52,17 @@ public abstract class LevelRendererMixin {
 		VanillaRenderController.INSTANCE.markWorldSkipped();
 		ci.cancel();
 	}
+
+	/**
+	 * The entity-outline pass blends {@code entityOutlineTarget} into the main target's colour and depth, and
+	 * that target is only ever refreshed by the level pass. While the ray-traced composite replaces the world
+	 * the level pass never runs, so the blend would paste a stale frame back over the traced image — and the
+	 * traced path draws its own glow and block outlines instead.
+	 */
+	@Inject(method = "doEntityOutline", at = @At("HEAD"), cancellable = true)
+	private void caustica$skipEntityOutline(CallbackInfo ci) {
+		if (VanillaRenderController.INSTANCE.wasWorldSkippedThisFrame()) {
+			ci.cancel();
+		}
+	}
 }

@@ -18,6 +18,9 @@ import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback
 
 public final class CausticaClient implements ClientModInitializer {
 	private static boolean rtInitDone = false;
+	// Guards the native teardown so it runs exactly once, at Minecraft.close(). CLIENT_STOPPING can no
+	// longer reset rtInitDone before this point, so the guard cannot live on rtInitDone itself.
+	private static boolean nativeDestroyed = false;
 
 	@Override
 	public void onInitializeClient() {
@@ -58,10 +61,21 @@ public final class CausticaClient implements ClientModInitializer {
 					// until we're in a world with the block atlas loaded, or once already created.
 					RtComposite.INSTANCE.ensureResourcesReady(ctx);
 					RtTerrain.update(ctx);
-					// Log DLSS-FG availability once when frame generation is enabled (capability query only;
-					// the present-loop integration that consumes it is built separately).
+					// Log each backend's availability once when frame generation is enabled (capability
+					// query only; the present-loop integration that consumes it is built separately). Only
+					// the selected backend is probed, because probing the other would load a vendor runtime
+					// that this session has no use for.
 					if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
-						dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
+						if (dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.selected()) {
+							dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.INSTANCE.probeAvailabilityOnce();
+						} else {
+							dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
+						}
+						// A backend switch in the settings leaves the previous backend's GPU state
+						// alive; release it here so the switch does not stack two contexts or
+						// features worth of device memory.
+						dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.INSTANCE.destroyUnlessSelected();
+						dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.destroyUnlessSelected();
 					}
 				}
 			}
@@ -80,6 +94,14 @@ public final class CausticaClient implements ClientModInitializer {
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
 			shutdownRt();
 		});
+
+		// The NGX natives extraction and shim dlopen are file IO that would otherwise happen inside
+		// the first render-frame acquire when DLSS is wanted; doing it here keeps that frame smooth.
+		// Never initializes NGX, and does nothing when DLSS is not wanted or the platform has no bundle.
+		if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr.enabled()
+				|| dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
+			dev.comfyfluffy.caustica.ngx.NgxRuntime.INSTANCE.prewarm();
+		}
 	}
 
 	private static void shutdownRt() {
@@ -89,30 +111,51 @@ public final class CausticaClient implements ClientModInitializer {
 			RtWorkerPool.INSTANCE.shutdown();
 			return;
 		}
+		// CLIENT_STOPPING fires while the client is still rendering: FastQuit keeps presenting its save
+		// screen and the title screen keeps baking font glyph atlases after this callback, and both
+		// allocate images on the shared Vulkan device through Blaze3D's VMA. Any native teardown here
+		// (RT pipelines, the RT VMA allocator, FFX/NGX release) races those live allocations, so the
+		// full destroy chain runs at Minecraft.close() instead, once the render loop has stopped. The
+		// process is exiting either way; only the Java-side workers need an orderly stop.
+		RtWorkerPool.INSTANCE.shutdown();
+		RtEntities.INSTANCE.shutdown();
+		rtInitDone = false;
+	}
 
+	/**
+	 * Destroy every native RT resource. Called from Minecraft.close(), after the render loop has
+	 * stopped and no further frames can allocate on the device, but before Blaze3D shuts the device
+	 * down, so the RT-owned Vulkan objects still have a live parent to be destroyed against.
+	 */
+	public static void destroyRtNative() {
+		if (nativeDestroyed) {
+			return;
+		}
+		nativeDestroyed = true;
 		RtContext ctx = RtContext.currentOrNull();
-		if (ctx != null) {
+		if (ctx == null) {
+			return; // RT never came up in this session
+		}
+		try {
 			// Let the terrain epoch cancel queued work and release every active-task token before
 			// shutdownNow(): discarded worker Runnables cannot deliver their terminal callbacks.
 			RtTerrain.shutdown(ctx);
+		} catch (Throwable t) {
+			CausticaMod.LOGGER.warn("RT terrain shutdown failed during exit", t);
 		}
 		RtWorkerPool.INSTANCE.shutdown();
-		if (ctx != null) {
-			RtEntities.INSTANCE.shutdown();
-		}
+		RtEntities.INSTANCE.shutdown();
 		RtComposite.INSTANCE.destroy();
 		RtEntityTextures.INSTANCE.reset();
 		RtBlockMaterials.INSTANCE.destroy();
 		dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.destroy();
-		if (ctx != null) {
-			dev.comfyfluffy.caustica.rt.RtFramePresenter.INSTANCE.destroy(ctx.device());
-			dev.comfyfluffy.caustica.rt.RtReflex.INSTANCE.destroy(ctx.device().vkDevice());
-		}
+		dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.INSTANCE.destroy();
+		dev.comfyfluffy.caustica.rt.RtFramePresenter.INSTANCE.destroy(ctx.device());
+		dev.comfyfluffy.caustica.rt.RtReflex.INSTANCE.destroy(ctx.device().vkDevice());
 		// Shut NGX down once, after every feature (RR + FG) has been released above.
 		dev.comfyfluffy.caustica.ngx.NgxRuntime.INSTANCE.shutdown();
-		if (ctx != null) {
-			ctx.destroy();
-		}
-		rtInitDone = false;
+		// Same for FFX: only after the FSR context has been released above.
+		dev.comfyfluffy.caustica.ffx.FfxRuntime.INSTANCE.shutdown();
+		ctx.destroy();
 	}
 }

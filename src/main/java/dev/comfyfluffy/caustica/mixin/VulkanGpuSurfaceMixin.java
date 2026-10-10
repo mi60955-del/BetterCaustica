@@ -6,6 +6,8 @@ import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
+import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
+import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtComposite;
@@ -13,6 +15,7 @@ import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtFramePresenter;
 import dev.comfyfluffy.caustica.rt.RtHdr;
 import dev.comfyfluffy.caustica.rt.RtReflex;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import it.unimi.dsi.fastutil.longs.LongList;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.KHRSurface;
@@ -134,13 +137,21 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * A framebuffer resize already recreates the swapchain through {@code configure}. Refresh the chosen
-	 * (format,colorSpace) pair at that same boundary so the HDR option can use the identical path without
-	 * recreating the window or Vulkan surface. Vanilla made swapchainImageFormat final because resize
-	 * normally keeps it fixed; the mixin marks that field mutable specifically for this re-selection.
+	 * Everything Caustica has to do at the swapchain-recreation boundary, which is also the framebuffer
+	 * resize boundary: a framebuffer resize recreates the swapchain through {@code configure}, so the HDR
+	 * option can use the identical path without recreating the window or Vulkan surface. Re-picks the
+	 * (format,colorSpace) pair — vanilla made swapchainImageFormat final because resize normally keeps it
+	 * fixed, and the mixin marks that field mutable specifically for this re-selection — and drops every
+	 * cache keyed on the outgoing swapchain handle, which the TAIL then refills.
 	 */
 	@Inject(method = "configure", at = @At("HEAD"))
-	private void caustica$refreshFormatForConfigure(GpuSurface.Configuration config, CallbackInfo ci) {
+	private void caustica$onConfigure(GpuSurface.Configuration config, CallbackInfo ci) {
+		// Everything below and everything at the TAIL treats a swapchain handle as an identity, but
+		// configure() destroys the old swapchain first and Vulkan may hand the same handle value back for
+		// the new one. Drop every cache keyed on the previous handle so the state scoped to a swapchain
+		// object — Reflex's sleep mode and the HDR mastering metadata — is genuinely re-applied.
+		this.caustica$metadataSwapchain = 0L;
+		RtReflex.INSTANCE.forgetSwapchain();
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			IntBuffer count = stack.callocInt(1);
 			int countResult = KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(
@@ -182,33 +193,46 @@ public abstract class VulkanGpuSurfaceMixin {
 				this.caustica$colorSpace = 0;
 			}
 			CausticaConfig.Rt.Hdr.setSwapchainPqActive(usePq);
-			CausticaMod.LOGGER.info("HDR: recreating swapchain as {} (format={}, colorSpace={})",
-					usePq ? "PQ" : "native SDR", this.swapchainImageFormat,
-					usePq ? "HDR10_ST2084" : "SRGB_NONLINEAR");
-		}
+		CausticaMod.LOGGER.info("HDR: recreating swapchain as {} (format={}, colorSpace={})",
+				usePq ? "PQ" : "native SDR", this.swapchainImageFormat,
+				usePq ? "HDR10_ST2084" : "SRGB_NONLINEAR");
 	}
+}
 
+	/**
+	 * The PQ surface format to steer the swapchain into. Packed 10-bit RGB is preferred when the surface
+	 * offers it — HDR10's native bit depth, at half the scanout bandwidth of a 16-bit-float swapchain —
+	 * with the first other PQ entry as the fallback.
+	 */
 	@Unique
 	private static VkSurfaceFormatKHR caustica$findPq(VkSurfaceFormatKHR.Buffer formats) {
+		VkSurfaceFormatKHR fallback = null;
 		for (int i = 0; i < formats.capacity(); i++) {
 			VkSurfaceFormatKHR f = formats.get(i);
 			if (f.colorSpace() == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
-				return f;
+					if (f.format() == VK10.VK_FORMAT_A2B10G10R10_UNORM_PACK32
+							|| f.format() == VK10.VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
+					return f;
+				}
+				if (fallback == null) {
+					fallback = f;
+				}
 			}
 		}
-		return null;
+		return fallback;
 	}
 
 	@Unique
 	private static VkSurfaceFormatKHR caustica$findSdr(VkSurfaceFormatKHR.Buffer formats) {
 		for (int i = 0; i < formats.capacity(); i++) {
 			VkSurfaceFormatKHR f = formats.get(i);
-			if (f.colorSpace() == 0 && (f.format() == 37 || f.format() == 44)) {
+			if (f.colorSpace() == 0 && (f.format() == VK10.VK_FORMAT_R8G8B8A8_UNORM
+					|| f.format() == VK10.VK_FORMAT_B8G8R8A8_UNORM)) {
 				return f;
 			}
 		}
 		return null;
-	}
+		}
 
 	/** Replace the hardcoded {@code imageColorSpace(0)} with the PQ color space when one was selected. */
 	@ModifyArg(method = "configure",
@@ -235,23 +259,37 @@ public abstract class VulkanGpuSurfaceMixin {
 					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkCreateSwapchainKHR(Lorg/lwjgl/vulkan/VkDevice;Lorg/lwjgl/vulkan/VkSwapchainCreateInfoKHR;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)I"))
 	private int caustica$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
 			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
+		// {@code this.swapchain} still holds the swapchain configure() has just destroyed, so comparing it
+		// with the handle about to be produced says whether Vulkan recycled it. Anything keyed on the
+		// previous handle — Reflex's sleep mode, the HDR mastering metadata, the descriptor no-op caches —
+		// would then mistake the new object for the one it already configured.
+		long discarded = this.swapchain;
+		int result;
 		if (!RtDeviceBringup.reflexEnabled()) {
-			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+			result = KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		} else {
+			try (MemoryStack stack = MemoryStack.stackPush()) {
+				VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
+				latency.pNext(pCreateInfo.pNext());
+				latency.latencyModeEnable(true);
+				pCreateInfo.pNext(latency.address());
+				result = KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+			}
 		}
-		try (MemoryStack stack = MemoryStack.stackPush()) {
-			VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
-			latency.pNext(pCreateInfo.pNext());
-			latency.latencyModeEnable(true);
-			pCreateInfo.pNext(latency.address());
-			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		if (result == VK10.VK_SUCCESS && discarded != 0L && pSwapchain.limit() > 0
+				&& discarded == pSwapchain.get(0)) {
+			CausticaMod.LOGGER.warn("Swapchain handle {} reused for the recreated swapchain; state scoped to "
+					+ "a swapchain object must be re-applied, not compared", Long.toHexString(discarded));
 		}
+		return result;
 	}
 
 	/**
-	 * Reapply the Reflex sleep-mode config for the configured swapchain. The configuration
-	 * is scoped to a specific swapchain object, so it must be re-called whenever {@code configure()} builds a
-	 * new one (e.g. resize) — {@link RtReflex#applySleepMode} is idempotent (no-op if unchanged), so calling
-	 * it unconditionally here is cheap. No-op when Reflex isn't enabled + device-supported.
+	 * Reapply the state scoped to a swapchain object. {@code configure()} has just built a new one (on a
+	 * resize, a fullscreen toggle, or an HDR change), and the HEAD inject cleared the handle-keyed caches
+	 * for exactly this, so both calls take effect here rather than being mistaken for a repeat.
+	 * No-ops when the feature is unavailable: HDR metadata unless the surface is PQ, Reflex unless it is
+	 * enabled and device-supported.
 	 */
 	@Inject(method = "configure", at = @At("TAIL"))
 	private void caustica$applySwapchainExtensionState(GpuSurface.Configuration config, CallbackInfo ci) {
@@ -264,7 +302,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		// display ever shows it — even though our vkQueuePresentKHR call itself reports success. FIFO is the
 		// only mode that guarantees every queued present gets its own vblank. Log once per (re)configure so
 		// this is checkable without guessing at the in-game V-Sync setting.
-		if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
+		if (RtDlssFg.enabled()) {
 			CausticaMod.LOGGER.info("DLSS-FG: swapchain present mode = {} (FIFO required for generated frames "
 					+ "to actually display; MAILBOX/IMMEDIATE will silently drop them — enable V-Sync if not FIFO)",
 					config.presentMode());
@@ -370,7 +408,7 @@ public abstract class VulkanGpuSurfaceMixin {
 
 	@Unique
 	private static long caustica$vkImageView(GpuTextureView view) {
-		return view instanceof com.mojang.blaze3d.vulkan.VulkanGpuTextureView v ? v.vkImageView() : 0L;
+		return view instanceof VulkanGpuTextureView v ? v.vkImageView() : 0L;
 	}
 
 	/**
@@ -385,12 +423,12 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (this.currentImageIndex < 0 || !RtFramePresenter.INSTANCE.isActive()) {
 			return;
 		}
-		long srcImage = textureView.texture() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTexture t ? t.vkImage() : 0L;
+		long srcImage = textureView.texture() instanceof VulkanGpuTexture t ? t.vkImage() : 0L;
 		long srcView = caustica$vkImageView(textureView);
 		if (srcImage == 0L) {
 			return;
 		}
-		int generatedCount = dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+		int generatedCount = RtFramePresenter.generatedFramesPerRendered();
 		RtFramePresenter.INSTANCE.prepareExtraFrames((VulkanCommandEncoder) commandEncoder, this.device,
 				this.swapchain, this.swapchainImages, this.presentSemaphores,
 				this.swapchainWidth, this.swapchainHeight,
@@ -414,7 +452,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (hdrImage == 0L) {
 			return;
 		}
-		int generatedCount = dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
+		int generatedCount = RtFramePresenter.generatedFramesPerRendered();
 		RtFramePresenter.INSTANCE.prepareExtraFrames(enc, this.device, this.swapchain, this.swapchainImages,
 				this.presentSemaphores, this.swapchainWidth, this.swapchainHeight,
 				hdrView, hdrImage, this.swapchainWidth, this.swapchainHeight, generatedCount, true);

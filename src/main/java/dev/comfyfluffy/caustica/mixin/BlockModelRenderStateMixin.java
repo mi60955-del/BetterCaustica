@@ -5,6 +5,8 @@ import dev.comfyfluffy.caustica.rt.entity.ContainedBlockSource;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityCollector;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.BlockModelRenderState;
+import net.minecraft.client.renderer.special.SpecialModelRenderer;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.level.block.state.BlockState;
 import org.joml.Matrix4fc;
 import org.jspecify.annotations.Nullable;
@@ -29,6 +31,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 public abstract class BlockModelRenderStateMixin implements ContainedBlockSource {
     @Shadow @Nullable private Matrix4fc transformation;
     @Shadow @Nullable private Matrix4fc specialRendererTransformation;
+    @Shadow @Nullable private SpecialModelRenderer<?> specialRenderer;
+    @Shadow public int blockLightCoords;
 
     @Unique private BlockState caustica$containedState;
 
@@ -53,11 +57,24 @@ public abstract class BlockModelRenderStateMixin implements ContainedBlockSource
         if (this.caustica$containedState == null || !(submitNodeCollector instanceof RtEntityCollector rt)) {
             return;
         }
-        // Apply whichever display transform the resolve set (normal vs special path), then re-emit the
-        // world model through FRAPI so custom geometry and wrapper transforms are retained even when the
-        // display set hands the block to a special renderer. Replaces only the RT-capture submission.
-        Matrix4fc transform = this.transformation != null ? this.transformation : this.specialRendererTransformation;
-        rt.captureBlockState(this.caustica$containedState, transform, poseStack);
+        // Mirror vanilla's submit(), which a composite display model populates on both paths: the
+        // world-model mesh always goes out under the state-model wrapper's transform, and the special
+        // renderer, when the resolve set one, is submitted on top under its own transform. Choosing
+        // either-or would silently drop the special-renderer half of a composite.
+        rt.captureBlockState(this.caustica$containedState, this.transformation, poseStack);
+        if (this.specialRenderer != null) {
+            poseStack.pushPose();
+            if (this.specialRendererTransformation != null) {
+                poseStack.mulPose(this.specialRendererTransformation);
+            }
+            try {
+                this.specialRenderer.submit(null, poseStack, rt,
+                        LightCoordsUtil.max(externalLightCoords, this.blockLightCoords),
+                        overlayCoords, false, outlineColor);
+            } finally {
+                poseStack.popPose();
+            }
+        }
         ci.cancel();
     }
 }

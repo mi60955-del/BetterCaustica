@@ -15,10 +15,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * Always selects the native Wayland window system on Linux, unconditionally — not gated on whether HDR
  * is currently enabled. GLFW's platform is chosen once, before any window/surface exists, which is before
  * {@code CausticaConfig.Rt.Hdr.enabled()} can mean anything actionable and long before
- * {@code VulkanGpuSurfaceMixin} can know whether the resulting surface is PQ-capable. Since HDR is now a
+ * {@code VulkanGpuSurfaceMixin} can know whether the resulting surface is PQ-capable. Since HDR is a
  * live runtime toggle (see {@code CausticaConfig.Rt.Hdr.swapchainPqAvailable}), the window has to already
  * be running on whatever backend can expose an HDR-capable surface before the toggle is ever flipped —
- * there is no "switch to Wayland later" once GLFW has initialized on X11.
+ * there is no "switch to Wayland later" once GLFW has initialized on X11. {@code -Dcaustica.hdr.x11=true}
+ * restores vanilla's X11 choice for sessions where Wayland misbehaves; it also gives up Linux HDR.
  */
 @Mixin(GLX.class)
 public abstract class GlxMixin {
@@ -30,6 +31,11 @@ public abstract class GlxMixin {
                     shift = At.Shift.BEFORE))
     private static void caustica$preferWaylandForHdr(CallbackInfoReturnable<LongSupplier> cir) {
         if (!caustica$isLinux()) {
+            return;
+        }
+
+        if (Boolean.getBoolean("caustica.hdr.x11")) {
+            CausticaMod.LOGGER.info("HDR: caustica.hdr.x11 is set; keeping vanilla's X11 window system");
             return;
         }
 

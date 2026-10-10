@@ -5,13 +5,13 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class CausticaMod implements ModInitializer {
-	public static final String MOD_ID = "caustica";
+	public static final String MOD_ID = "bettercaustica";
 	public static final Logger LOGGER = LoggerFactory.getLogger("Caustica");
 
 	@Override
 	public void onInitialize() {
-		// Register every setting (applying TOML file values) and write a default config on first run.
-		CausticaConfig.ensureRegistered();
+		// saveIfMissing registers every setting (applying TOML file values) and writes a default
+		// config on first run.
 		CausticaConfig.saveIfMissing();
 		LOGGER.info("Caustica initialized (common); config: {}", CausticaConfig.configPath());
 	}

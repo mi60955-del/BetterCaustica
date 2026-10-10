@@ -124,6 +124,10 @@ public abstract class GameRendererMixin {
 					shift = At.Shift.AFTER))
 	private void caustica$endWorldScale(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
 		WorldRenderScaler.INSTANCE.endSafetyNet(this.mainRenderTarget);
+		// The safety net can run its own composite, which claims the shared RT graphics-use token; the
+		// primary seam's finally never ran on that path. finishGraphicsUse is a no-op once the primary
+		// seam has already released the token, so this only closes the safety net's own claim.
+		RtComposite.INSTANCE.finishGraphicsUse();
 	}
 
 	// Capture the frame's camera for the RT composite at the exact point the level projection is built
@@ -181,7 +185,7 @@ public abstract class GameRendererMixin {
 		// DLSS-FG quality: snapshot the main target before the combined UI overlay composites back below.
 		// Hand/screen effects, world overlays and GUI are carried by the optional DLSSG UI resource.
 		RtComposite.INSTANCE.captureFgHudless(this.mainRenderTarget);
-		dev.comfyfluffy.caustica.rt.RtUiOverlay.compositeIfUsed();
+		RtUiOverlay.compositeIfUsed();
 	}
 
 	@Shadow

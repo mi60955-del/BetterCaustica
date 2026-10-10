@@ -28,18 +28,23 @@ public final class RtScreenshotExporter {
             Files.createDirectories(screenshotDirectory);
             Path output = nextPairedPath(screenshotDirectory);
             if (!RtComposite.INSTANCE.exportLatestResidualExposureExr(output)) {
+                // Without a line here a missing EXR is indistinguishable from a lost write, and the
+                // usual cause is simply that RT was not producing frames when F2 was pressed.
+                CausticaMod.LOGGER.info("No residual-exposure EXR written: the RT composite had no frame to export");
+                callback.accept(Component.translatable(
+                        "caustica.options.rt.screenshot.exrUnavailable").withStyle(ChatFormatting.YELLOW));
                 return pngName(output);
             }
             File file = output.toFile().getAbsoluteFile();
             Component link = Component.literal(file.getName())
                     .withStyle(ChatFormatting.UNDERLINE)
                     .withStyle(style -> style.withClickEvent(new ClickEvent.OpenFile(file)));
-            callback.accept(Component.literal("Saved residual-exposure ACEScg EXR: ").append(link));
+            callback.accept(Component.translatable("caustica.options.rt.screenshot.exrSaved", link));
             CausticaMod.LOGGER.info("Saved residual-exposure ACEScg screenshot to {}", file);
             return pngName(output);
         } catch (Exception e) {
             CausticaMod.LOGGER.warn("Couldn't save residual-exposure ACEScg screenshot", e);
-            callback.accept(Component.literal("Couldn't save Caustica EXR: " + e.getMessage())
+            callback.accept(Component.translatable("caustica.options.rt.screenshot.exrFailed", e.getMessage())
                     .withStyle(ChatFormatting.RED));
             return null;
         }

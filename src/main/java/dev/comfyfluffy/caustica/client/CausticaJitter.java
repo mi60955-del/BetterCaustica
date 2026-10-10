@@ -21,7 +21,9 @@ public final class CausticaJitter {
 	/** Advance one frame. Call once per frame before the level projection is built. */
 	public void prepare(int renderWidth, int renderHeight, int displayWidth) {
 		int phaseCount = jitterPhaseCount(renderWidth, displayWidth);
-		int index = (this.frameIndex++ % phaseCount) + 1; // Halton(0) is degenerate
+		// floorMod keeps the index in range for the life of the process: a plain % would go negative
+		// once the frame counter wraps, and Halton(<=0) is degenerate.
+		int index = Math.floorMod(this.frameIndex++, phaseCount) + 1;
 		this.pixelsX = halton(index, 2) - 0.5f;
 		this.pixelsY = halton(index, 3) - 0.5f;
 	}

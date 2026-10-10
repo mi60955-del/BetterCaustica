@@ -8,7 +8,6 @@ import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
 import net.minecraft.client.gui.components.OptionsList;
 import net.minecraft.client.gui.screens.options.VideoSettingsScreen;
-import net.minecraft.network.chat.Component;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
@@ -23,10 +22,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * <ul>
  *   <li>The Quality section drops the vanilla options the path tracer supersedes (Ambient Occlusion and
  *       Entity Shadows are computed by RT global illumination / RT shadows).</li>
- *   <li>A trailing "Ray Tracing" section adds the {@link RtVideoOptions} controls.</li>
+ *   <li>A "Ray Tracing" section adds the controls from {@link RtVideoOptions#addRuntimeSection}, which is
+ *       the same section the Mod Menu landing screen shows.</li>
  * </ul>
  *
- * When RT is disabled the screen is left exactly as vanilla built it.
+ * When RT is disabled the screen is left exactly as vanilla built it. When Sodium is installed it replaces
+ * this screen entirely and nothing here runs; Caustica's Sodium integration publishes the same settings
+ * through Sodium's own config API instead.
  */
 @Mixin(VideoSettingsScreen.class)
 public abstract class VideoSettingsScreenMixin {
@@ -34,8 +36,6 @@ public abstract class VideoSettingsScreenMixin {
     private static OptionInstance<?>[] qualityOptions(Options options) {
         throw new AssertionError("mixin stub");
     }
-
-    private static final Component CAUSTICA$RT_HEADER = Component.translatable("caustica.options.rt.header");
 
     @Redirect(
         method = "addOptions",
@@ -67,13 +67,14 @@ public abstract class VideoSettingsScreenMixin {
         if (list == null) {
             return;
         }
-        list.addHeader(CAUSTICA$RT_HEADER);
-        list.addSmall(RtVideoOptions.runtimeOptions());
+        RtVideoOptions.addRuntimeSection(list);
     }
 
     @Inject(method = "removed", at = @At("TAIL"))
     private void caustica$saveConfig(CallbackInfo ci) {
-        // Persist any RT settings the player changed in this screen to the TOML config.
+        // Persist any RT settings the player changed in this screen to the TOML config. Unconditional:
+        // the file is small and vanilla itself closes this screen far less often than it rewrites its
+        // own options.txt, so a dirty flag would not buy anything measurable.
         CausticaConfig.save();
     }
 }

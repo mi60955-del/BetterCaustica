@@ -58,10 +58,6 @@ public final class VanillaRenderController {
 		this.projectionCaptured = true;
 	}
 
-	public boolean shouldCancelLevelRenderer() {
-		return this.shouldCancelLevelRenderer(false);
-	}
-
 	public boolean shouldCancelLevelRenderer(boolean waitingForRtPlayerSection) {
 		if (!this.rtActive) {
 			return false;
