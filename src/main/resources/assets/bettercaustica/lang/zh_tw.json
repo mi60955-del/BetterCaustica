@@ -9,6 +9,16 @@
 	"caustica.options.rt.manualEv": "曝光 EV",
 	"caustica.options.rt.manualEv.tooltip": "以檔位為單位的曝光補償。手動模式下這是固定曝光；自動模式下會讓自動曝光更亮或更暗。",
 
+	"caustica.options.rt.gamma": "伽馬",
+	"caustica.options.rt.gamma.tooltip": "變換後的亮度伽馬。低於 1.00 的值會提亮陰影和中间調，同時保持黑場、白場和顏色比例不變。",
+
+	"caustica.options.rt.look": "觀感變換",
+	"caustica.options.rt.look.tooltip": "套用觀感包中的場景參考 LMT。關閉後曝光後的影像會直接經過 ACES 2.0 —— 用於判斷畫面發灰、發悶是來自觀感曲線還是來自光照。",
+
+	"caustica.options.rt.risCandidates": "發光方塊取樣數",
+	"caustica.options.rt.risCandidates.tooltip": "每個表面在為發光方塊取樣時測試的候選數。數值越高，火把和岩漿的光噪點越少，但開銷越大。關閉後只有光線直接擊中發光方塊時才會被照亮。",
+	"caustica.options.rt.risCandidates.off": "關閉",
+
 	"caustica.options.rt.spp": "每像素取樣數",
 	"caustica.options.rt.spp.tooltip": "每幀對每個像素進行的路徑追蹤取樣數。數值越高畫面越乾淨，但負載也越高。",
 
@@ -30,8 +40,8 @@
 	"caustica.options.rt.hdr": "HDR 輸出",
 	"caustica.options.rt.hdr.tooltip": "當顯示器支援時，以 HDR (ST.2084/PQ) 而不是 SDR 顯示。重新啟動遊戲後生效。",
 
-	"caustica.options.rt.hdrPaperWhite": "HDR 紙白亮度",
-	"caustica.options.rt.hdrPaperWhite.tooltip": "SDR 等效場景亮度在 HDR 顯示器上映射到的絕對亮度（nits）。",
+	"caustica.options.rt.hdrUiBrightness": "HDR 介面亮度",
+	"caustica.options.rt.hdrUiBrightness.tooltip": "在 HDR 顯示器上，為依 SDR 製作的介面元素指定的絕對亮度（nits）。",
 
 	"caustica.options.rt.hdrPeak": "HDR 峰值亮度",
 	"caustica.options.rt.hdrPeak.tooltip": "高光回落目標的絕對亮度（nits）。請設為顯示器的 HDR 峰值亮度。",
@@ -53,5 +63,7 @@
 	"caustica.options.rt.debugView.4": "粗糙度",
 	"caustica.options.rt.debugView.5": "運動",
 	"caustica.options.rt.debugView.6": "鏡面反射",
-	"caustica.options.rt.debugView.7": "鏡面運動"
+	"caustica.options.rt.debugView.7": "鏡面運動",
+	"caustica.options.rt.debugView.8": "曝光偽彩",
+	"caustica.options.rt.debugView.9": "測光權重"
 }
