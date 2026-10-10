@@ -1,7 +1,7 @@
 {
   "schemaVersion": 4,
   "id": "default",
-  "packageVersion": 4,
+  "packageVersion": 5,
   "exposure": {
     "minEv": -15.0,
     "maxEv": -2.0,
@@ -11,7 +11,7 @@
     "resource": "lmt.bin"
   },
   "bloom": {
-    "strength": 0.02,
+    "strength": 0.05,
     "thresholdSceneLinear": 2.0,
     "softKneeFraction": 0.25,
     "radius": 1.0,
@@ -33,5 +33,13 @@
     "moonDiscHalfAngleDegrees": 11.31,
     "groundAlbedo": 0.1,
     "horizonSoftenDegrees": 15.0
+  },
+  "end": {
+    "flashIlluminanceLux": 3.0,
+    "flashAngularRadiusDegrees": 20.0,
+    "flashQuadLuminanceCdM2": 25.0,
+    "ambientIlluminanceLux": 1.0,
+    "skyBoxGain": 1.0,
+    "skyGradientGain": 1.0
   }
 }

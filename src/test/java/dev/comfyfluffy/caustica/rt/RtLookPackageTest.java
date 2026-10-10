@@ -18,7 +18,10 @@ final class RtLookPackageTest {
              "starLuminanceCdM2":10,"moonPhaseFixedFraction":0.1},
              "sky":{"sunNoonSouthTiltDegrees":30,"sunAngularRadiusDegrees":0.6,
              "moonAngularRadiusDegrees":1.5,"sunDiscHalfAngleDegrees":16.7,
-             "moonDiscHalfAngleDegrees":11.31,"groundAlbedo":0.1,"horizonSoftenDegrees":15}}
+             "moonDiscHalfAngleDegrees":11.31,"groundAlbedo":0.1,"horizonSoftenDegrees":15},
+             "end":{"flashIlluminanceLux":3,"flashAngularRadiusDegrees":20,
+             "flashQuadLuminanceCdM2":25,"ambientIlluminanceLux":1,
+             "skyBoxGain":1,"skyGradientGain":1}}
             """;
 
     @Test
@@ -27,6 +30,8 @@ final class RtLookPackageTest {
         assertEquals(6, look.bloom().levels());
         assertEquals(30.0f, look.sky().sunNoonSouthTiltDegrees());
         assertEquals(0.1f, look.sky().groundAlbedo());
+        assertEquals(3.0f, look.end().flashIlluminanceLux());
+        assertEquals(1.0f, look.end().skyBoxGain());
     }
 
     @Test
@@ -47,6 +52,9 @@ final class RtLookPackageTest {
         // A fade still running at the nadir leaves the lower hemisphere with no settled colour.
         assertThrows(IllegalArgumentException.class, () -> parse(
                 VALID.replace("\"horizonSoftenDegrees\":15", "\"horizonSoftenDegrees\":120")));
+        // Past a quarter turn the flash's NEE square would wrap the light's own horizon.
+        assertThrows(IllegalArgumentException.class, () -> parse(
+                VALID.replace("\"flashAngularRadiusDegrees\":20", "\"flashAngularRadiusDegrees\":60")));
     }
 
     @Test
@@ -54,8 +62,13 @@ final class RtLookPackageTest {
         assertThrows(IllegalArgumentException.class, () -> parse(VALID.replace("\"sky\":", "\"nope\":")));
     }
 
+    @Test
+    void rejectsAMissingEndSection() {
+        assertThrows(IllegalArgumentException.class, () -> parse(VALID.replace("\"end\":", "\"nope\":")));
+    }
+
     private static RtLookPackage parse(String json) {
         return RtLookPackage.parse(JsonParser.parseString(json).getAsJsonObject(),
-                "/caustica/color/looks/test/look.json");
+                "/bettercaustica/color/looks/test/look.json");
     }
 }

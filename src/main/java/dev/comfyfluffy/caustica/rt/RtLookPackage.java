@@ -4,6 +4,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import dev.comfyfluffy.caustica.rt.pipeline.RtBloomPipeline;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -25,12 +27,13 @@ public record RtLookPackage(
         String lmtResource,
         Bloom bloom,
         Lighting lighting,
-        Sky sky) {
+        Sky sky,
+        End end) {
     public static final int SCHEMA_VERSION = 4;
-    /** Mirrors RtBloomPipeline.MAX_LEVELS; validated here so a bad package fails at load, not at resize. */
-    private static final int MAX_BLOOM_LEVELS = 8;
+    /** Shared with the bloom pipeline so a bad package fails at load, not at resize. */
+    private static final int MAX_BLOOM_LEVELS = RtBloomPipeline.MAX_LEVELS;
     public static final String DEFAULT_ID = "default";
-    public static final String DEFAULT_JSON = "/caustica/color/looks/default/look.json";
+    public static final String DEFAULT_JSON = "/bettercaustica/color/looks/default/look.json";
     private static final RtLookPackage DEFAULT = load(DEFAULT_JSON);
 
     public static RtLookPackage current() {
@@ -136,8 +139,21 @@ public record RtLookPackage(
         requireRange(sky.horizonSoftenDegrees(), 0.0f, 90.0f,
                 jsonResource, "sky.horizonSoftenDegrees");
 
+        JsonObject endJson = requiredObject(root, "end");
+        End end = new End(
+                positive(endJson, "flashIlluminanceLux", jsonResource, "end"),
+                nonNegative(endJson, "flashAngularRadiusDegrees", jsonResource, "end"),
+                nonNegative(endJson, "flashQuadLuminanceCdM2", jsonResource, "end"),
+                nonNegative(endJson, "ambientIlluminanceLux", jsonResource, "end"),
+                nonNegative(endJson, "skyBoxGain", jsonResource, "end"),
+                nonNegative(endJson, "skyGradientGain", jsonResource, "end"));
+        // The flash glow is tens of degrees across; beyond a quarter turn the NEE square would wrap the
+        // light's own horizon.
+        requireRange(end.flashAngularRadiusDegrees(), 0.0f, 45.0f,
+                jsonResource, "end.flashAngularRadiusDegrees");
+
         return new RtLookPackage(schemaVersion, id, packageVersion, exposure, lmtResource, bloom,
-                lighting, sky);
+                lighting, sky, end);
     }
 
     private static RtLookPackage load(String resource) {
@@ -310,5 +326,24 @@ public record RtLookPackage(
              * without this the horizon reads as a hard grey line. Zero restores the hard ground.
              */
             float horizonSoftenDegrees) {
+    }
+
+    /**
+     * The End. The flash carries two decoupled scales for the same reason the sun's drawn size and its
+     * illuminance are decoupled: {@code flashIlluminanceLux} is the world lighting (NEE, tinted by the
+     * dimension's SKY_LIGHT_COLOR), {@code flashQuadLuminanceCdM2} is how bright the drawn quad's white
+     * point renders (the sprite's own radial falloff shapes everything under it). The ambient floor is
+     * the isotropic irradiance the dimension's {@code ambient_light} scalar multiplies (the End ships
+     * 0.25), tinted by SKY_LIGHT_COLOR + AMBIENT_LIGHT_COLOR; it is what keeps unlit End stone readable
+     * between flashes. The gains scale the sampled end_sky box and the attribute-colour dome gradient
+     * against the exposure the rest of the scene settles at.
+     */
+    public record End(
+            float flashIlluminanceLux,
+            float flashAngularRadiusDegrees,
+            float flashQuadLuminanceCdM2,
+            float ambientIlluminanceLux,
+            float skyBoxGain,
+            float skyGradientGain) {
     }
 }
