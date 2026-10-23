@@ -423,8 +423,14 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
             && materialLod < PARALLAX_MAX_LOD && parallaxDepth > 0.0) {
         // Parallax comes first: it moves where the surface actually is, so every channel below — and
         // the caller's albedo — has to be read from the moved UV.
+#ifdef CAUSTICA_LEAN_HIT
+        // Diagnostic build only: the steep parallax march compiled out of the hit shader, so the cost of
+        // carrying it can be measured against a hit shader without it.
+        float2 displaced = localUv;
+#else
         float2 displaced = parallaxLocalUv(header, page, localUv, materialLod, maxMaterialLod,
                 geometricNormal, T, B, vdir, parallaxDepth, stepNormal);
+#endif
         // A flush texel inside an otherwise displaced material marches nowhere, so it keeps the flat
         // mapping and skips the caller's extra albedo fetch.
         if (any(abs(displaced - localUv) > 1.0e-5)) {
@@ -720,6 +726,11 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         } else {
             baseAlbedo709 = srgbToLinear(entityTexel.rgb) * srgbToLinear(pr.tint.rgb);
         }
+        // Vanilla's hurt / spawn-flash overlay (see RtEntityOverlay). It is per submission, so a layer that
+        // opted out of it — a cape, an eye layer, an item frame's contents — keeps its own colour while the
+        // entity around it flashes.
+        float4 entityOverlay = entityOverlayRgba(pr.flags);
+        baseAlbedo709 = applyEntityOverlay(baseAlbedo709, entityOverlay);
         float3 opticalColor709 = material == MATERIAL_DIELECTRIC
                 ? lerp(float3(1.0), baseAlbedo709, entityTexel.a) : baseAlbedo709;
         float3 albedo = bt709ToAcesCg(opticalColor709);
@@ -735,6 +746,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             float4 displacedTexel = entityAlbedoTex[NonUniformResourceIndex(texSlot)]
                     .SampleLevel(surface.localUv, entityLod);
             float3 displaced709 = srgbToLinear(displacedTexel.rgb) * srgbToLinear(pr.tint.rgb);
+            displaced709 = applyEntityOverlay(displaced709, entityOverlay);
             float3 displacedOptical = material == MATERIAL_DIELECTRIC
                     ? lerp(float3(1.0), displaced709, displacedTexel.a) : displaced709;
             albedo = bt709ToAcesCg(displacedOptical);

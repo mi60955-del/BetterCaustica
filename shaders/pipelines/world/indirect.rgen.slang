@@ -14,7 +14,15 @@
 // which returns sky radiance — so soft sky fill and contact AO both fall out of the path integral.
 //
 // Each frame emits a single SPP-averaged (still noisy) estimate; temporal convergence is the denoiser's
-// job. With RR disabled the output is the raw noisy path trace — a reference view, not a converged
+// job. With spp > 1 every sample re-traces its own full path, but the first segment's seed-free
+// radiance — volume probes, first-vertex interface emission, a terminating first-ray miss — is
+// evaluated once, on the first sample, and returned through the prefix out-params: its inputs carry no
+// per-sample state, so recomputing it per sample is pure duplication. The prefix is added once at full
+// weight after the /spp average — the same accounting seam as PATH_PREFIX_IN_IMAGE; folding it into the
+// averaged sum instead would darken it by spp. A first-ray miss additionally ends the resampling: every
+// sample's first ray is the same ray, so the samples after the first would only re-derive the identical
+// radiance.
+// With RR disabled the output is the raw noisy path trace — a reference view, not a converged
 // image. Output is scene-linear ACEScg HDR (R16G16B16A16_SFLOAT); display mapping happens afterward.
 //
 // The build emits an ordinary TraceRay fallback and an optional EXT SER variant from this source.
@@ -33,9 +41,30 @@ import sky;
 import volume;
 import bindings;
 
+// Perf switch: true by default, false when built with -DCAUSTICA_NO_VOLUME_PATH. That build compiles the
+// volumetric scatter out of this raygen entirely; it is traced instead of this one on frames where every
+// volumetric switch is off, because code that never executes still costs registers — 5 ms of the frame.
+#ifndef CAUSTICA_NO_VOLUME_PATH
+#define CAUSTICA_VOLUME_PATH true
+#else
+#define CAUSTICA_VOLUME_PATH false
+#endif
+
+
 // Atmospheric transmittance LUT (RtSkyLut), also bound to world.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
-public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
+// `firstSample` routes the first segment's seed-free radiance: the volume probes, the first vertex's
+// interface emission and a terminating first-ray miss carry no per-sample state, so they are evaluated
+// once — on the first sample — into `prefixL` and skipped by the later samples; main adds `prefixL`
+// once at full weight after the /spp average. A first-ray miss also sets `prefixDone`, which stops the
+// resampling: every sample's first ray is the same ray, so the later samples would only re-derive the
+// identical terminating radiance. Deeper segments diverge per sample and keep the ordinary in-line
+// accumulation. With spp == 1 the single sample is the first one, so the same terms flow through the
+// prefix and the sum is unchanged (up to floating-point association order).
+public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool firstSample,
+                        out float3 prefixL, out bool prefixDone) {
+    prefixL = float3(0.0, 0.0, 0.0);
+    prefixDone = false;
     float3 L = float3(0.0, 0.0, 0.0);
     float3 ro = seg.ro;
     float3 rd = seg.rd;
@@ -64,6 +93,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     MediumStack medium = seg.medium;
     bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
     bool fogOn = (worldPush.flags & WORLD_FLAG_FOG) != 0u; // analytic height fog on this segment
+    bool shaftOn = (worldPush.flags & WORLD_FLAG_SHAFTS) != 0u; // clear-air sun shafts
     // Set when the path crosses a dielectric interface: the air segment right behind the glass also
     // carries fog, which is what keeps aerial perspective alive when looking through panes. Consumed
     // by the next fog evaluation, and kept alive across a crossing's own (non-air) segment.
@@ -101,6 +131,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // and false at every diffuse one, for the same physical reason it gates the sun disc.
         uint cullMask = bounce == 0 ? CULL_PRIMARY
                 : (showCelestial ? CULL_SECONDARY | CULL_SPECULAR : CULL_SECONDARY);
+        bool firstSegment = bounce == seg.bounce;
 #ifdef CAUSTICA_ENABLE_EXT_SER
         // SER lifetime phase: keep paths that are not roulette-eligible, paths that may terminate via
         // roulette, and paths guaranteed to end at the bounce cap in separate coherence groups.
@@ -113,20 +144,33 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 #endif
 
         if (payload.hitT < 0.0) {
+            // Only the FIRST segment's terminating miss is shared: every sample's first ray is the
+            // same ray, so sample 0 evaluates the whole seed-free miss into prefixL and main stops
+            // resampling the segment (prefixDone). Deeper misses are per-sample rays — each sample
+            // that reaches one arrives by its own continuation — and keep the ordinary accumulation.
+            bool sharedMiss = firstSegment && firstSample;
             // A ray still in water should leave through a water interface. A miss instead means the
             // streamed/open volume has no known exit; do not reinterpret that unknown region as air
-            // and reveal sky.
+            // and reveal sky. The column the view crossed is still water, though, so the shaft layer
+            // integrates it before the path stops — otherwise the water past the streamed edge reads as
+            // a black hole in the middle of the body.
             if (medium.current.water) {
+                if (CAUSTICA_VOLUME_PATH && shaftOn && firstSegment && firstSample) {
+                    float shaftShare;
+                    prefixL += throughput * shaftInScatter(ro, rd, 10000.0, pix, worldPush.waterShaft.x,
+                            medium.current.phaseG, true, shaftShare);
+                }
+                if (sharedMiss) prefixDone = true;
                 break;
             }
 
             // Fog stands in front of the sky: integrate its in-scatter over the whole ray first, then
             // attenuate the sky with the same transmittance, so ground fog occludes the horizon. The
             // first segment only — deeper escapes are the marched tier's work.
-            if ((bounce == seg.bounce || fogAfterInterface) && fogOn) {
+            if (CAUSTICA_VOLUME_PATH && (firstSegment || fogAfterInterface) && fogOn) {
                 float fogT;
                 float3 fogL = fogSegmentInScatter(ro, rd, 10000.0, pix, false, fogT);
-                L += throughput * fogL;
+                if (sharedMiss) prefixL += throughput * fogL; else L += throughput * fogL;
                 throughput *= fogT;
                 fogAfterInterface = false;
             }
@@ -135,10 +179,13 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             // surface words as a full float3, so this is absolute scene units with nothing to undo. The
             // packed show-celestial flag decides whether this path segment may see the bright disc.
             if (skyIsDiffuse) {
-                L += skyWeight * skyIrradiance(skyIrradianceLut, skyNormal);
+                float3 skyL = skyWeight * skyIrradiance(skyIrradianceLut, skyNormal);
+                if (sharedMiss) prefixL += skyL; else L += skyL;
             } else {
-                L += throughput * payloadSky(); // escaped to sky
+                float3 skyL = throughput * payloadSky(); // escaped to sky
+                if (sharedMiss) prefixL += skyL; else L += skyL;
             }
+            if (sharedMiss) prefixDone = true;
             break;
         }
         // Only a diffuse lobe may claim the analytic sky term. Every other continuation keeps the traced
@@ -159,19 +206,42 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // underwater stretch as a prefix). Deeper segments — TIR chains between surface and deep
         // water — ride the ambient term alone: their throughput is attenuation-eaten, and a probe
         // per bounce cost a third of the frame for second-order radiance.
-        if (medium.current.water && worldPush.water1.x > 0.0
-                && bounce == seg.bounce) {
-            L += throughput * waterSegmentInScatter(ro, rd, payload.hitT, pix, medium.current);
+        if (CAUSTICA_VOLUME_PATH && medium.current.water && firstSegment && shaftOn && firstSample) {
+            // The column's volumetric term is the shaft layer on the water's own medium. It needs no
+            // scattering fraction from the water body: the layer is the body's only volumetric term now.
+            // Seed-free (pix + frameIndex jitter over a segment every sample shares), so the first
+            // sample evaluates it into the prefix and the later samples skip it.
+            float shaftShare;
+            prefixL += throughput * shaftInScatter(ro, rd, payload.hitT, pix, worldPush.waterShaft.x,
+                    medium.current.phaseG, true, shaftShare);
         }
 
         // The air volume in front of this hit: closed-form in-scatter over the segment, one shadow ray.
         // Only while the stack medium is air — inside water or a dielectric the stack's own medium owns
         // the volume, so mixing the air field in would double-count it. First segment only, matching
         // the analytic tier's one-shadow-ray-per-pixel budget.
-        if ((bounce == seg.bounce || fogAfterInterface) && fogOn
-                && !any(medium.current.extinction > 0.0)) {
+        //
+        // Sun shafts ride the same two gates and the same stretch, from their own medium: they are the
+        // airlight of clear air, so they stay on when the fog is off. `segmentIsAir` is latched before
+        // either branch consumes the interface flag, so one crossing cannot licence both.
+        bool segmentIsAir = !any(medium.current.extinction > 0.0);
+        bool firstAirSegment = firstSegment || fogAfterInterface;
+        // The first segment's probes are shared — every sample's first ray is the same ray, so the
+        // first sample evaluates them into the prefix and the later samples skip them. The segment
+        // right behind a dielectric crossing is NOT shared: which sample sits behind the glass is the
+        // outcome of that sample's own Fresnel choice, so every sample evaluates its own.
+        bool airProbeSite = (firstSegment && firstSample) || fogAfterInterface;
+        if (CAUSTICA_VOLUME_PATH && airProbeSite && fogOn && segmentIsAir) {
             float fogT;
-            L += throughput * fogSegmentInScatter(ro, rd, payload.hitT, pix, true, fogT);
+            float3 fogL = throughput * fogSegmentInScatter(ro, rd, payload.hitT, pix, true, fogT);
+            if (fogAfterInterface) L += fogL; else prefixL += fogL;
+            fogAfterInterface = false;
+        }
+        if (CAUSTICA_VOLUME_PATH && airProbeSite && shaftOn && segmentIsAir) {
+            float shaftShare;
+            float3 shaftL = throughput * shaftInScatter(ro, rd, payload.hitT, pix,
+                    worldPush.shaft.x, worldPush.shaft.y, false, shaftShare);
+            if (fogAfterInterface) L += shaftL; else prefixL += shaftL;
             fogAfterInterface = false;
         }
 
@@ -206,7 +276,17 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             float emission = payloadEmission();
             bool gateEmitter = risOn && payloadEmitterInList();
             if (emission > 0.0 && (!gateEmitter || showCelestial)) {
-                L += throughput * float3(payload.f0) * emission;
+                // Seed-free at the first vertex (payload + segment state only), so the first sample
+                // routes it into the prefix and the later samples skip it. Deeper dielectric vertices
+                // diverge per sample — showCelestial changes after the first lobe choice — and keep
+                // the ordinary accumulation.
+                if (firstSegment) {
+                    if (firstSample) {
+                        prefixL += throughput * float3(payload.f0) * emission;
+                    }
+                } else {
+                    L += throughput * float3(payload.f0) * emission;
+                }
             }
 
             // At the path cap the continuation cannot be traced, so the Fresnel choice, medium update and
@@ -244,7 +324,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 
             bool chooseReflection = rndf(seed) < F;
             if (chooseReflection) {
-                rd = reflect(rd, n);
+                rd = isWater && waterWaves
+                        ? waterReflectedDir(rd, n, geometricNormal) : reflect(rd, n);
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, SURF_BIAS);
             } else {
                 if (dot(transmittedDir, transmittedDir) <= 0.0) break; // TIR with F < 1 cannot happen
@@ -531,6 +612,10 @@ void main() {
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
     ConstPtr<PackedPathSegment> queue = ConstPtr<PackedPathSegment>(pc.pathQueueAddr);
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
+    // Seed-free first-segment radiance summed over the segment chain, added at full weight after the
+    // /spp division below. Inside the average it would be darkened by spp — the per-sample estimates
+    // each used to carry one prefix copy, and (spp * prefix) / spp = prefix is what the division undid.
+    float3 sharedRadiance = float3(0.0, 0.0, 0.0);
     uint recordIndex = pixelIndex;
     // The primary pass pre-wrote the pre-interface fog radiance for dielectric-continuation pixels
     // (see PATH_PREFIX_IN_IMAGE); those pixels accumulate on top of the stored value instead of
@@ -543,7 +628,17 @@ void main() {
         }
         PathSegment segment = unpackPathSegment(packed);
         for (uint s = 0u; s < spp; ++s) {
-            frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp);
+            float3 prefixL;
+            bool prefixDone;
+            frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp, s == 0u,
+                                       prefixL, prefixDone);
+            sharedRadiance += prefixL;
+            if (prefixDone) {
+                // The segment's first ray missed: the remaining samples would re-trace the same ray
+                // only to re-derive the identical terminating radiance, which the prefix already
+                // carries once.
+                break;
+            }
         }
         if (packed.nextRecord == PATH_NO_NEXT) {
             break;
@@ -558,6 +653,7 @@ void main() {
     // sun mid-transition, a firefly off a tiny emitter — and ACES 2.0 renders anything a few EV over
     // white as white, so it costs nothing visible.
     float3 stored = frameRadiance * (worldPush.preExposure / float(spp));
+    stored += sharedRadiance * worldPush.preExposure;
     if (prefixInImage) {
         stored += outImage[pix].rgb;
     }

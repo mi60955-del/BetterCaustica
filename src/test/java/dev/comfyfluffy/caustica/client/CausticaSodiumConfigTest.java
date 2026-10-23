@@ -215,7 +215,7 @@ class CausticaSodiumConfigTest {
 
     private static List<Page> buildPages() {
         ConfigBuilderImpl config = new ConfigBuilderImpl(
-                modId -> new ConfigManager.ModMetadata(modId, "test"), "bettercaustica");
+                modId -> new ConfigManager.ModMetadata(modId, "test"), "caustica");
         new CausticaSodiumConfig().registerConfigLate(config);
         List<Page> pages = new ArrayList<>();
         config.build().forEach(mod -> pages.addAll(mod.pages()));

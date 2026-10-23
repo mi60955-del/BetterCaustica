@@ -271,134 +271,12 @@ final class VolumeFogTest {
         return mean * opacity; // the port tracks the achromatic mean; the chroma split cancels here
     }
 
-    /**
-     * Phase 3's degradation and energy lines: with waterOpacity 0 the water medium carries no
-     * extinction and therefore no scattering — the pre-water-fog behaviour, bit for bit — and for
-     * any turbidity in [0, 1] the scattering never exceeds the extinction (sigmaS <= sigmaT per
-     * construction), while the extinction itself stays independent of the turbidity so the
-     * transmittance a turbidity change produces is exactly zero.
-     */
-    @Test
-    void waterScatteringInvariants() {
-        float[] tints = {0.0f, 0.2f, 0.5f, 0.8f, 1.0f};
-        float[] opacities = {0.0f, 0.5f, 1.0f, 2.0f, 4.0f};
-        float[] turbidities = {0.0f, 0.35f, 0.7f, 1.0f};
-        for (float tint : tints) {
-            for (float opacity : opacities) {
-                float extinction = waterExtinction(tint, opacity);
-                if (opacity == 0.0f) {
-                    assertEquals(0.0f, extinction, 0.0f,
-                            "opacity 0 must leave no residual extinction at tint=" + tint);
-                }
-                for (float turbidity : turbidities) {
-                    float scattering = turbidity > 0.0f ? turbidity * extinction : 0.0f;
-                    assertTrue(scattering <= extinction + 1.0e-9f,
-                            "sigmaS must not exceed sigmaT at tint=" + tint + " opacity=" + opacity
-                                    + " turbidity=" + turbidity);
-                    // The grey-mean single-scatter weight the underwater in-scatter uses.
-                    if (extinction > 0.0f) {
-                        float weight = scattering / extinction;
-                        assertTrue(weight >= 0.0f && weight <= 1.0f + 1.0e-6f,
-                                "single-scatter fraction must stay in [0, 1] at turbidity="
-                                        + turbidity);
-                    }
-                }
-            }
-        }
-    }
-
-    /**
-     * Java port of waterSegmentInScatter's depth-attenuated ambient integral: the ambient light field
-     * inside water decays as exp(-sigmaT·depth) below the surface plane, so the in-scatter integral
-     * becomes sigmaS·A·exp(-sigmaT·d0)·(1 - exp(-sigmaT·t·(1-rd.y))) / (sigmaT·(1-rd.y)) with the
-     * straight-up limit t.
-     */
-    private static double waterAmbientIntegral(float sigmaT, float t, float dirY, float d0) {
-        float upCos = 1.0f - dirY;
-        if (upCos < 1.0e-4f) {
-            return t * Math.exp(-sigmaT * d0);
-        }
-        return Math.exp(-sigmaT * d0) * (1.0 - Math.exp(-sigmaT * t * upCos)) / (sigmaT * upCos);
-    }
-
-    /**
-     * The "white surface from below" regression: the underwater ambient in-scatter must collapse
-     * with depth (deep water goes dark, not milk), match a brute-force numeric integration of the
-     * decaying field, and reduce to the un-attenuated closed form right at the surface (d0 = 0).
-     * Deliberately NOT monotone in depth overall: near the surface the path to the plane is short,
-     * so the integral first grows with the available path length, then the decay wins.
-     */
-    @Test
-    void waterAmbientDecaysWithDepth() {
-        float sigmaT = waterExtinction(0.5f, 4.0f); // default murky water, ~0.25/block
-        float sigmaS = 0.35f * sigmaT;              // default turbidity
-        float ambient = 1500.0f;                    // arbitrary sky radiance — ratios are what matter
-        for (float dirY : new float[]{0.95f, 0.5f, -0.5f}) {
-            for (float d0 : new float[]{1f, 5f, 20f, 60f}) {
-                // Upward rays end at the surface plane (t = d0/dirY, depth stays >= 0 along the
-                // segment); downward rays run the full 120 blocks away from it.
-                float t = dirY > 0.0f ? d0 / dirY : 120.0f;
-                double closed = sigmaS * ambient * waterAmbientIntegral(sigmaT, t, dirY, d0);
-                // Brute force: 200k midpoint samples of T(s)·sigmaS·A·exp(-sigmaT·depth(s)).
-                double h = t / 200_000.0;
-                double numeric = 0.0;
-                for (int i = 0; i < 200_000; i++) {
-                    double s = (i + 0.5) * h;
-                    double depth = Math.max(d0 - dirY * s, 0.0);
-                    numeric += Math.exp(-sigmaT * s) * Math.exp(-sigmaT * depth) * h;
-                }
-                numeric *= sigmaS * ambient;
-                assertClose("ambient integral dirY=" + dirY + " d0=" + d0, numeric, closed, 1.0e-3);
-            }
-        }
-        // At the surface plane with a horizontal view the integral reduces to the un-attenuated
-        // closed form weight/sigmaT, i.e. the pre-fix term.
-        double atSurface = sigmaS * ambient * waterAmbientIntegral(sigmaT, 50.0f, 0.0f, 0.0f);
-        double legacy = (sigmaS / sigmaT) * (1.0 - Math.exp(-sigmaT * 50.0)) * ambient;
-        assertClose("surface-consistency with the un-attenuated form", legacy, atSurface, 1.0e-6);
-        // Deep water collapses to darkness: 60 blocks down, the glow must be gone against the
-        // saturated pre-fix value a long horizontal view used to hold everywhere.
-        double deep = sigmaS * ambient * waterAmbientIntegral(sigmaT, 120.0f, 0.0f, 60.0f);
-        assertTrue(deep < legacy * 1.0e-4,
-                "60 blocks down the ambient glow must be gone, got " + deep + " vs " + legacy);
-    }
-
-    /**
-     * The underwater in-scatter's closed form over one segment: scatter weight = 1 - exp(-sigmaT·t)
-     * sits in [0, 1] for every geometry, and the whole term is bounded by the turbidity — the
-     * firefly-safety claim in waterSegmentInScatter's header, pinned numerically over the parameter
-     * box the push block can produce (turbidity <= 1, opacity <= 4).
-     */
-    @Test
-    void waterInScatterStaysBounded() {
-        float sigmaT = waterExtinction(0.3f, 4.0f); // the murkiest legal water
-        float turbidity = 1.0f;
-        for (float t = 1.0f; t <= 500.0f; t += 3.0f) {
-            float scatterWeight = 1.0f - (float) Math.exp(-sigmaT * t);
-            assertTrue(scatterWeight >= 0.0f && scatterWeight <= 1.0f + 1.0e-6f,
-                    "scatter weight must stay in [0, 1] at t=" + t);
-            // L = turbidity * scatterWeight * (phase·illuminance·vis·legT + ambient): every factor
-            // <= 1 except the clamped caustic (water.slang's CAUSTIC_MAX, source-paired below), so
-            // the term is bounded by turbidity * illuminance — no firefly channel exists.
-            float bound = turbidity * scatterWeight;
-            assertTrue(bound <= 1.0f + 1.0e-6f, "the grey in-scatter bound must hold at t=" + t);
-        }
-    }
-
-    // ---- Source pairing ------------------------------------------------------------------------------
-
     /** Bit position of a `WORLD_FLAG_*` constant in the shader source. */
     private static int shaderFlagBit(String source, String name) {
         Matcher m = Pattern.compile("public static const uint " + name + " = 1u << (\\d+)u;")
                 .matcher(source);
         assertTrue(m.find(), "shader must define " + name);
         return Integer.parseInt(m.group(1));
-    }
-
-    /** Java port of volume.slang's fogTransmittance over the same closed form. */
-    private static float fogTransmittance(float sigma0, float baseY, float heightH, float y0,
-                                          float dirY, float t) {
-        return (float) Math.exp(-fogOpticalDepth(sigma0, baseY, heightH, y0, dirY, t));
     }
 
     /** Bit position of the same constant on the Java side of RtComposite. */
@@ -415,7 +293,7 @@ final class VolumeFogTest {
         String java = Files.readString(COMPOSITE);
         for (String flag : new String[]{"WORLD_FLAG_FOG", "WORLD_FLAG_CLOUD", "WORLD_FLAG_SPRAY",
                 "WORLD_FLAG_VOLUME_SHADOW", "WORLD_FLAG_VOLUME_MARCH", "WORLD_FLAG_VOLUME_DEBUG",
-                "WORLD_FLAG_CLOUD_VOLUMETRIC"}) {
+                "WORLD_FLAG_CLOUD_VOLUMETRIC", "WORLD_FLAG_SHAFTS"}) {
             assertEquals(shaderFlagBit(shader, flag), javaFlagBit(java, flag),
                     flag + " must sit on the same bit in world_common.slang and RtComposite");
         }
@@ -434,14 +312,42 @@ final class VolumeFogTest {
         String indirect = Files.readString(Path.of("shaders/pipelines/world/indirect.rgen.slang"));
         // Both in-scatter insertion points (hit and miss) gate on the fog flag and on the segment being
         // either the trace's first or the air segment directly behind a dielectric crossing (what keeps
-        // aerial perspective alive through glass). The fog flag caps everything else.
-        assertTrue(indirect.contains("(bounce == seg.bounce || fogAfterInterface) && fogOn"),
-                "the fog in-scatter must run on the first segment and behind dielectric crossings only");
-        assertTrue(indirect.contains("WORLD_FLAG_FOG) != 0u"),
-                "the fog in-scatter must be gated on the fog flag");
+        // aerial perspective alive through glass). The fog flag caps everything else. The latched
+        // first-air-segment flag is what stops one crossing from licensing both media twice. The first
+        // segment's probes are seed-free and shared across spp (evaluated once, into the prefix), but
+        // the behind-the-glass probes belong to each sample's own Fresnel outcome and must not be
+        // skipped — the airProbeSite split below is what keeps the two apart.
+        assertTrue(indirect.contains("bool firstAirSegment = firstSegment || fogAfterInterface;"),
+                "the air terms must run on the first segment and behind dielectric crossings only");
+        assertTrue(indirect.contains(
+                        "bool airProbeSite = (firstSegment && firstSample) || fogAfterInterface;"),
+                "shared first-segment probes must be evaluated once while behind-the-glass probes "
+                        + "stay per-sample");
+        assertTrue(indirect.contains("if (airProbeSite && fogOn && segmentIsAir)"),
+                "the fog in-scatter must be gated on the fog flag and on an air segment");
+        assertTrue(indirect.contains("if (airProbeSite && shaftOn && segmentIsAir)"),
+                "the shaft in-scatter must ride the same two gates from its own flag");
+        assertTrue(!indirect.contains("(bounce == seg.bounce || fogAfterInterface) && (!fogOn || shaftOn)"),
+                "the shafts must not widen the fog's own gate");
+        assertTrue(indirect.contains("WORLD_FLAG_SHAFTS) != 0u"),
+                "the shaft in-scatter must be gated on its own flag");
+        // The air shafts are geometry-only on purpose: the sky LUT already carries the atmosphere's own
+        // in-scatter, so a sky miss must not add airlight on top of it. The water column is the
+        // exception — nothing else carries it — and it integrates only inside the water-medium branch,
+        // before the path stops. The miss branch ends where the diffuse-sky comment picks up.
+        String missBranch = indirect.substring(indirect.indexOf("if (payload.hitT < 0.0)"),
+                indirect.indexOf("// Only a diffuse lobe may claim the analytic sky term"));
+        assertTrue(!missBranch.contains("worldPush.shaft.x"),
+                "the air shaft must not run on a sky miss");
+        int waterMiss = missBranch.indexOf("if (medium.current.water) {");
+        assertTrue(waterMiss >= 0 && missBranch.substring(waterMiss).contains("worldPush.waterShaft.x"),
+                "a water miss must still integrate its own column before the path stops");
         String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
-        assertTrue(primary.contains("fogOn && !any(medium.current.extinction > 0.0)"),
+        assertTrue(primary.contains("if (!any(medium.current.extinction > 0.0)) {\n"
+                        + "                if (fogOn) {"),
                 "the pre-interface fog attenuation must apply only while the stack medium is air");
+        assertTrue(primary.contains("prefixRadiance += shaftInScatter(ro, rd, payload.hitT, pix,"),
+                "the pre-interface shafts must ride the same prefix write as the fog");
         // The pre-interface fog GLOW is radiance common to both Fresnel branches: the primary pass must
         // write it into outImage and flag its records, and the indirect pass must accumulate on top of
         // the stored value rather than replacing it.
@@ -483,28 +389,30 @@ final class VolumeFogTest {
     }
 
     /**
-     * The shadow cull's core promise: fully-shadowed fog is never denser than the outdoor fog. Both
-     * tiers thin the medium by a factor max(vis, floor) with vis the measured sun visibility in
-     * [0, 1], so the promise holds for every floor in [0, 1). The floor is now the live slider
-     * volume.fog-shadow-floor riding fog1.w (no longer a compile-time constant), so this pins the
-     * whole chain across the slider's range: the shader reads fog1.w at every culling site in both
-     * tiers, Java pushes the config value into that lane, and the resulting density and transmittance
-     * never cross the unthinned outdoor values over a full visibility sweep per floor setting.
+     * The shadow floor no longer thins the medium. A visibility-scaled sigma made the fog's opacity a
+     * per-pixel lottery a temporal reconstruct cannot accumulate, and it deleted the medium wherever the
+     * sun is occluded (the air over the sea reading as a dark band while the sky-facing segment, which
+     * traces no probes, kept its full density). The floor now rides the SUN TERMS of both tiers as
+     * max(vis, floor): it holds a minimum share of direct light and can never amplify.
      */
     @Test
-    void shadowCulledFogNeverExceedsOutdoorFog() throws IOException {
+    void shadowFloorRidesTheSunTerms() throws IOException {
         String volume = Files.readString(VOLUME);
         String composite = Files.readString(COMPOSITE);
-        // The constant is gone; the floor is the fog1.w lane, read through fogShadowFloor() at every
-        // culling site in both tiers.
         assertTrue(volume.contains("public float fogShadowFloor()"),
                 "the floor must be a function reading the pushed lane");
         assertTrue(volume.contains("clamp(worldPush.fog1.w, 0.0, 0.95)"),
                 "fogShadowFloor must clamp the fog1.w lane into the safe range");
-        assertTrue(volume.contains("sigma = sigma0 * max(visBar, fogShadowFloor())"),
-                "the analytic tier must thin by max(visBar, fogShadowFloor())");
-        assertTrue(volume.contains("float sigmaEff = sigma * max(vis, fogShadowFloor())"),
-                "the march tier must thin by max(vis, fogShadowFloor())");
+        // The medium is the unthinned profile in both tiers.
+        assertTrue(volume.contains("float sigma = sigma0;"),
+                "the analytic tier must integrate the unthinned profile");
+        assertTrue(volume.contains("float sigmaEff = sigma;"),
+                "the march tier must integrate the unthinned profile");
+        // The floor rides the sun legs, as a max() with the measured visibility.
+        assertTrue(volume.contains("float sunVis = max(vis, fogShadowFloor());"),
+                "the marched tier's sun leg must carry the floor");
+        assertTrue(volume.contains("float sunVis = max(vis[k], fogShadowFloor());"),
+                "the analytic tier's stratum sun legs must carry the floor");
         // The floor must ride the fog1.w lane specifically — the v13 regression pushed it into the
         // look-alike volumeParams.w lane, where nothing read it and the slider did nothing.
         assertTrue(composite.contains("fogMarchOn ? CausticaConfig.Rt.Volume.FOG_NOISE.value() : 0f,\n"
@@ -512,80 +420,15 @@ final class VolumeFogTest {
                 "Java must push the fog-shadow-floor config into fog1.w (after the noise lane)");
         assertTrue(!composite.contains("0f, CausticaConfig.Rt.Volume.FOG_SHADOW_FLOOR.value()"),
                 "the floor must NOT ride volumeParams.w, where no shader reads it");
-        // The sun-leg transmittance of the marched tier rides the same floored sigma.
-        assertTrue(volume.contains("sigma0 * max(vis, fogShadowFloor())"),
-                "the march tier's toward-sun transmittance must use the floored sigma");
 
-        // Sweep a representative set of slider positions (0 = hard cull, default 0.10, dense 0.90):
-        // culled density never exceeds the outdoor density, and culled transmittance never drops
-        // below the outdoor transmittance (thinner fog is more transparent), along every ray
-        // geometry the closed form handles.
-        float sigma0 = 0.02f;
-        float baseY = 62f;
-        float heightH = 24f;
+        // max() semantics: the floor holds a minimum share of direct light and can never amplify.
         for (float floor : new float[]{0.0f, 0.10f, 0.35f, 0.90f}) {
             for (float vis = 0.0f; vis <= 1.0f + 1.0e-6f; vis += 0.01f) {
                 float factor = Math.max(vis, floor);
-                assertTrue(factor <= 1.0f + 1.0e-6f, "cull factor must not exceed 1 at vis=" + vis);
-                assertTrue(factor >= floor - 1.0e-6f, "cull factor must hold the floor at vis=" + vis);
-                float sigmaCulled = sigma0 * factor;
-                assertTrue(sigmaCulled <= sigma0 + 1.0e-9f,
-                        "culled density must not exceed outdoor density at floor=" + floor
-                                + " vis=" + vis);
-                for (float y0 : new float[]{baseY + 30f, baseY, baseY - 10f}) {
-                    for (float dy : new float[]{0.6f, 0.05f, -0.5f}) {
-                        float tOutdoor = fogTransmittance(sigma0, baseY, heightH, y0, dy, 120f);
-                        float tCulled = fogTransmittance(sigmaCulled, baseY, heightH, y0, dy, 120f);
-                        assertTrue(tCulled >= tOutdoor - 1.0e-7f,
-                                "culled transmittance must not fall below outdoor transmittance at floor="
-                                        + floor + " vis=" + vis + " y0=" + y0 + " dy=" + dy);
-                    }
-                }
+                assertTrue(factor <= 1.0f + 1.0e-6f, "floor must not exceed 1 at vis=" + vis);
+                assertTrue(factor >= floor - 1.0e-6f, "floor must hold at vis=" + vis);
             }
         }
-    }
-
-    /**
-     * Phase 3's wiring: the underwater in-scatter fires only inside a water medium with a non-zero
-     * turbidity (zero turbidity must keep the pre-water-fog frame untouched), both call sites gate on
-     * the same predicate, the firefly bound is the caustic clamp, and a resumed packed record
-     * re-derives the scattering instead of expecting a lane the 48-byte record never carried.
-     */
-    @Test
-    void waterScatteringGatingAndFireflyBound() throws IOException {
-        String volume = Files.readString(VOLUME);
-        assertTrue(volume.contains("if (sigmaT <= 0.0 || sigmaS <= 0.0 || t <= RAY_TMIN)"),
-                "waterSegmentInScatter must early-out on a zero medium (the zero-when-off invariant)");
-        String indirect = Files.readString(Path.of("shaders/pipelines/world/indirect.rgen.slang"));
-        String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
-        for (String source : new String[]{indirect, primary}) {
-            assertTrue(source.contains("medium.current.water && worldPush.water1.x > 0.0"),
-                    "the underwater in-scatter must gate on the water medium AND a non-zero turbidity");
-        }
-        // Probe budget: the indirect pass fires the sun probe on the walk's FIRST segment only (the
-        // primary prefix owns the camera's own stretch) — a probe per TIR bounce cost a third of the
-        // frame for second-order radiance.
-        assertTrue(indirect.contains("worldPush.water1.x > 0.0\n                && bounce == seg.bounce"),
-                "the water sun probe must be gated to the first indirect segment");
-        // The fog and water in-scatters must never co-fire on one segment: fog stands down while any
-        // extinction is present, which is exactly the water/glass case.
-        assertTrue(indirect.contains("!any(medium.current.extinction > 0.0)"),
-                "the fog in-scatter must stay behind the no-extinction gate next to the water term");
-        // Firefly bound: the caustic is clamped at the source, and the in-scatter multiplies the
-        // clamped value (never a raw focus).
-        String water = Files.readString(Path.of("shaders/pipelines/world/water.slang"));
-        assertTrue(water.contains("lerp(1.0, min(focus, CAUSTIC_MAX), fade)"),
-                "waterCaustic must clamp the focusing factor at CAUSTIC_MAX");
-        assertTrue(volume.contains("vis *= waterCaustic("),
-                "the underwater sun leg must consume the caustic through the clamped call");
-        // Resumed records re-derive scattering from the packed extinction plus the turbidity global;
-        // the derivation itself must be the turbidity product, not a free lane.
-        String medium = Files.readString(Path.of("shaders/pipelines/world/medium.slang"));
-        assertTrue(medium.contains("turbidity > 0.0 ? turbidity * extinction : float3(0.0, 0.0, 0.0)"),
-                "waterScattering must be the turbidity fraction of the extinction");
-        String segment = Files.readString(Path.of("shaders/pipelines/world/segment.slang"));
-        assertTrue(segment.contains("current.water ? waterScattering(current.extinction)"),
-                "unpackPathSegment must re-derive the water scattering for resumed records");
     }
 
     /**
@@ -727,13 +570,21 @@ final class VolumeFogTest {
                         + "streak lattice has no period) plus the Java-accumulated drift");
         assertTrue(volume.contains("float2 p = rebasedXZ + push.cloud2.xy + push.cloud2.zw;"),
                 "the coverage field must sample through the exact anchor and the drift");
-        // The sheet's light must not survive its body's sunset: the pushed illuminance is a look
-        // constant, so only the elevation gate keeps noon light off a midnight sky.
-        assertTrue(volume.contains("bool sunUp = state.sunIlluminance > 0.0 && state.sunDir.y > 0.0;")
-                        && volume.contains("(moonUp ? state.moonIlluminance : 0.0);"),
-                "the sheet's sun/moon term must gate on the body being above the horizon");
-        assertTrue(volume.contains("clamp(push.cloudColor.w, 0.0, 2.0);"),
-                "the sheet's ambient weight must be clamped so a lane slip cannot relight the sky");
+        // The deck's light must be the derived celestial for body AND colour, with the level kept on the
+        // pushed look constant: a literal physical level at a one-degree sun is a rounding error, which
+        // left the deck black instead of burning. The colour is a FRACTION of the derived chromaticity —
+        // at full strength a one-degree sunset colour is an impossible light at that level, and the ACES
+        // highlight roll-off turned the deck khaki.
+        assertTrue(volume.contains("CelestialLight light = dominantCelestialLight(state, transmittanceLut);")
+                        && volume.contains("float3 lightIll = lightLevel * cloudLightTint(light.illuminance);")
+                        && volume.contains("public static const float CLOUD_LIGHT_TINT = 0.5;")
+                        && volume.contains("return lerp(float3(1.0, 1.0, 1.0), chroma, CLOUD_LIGHT_TINT);"),
+                "the cloud tiers must take the light's colour from the derived body, trimmed, and its "
+                        + "level from the pushed constant");
+        assertTrue(volume.contains("skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI")
+                        && volume.contains("clamp(push.cloudColor.w, 0.0, 2.0);"),
+                "the deck's ambient must be the sky's hemisphere irradiance, with the weight clamped so "
+                        + "a lane slip cannot relight the sky");
         // The slab's self-shadow runs the multi-scatter octave stack (energy-normalised, so tau = 0
         // still gives exactly 1): a single-scatter deck reads blue-grey by day and black at night.
         assertTrue(volume.contains("float selfT = cloudSelfShadow(tauSelf);")
@@ -766,8 +617,10 @@ final class VolumeFogTest {
                         && volume.contains("public static const float CLOUD_REMAP_GAMMA = 0.7;"),
                 "the coverage remap must keep the calibrated constants (they are what makes the slider "
                         + "honest after the cumulus rework changed the field's distribution)");
-        assertTrue(volume.contains("float n = cloudFbm(q, 3) - 0.07 * cloudValueNoise(q * 0.25 + 7.0 + f.evolve * 1.7)"),
-                "the streak field must run three octaves (a fourth was sub-pixel speckle)");
+        assertTrue(volume.contains("float n = cloudFbm(q, 2) - 0.07 * cloudValueNoise(q * 0.25 + 7.0 + f.evolve * 1.7)"),
+                "the streak field must run two octaves: a third's cells are a quarter of the base cell, "
+                        + "below the size a grazing sight line can resolve, so it arrived as lace rather "
+                        + "than shape");
 
         // The sheet-only dissipation: the fade reads cloud1.w, clamps to a sane minimum, and the
         // shadow field deliberately never reads it.
@@ -811,11 +664,14 @@ final class VolumeFogTest {
                 "the analytic fog's unshadowed sun leg must pick up the cloud shadow");
         assertTrue(volume.contains("cloudShadowTransmittance(probe, celestialLight.dir));"),
                 "the analytic fog's per-stratum sun legs must pick up the cloud shadow");
-        assertTrue(volume.contains("* cloudShadowTransmittance(p, sunDir));"),
-                "the marched fog's per-sample sun leg must pick up the cloud shadow");
+        assertTrue(volume.contains("stratumCloud = cloudShadowTransmittance(p, sunDir);")
+                        && volume.contains("* (sunVis * sunFogT * stratumCloud);"),
+                "the marched fog's stratum probe must measure the cloud shadow once per stratum and "
+                        + "its sun leg must consume that measurement");
+        // The underwater sun leg is the shaft layer now, and it carries the cloud shadow per probe —
+        // the same field the terrain NEE reads, so a clouded sun thins the water shafts too.
         assertTrue(volume.contains(
-                        "sunPart = phase * celestialLight.illuminance\n"
-                                + "                    * (vis * legT * cloudShadowTransmittance(p, celestialLight.dir));"),
+                        "sun += vis * (weight * cloudShadowTransmittance(p, celestialLight.dir));"),
                 "the underwater sun leg must pick up the cloud shadow");
 
         // The shadow field's own gate: exactly 1 while clouds are off, so every multiply above
@@ -1050,11 +906,18 @@ final class VolumeFogTest {
         // The local-density self-shadow: no extra field tap, and the multi-scatter stack stays on top.
         assertTrue(volume.contains("float tauSun = tauUp / max(lightDir.y, 0.05);")
                         && volume.contains("float3 sunT = cloudSelfShadow(tauSun);")
-                        && volume.contains("float ambT = cloudSelfShadow(tauUp * 0.25);"),
+                        && volume.contains("float ambT = cloudSelfShadow(tauUp * CLOUD_AMBIENT_OCCLUSION);")
+                        && volume.contains("public static const float CLOUD_AMBIENT_OCCLUSION = 0.20;"),
                 "each sample's light must come from its own density and the path left to the slab top, "
-                        + "with the multi-scatter octave stack on top");
-        assertTrue(volume.contains("float phase = hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));"),
-                "the samples must carry the plan's Beer-Powder phase term");
+                        + "with the multi-scatter octave stack on top and the ambient leg softened");
+        // The phase must carry the Beer-Powder term AND the multi-scatter share that keeps the lobe's own
+        // two orders of magnitude from drawing one deck white on one side of the sky and black on the other.
+        assertTrue(volume.contains("hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));")
+                        && volume.contains("float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE")
+                        && volume.contains("public static const float CLOUD_SCATTER_FLOOR = 0.15;")
+                        && volume.contains("public static const float CLOUD_SCATTER_LOBE = 0.85;"),
+                "the samples must carry the plan's Beer-Powder phase term, compressed onto the isotropic "
+                        + "multi-scatter share");
 
         // Tier routing: the flag is separate from the base cloud bit, only a primary ray walks the slab,
         // and a continuation ray pays the cheap mean extinction instead.
@@ -1081,16 +944,14 @@ final class VolumeFogTest {
         String config = Files.readString(CONFIG);
         String settings = Files.readString(SETTINGS);
 
-        // The tier table, Java ported: (cloud, cloudVolumetric, cloudSteps, fog, fogShadow, fogMarch,
-        // fogMarchSteps, turbidity, spray) for tiers 0..4.
+        // The tier table, Java ported: (cloud, cloudVolumetric, fog, fogShadow, fogMarch, spray) for
+        // tiers 0..4.
         boolean[][] on = new boolean[5][];
         int[] steps = new int[5];
-        float[] turb = new float[5];
         float[] spray = new float[5];
         for (int t = 0; t <= 4; t++) {
             on[t] = new boolean[]{t >= 1, t >= 2, t >= 3, t >= 3, t >= 2, t >= 4, t >= 1, t >= 4};
             steps[t] = t == 2 ? 12 : (t == 4 ? 40 : 24);
-            turb[t] = t >= 1 ? 0.35f : 0.0f;
             spray[t] = t >= 4 ? 0.5f : 0.0f;
         }
         // Off clears everything: clouds, the volumetric tier, the fog layer and its shadow, and the water
@@ -1098,7 +959,6 @@ final class VolumeFogTest {
         for (boolean b : on[0]) {
             assertTrue(!b, "tier 0 must clear every volumetric switch");
         }
-        assertEquals(0.0f, turb[0], 0.0f, "tier 0 must clear the water medium's scattering");
         assertEquals(0.0f, spray[0], 0.0f, "tier 0 must clear the surface spray band");
         // Monotone: a higher tier never takes an effect away, and the last one has everything on.
         for (int t = 1; t <= 4; t++) {
@@ -1123,7 +983,7 @@ final class VolumeFogTest {
                 "the tier table must be data, with the write derived from it");
         for (String member : new String[]{"CLOUD_ENABLED.set(", "CLOUD_VOLUMETRIC.set(", "CLOUD_STEPS.set(",
                 "FOG_ENABLED.set(", "FOG_SHADOW.set(", "FOG_MARCH.set(", "FOG_MARCH_STEPS.set(",
-                "CausticaConfig.Rt.Composite.WATER_TURBIDITY.set(", "CausticaConfig.Rt.Composite.WATER_SPRAY.set("}) {
+                "CausticaConfig.Rt.Composite.WATER_SPRAY.set("}) {
             assertTrue(config.contains(member), "applyQuality must write " + member);
         }
         // The choice list rejects a hand-edited config rather than letting an out-of-range tier through.
@@ -1222,5 +1082,190 @@ final class VolumeFogTest {
                 "the phase must be accumulated on the wave clock and pushed unconditionally");
         assertTrue(!composite.contains("cloudEvolve %") && !composite.contains("cloudEvolve -= "),
                 "the phase must never wrap: the lattices it offsets are not periodic");
+    }
+
+    // ---- Sun shafts (air and water) -------------------------------------------------------------------
+
+    /** Java port of volume.slang's fogTransmittance over the same closed form. */
+    private static float fogTransmittance(float sigma0, float baseY, float heightH, float y0,
+                                          float dirY, float t) {
+        return (float) Math.exp(-fogOpticalDepth(sigma0, baseY, heightH, y0, dirY, t));
+    }
+
+    /** Java port of shaftDepthAtWeight: the depth where the cumulative weight reaches k/strata. */
+    private static double shaftDepthAtWeight(double sigma, double reach, int k, int strata) {
+        if (k <= 0) {
+            return 0.0;
+        }
+        if (k >= strata) {
+            return reach;
+        }
+        double total = 1.0 - Math.exp(-sigma * reach);
+        double weight = (double) k * total / strata;
+        return -Math.log(Math.max(1.0 - weight, 1.0e-6)) / sigma;
+    }
+
+    /**
+     * The strata are one integral split into equal weights, so their boundaries are the inverse of the
+     * medium's transmittance. Two consequences the estimator leans on: the depths stay monotone and
+     * pinned to [0, reach] whatever the density, and every stratum carries exactly 1/strata of the
+     * total. The dense case is why the spacing is optical rather than geometric: at water's extinction
+     * even spacing puts seven probes where the light is already gone.
+     */
+    @Test
+    void shaftStrataSplitTheStretchIntoEqualWeights() {
+        for (double sigma : new double[]{0.0005, 0.01, 0.05, 0.3, 1.0}) {
+            for (double reach : new double[]{16.0, 64.0, 192.0, 512.0}) {
+                double total = 1.0 - Math.exp(-sigma * reach);
+                assertEquals(0.0, shaftDepthAtWeight(sigma, reach, 0, 8), 1.0e-9);
+                assertEquals(reach, shaftDepthAtWeight(sigma, reach, 8, 8), 1.0e-9);
+                double previous = 0.0;
+                for (int k = 0; k < 8; k++) {
+                    double a = shaftDepthAtWeight(sigma, reach, k, 8);
+                    double b = shaftDepthAtWeight(sigma, reach, k + 1, 8);
+                    assertTrue(b > a, "stratum " + k + " must have extent, got [" + a + ", " + b + "]");
+                    assertEquals(total / 8.0, Math.exp(-sigma * a) - Math.exp(-sigma * b), 1.0e-6,
+                            "sigma=" + sigma + " reach=" + reach + " stratum=" + k);
+                    previous = b;
+                }
+                assertEquals(reach, previous, 1.0e-9);
+            }
+        }
+        // A murky column's first stratum sits inside its own e-folding, not at an eighth of the reach.
+        assertTrue(shaftDepthAtWeight(0.3, 64.0, 1, 8) < 1.0,
+                "a dense medium's first stratum must land within its e-folding");
+    }
+
+    /**
+     * A lit beam is bounded by the medium's own scatter weight: with every probe seeing the sun the
+     * term is phase * illuminance * strength * (1 - exp(-sigma*reach)), which rises monotonically with
+     * the reach and saturates instead of growing without bound. The shipped defaults must land in the
+     * visible-but-unsaturated band, or the reach control would read as a wall.
+     */
+    @Test
+    void shaftTermIsBoundedMonotoneAndSaturating() {
+        // The shipped defaults (volume.shaft-density / volume.shaft-distance).
+        double sigma = 0.010;
+        double previous = -1.0;
+        for (double reach = 1.0; reach <= 2048.0; reach *= 2.0) {
+            double weight = 1.0 - Math.exp(-sigma * reach);
+            assertTrue(weight > previous, "the scatter weight must rise with the reach at " + reach);
+            assertTrue(weight < 1.0 + 1.0e-6, "the scatter weight must stay below 1 at " + reach);
+            previous = weight;
+        }
+        // Near foliage — a canopy a few blocks overhead — has to carry enough of the medium to read at
+        // all; that was the whole defect of the first set of defaults (0.0025 put a 30-block beam at
+        // 7%, which vanished against shaded grass).
+        double nearBeam = 1.0 - Math.exp(-sigma * 30.0);
+        assertTrue(nearBeam > 0.20, "a 30-block beam must carry real weight, got " + nearBeam);
+        // And the cap must not sit in the saturated tail, or the reach slider would do nothing visible.
+        double shipped = 1.0 - Math.exp(-sigma * 192.0);
+        assertTrue(shipped > 0.70 && shipped < 0.92,
+                "the default density/reach must stay short of saturation, got " + shipped);
+    }
+
+    /**
+     * The water column's only volumetric term is the shaft layer, on a medium of its own. The old
+     * turbidity-driven pair — a sky-lit ambient and a single-probe sun leg — is gone, and with it the
+     * milky water and the scattering fraction that had to be on for the water to have any body.
+     */
+    @Test
+    void underwaterColumnIsTheShaftLayer() throws IOException {
+        String volume = Files.readString(VOLUME);
+        assertTrue(!volume.contains("waterSegmentInScatter"),
+                "the old water volume function must be gone, not left as dead code");
+        assertTrue(!volume.contains("WATER_AMBIENT_SURFACE"),
+                "the water ambient constant must be gone with the ambient term");
+        assertTrue(!volume.contains("sigmaS / sigmaT"),
+                "nothing may still scale a water term by a scattering fraction");
+        // The lobe is capped and the gate keeps a floor: without the cap a grazing look at the surface
+        // goes white, without the floor the gate's product is a hairline band.
+        assertTrue(volume.contains("phase = min(phase, worldPush.waterShaft.y);"),
+                "the underwater lobe must be capped by the pushed ceiling");
+        assertTrue(volume.contains("structure = lerp(WATER_SHAFT_STRUCTURE_FLOOR, 1.0, structure);"),
+                "the underwater gate must keep a floor");
+        assertTrue(volume.contains("float fogT = underwater ? 1.0 : fogTransmittance("),
+                "the air fog must not attenuate the underwater term");
+        assertTrue(volume.contains("vis *= exp(-sigma * probe.waterHitT);"),
+                "every underwater probe must carry its own Beer-Lambert up to the surface");
+        assertTrue(volume.contains("caustic = waterWaves"),
+                "the surface focus must ride the wave field while it is on");
+        // Both call sites run the layer directly on the water medium, with no scattering fraction.
+        String indirect = Files.readString(Path.of("shaders/pipelines/world/indirect.rgen.slang"));
+        String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
+        for (String source : new String[]{indirect, primary}) {
+            assertTrue(source.contains("medium.current.water && shaftOn")
+                            || source.contains("medium.current.water && firstSegment && shaftOn && firstSample"),
+                    "the water term must gate on the water medium and the shaft switch only");
+            assertTrue(source.contains("worldPush.waterShaft.x"),
+                    "the water term must integrate the dedicated water medium");
+        }
+        String config = Files.readString(CONFIG);
+        assertTrue(!config.contains("WATER_TURBIDITY"),
+                "the scattering setting is gone with the effect it drove");
+        assertTrue(config.contains("clampedFloat(\"caustica.rt.volume.waterShaftDensity\", "
+                        + "\"volume.water-shaft-density\","),
+                "the dedicated water medium needs its own density setting");
+        assertTrue(config.contains("clampedFloat(\"caustica.rt.volume.waterShaftCeiling\", "
+                        + "\"volume.water-shaft-ceiling\","),
+                "the lobe ceiling needs its own setting");
+    }
+
+    /**
+     * The gating that keeps a shaft-off frame identical to one without the feature: the integrator
+     * early-outs on a zero density and a zero strength (both pushed as zero while the switch is off),
+     * Java pushes those zeros, and both call sites sit behind the flag. Also the independence the
+     * feature is for: nothing inside the shaft block reads a fog switch.
+     */
+    @Test
+    void shaftGatingAndIndependence() throws IOException {
+        String volume = Files.readString(VOLUME);
+        assertTrue(volume.contains("if (sigma <= 0.0 || strength <= 0.0 || t <= RAY_TMIN)"),
+                "the shaft integrator must early-out on zero density and zero strength");
+        assertTrue(volume.contains("float reach = min(t, max(worldPush.shaft.z, 1.0));"),
+                "the shaft reach must clamp the segment to the pushed distance");
+        assertTrue(volume.contains("float shaftWeight = total * fogT;"),
+                "the shaft weight must be the stretch's total in-scatter times the fog's transmittance");
+        assertTrue(volume.contains("if (shaftWeight <= 1.0e-4)"),
+                "a hit close enough that the stretch holds no air must skip the probes entirely");
+        // The structure gate is what separates a Tyndall beam from a veil: a path that never leaves the
+        // light scatters uniformly along its whole length, which reads as mist over every sunlit wall.
+        // It must stay LINEAR in the lit fraction: a smoothstep multiplies the probe quantisation by
+        // its slope, and at a forward-scattering phase that renders as contour arcs across the wall.
+        assertTrue(volume.contains("float structure = clamp(1.0 - lit, 0.0, 1.0);"),
+                "the shaft term must fade out on fully-lit paths, linearly in the lit fraction");
+        // ... and it must not ride the albedo guide: a structured volumetric term in the guide is
+        // material as far as the reconstruct is concerned, so its grain survives instead of averaging.
+        String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
+        assertTrue(!primary.contains("shaftOpacity"),
+                "the shaft term must not be blended into the RR albedo guide");
+        assertTrue(volume.contains("lit += dot(vis, float3(0.3333333, 0.3333333, 0.3333333));"),
+                "the gate must read the grey lit fraction of the same probes");
+        assertTrue(volume.contains("strength * fogT * structure"),
+                "the gate must multiply the finished in-scatter");
+        assertTrue(volume.contains("public static const int SHAFT_STRATA = 8;"),
+                "the stratum count must stay high enough for the gate to place a shadow boundary");
+        assertTrue(!volume.substring(volume.indexOf("public float3 shaftInScatter"))
+                        .contains("WORLD_FLAG_FOG"),
+                "the shaft integrator must not depend on a fog switch");
+        String composite = Files.readString(COMPOSITE);
+        assertTrue(composite.contains(
+                        "boolean shaftOn = CausticaConfig.Rt.Volume.SHAFT_ENABLED.value() && skyLit"),
+                "the shaft flag must sit behind its own switch and the sky-light gate");
+        assertTrue(composite.contains(
+                        "new Float4(shaftOn ? CausticaConfig.Rt.Volume.SHAFT_DENSITY.value() : 0f,\n"
+                                + "                            CausticaConfig.Rt.Volume.SHAFT_ANISOTROPY.value(),\n"
+                                + "                            CausticaConfig.Rt.Volume.SHAFT_DISTANCE.value(),\n"
+                                + "                            shaftOn ? CausticaConfig.Rt.Volume.SHAFT_INTENSITY.value() : 0f),"),
+                "Java must push the shaft block with density and strength zeroed while it is off");
+        assertTrue(composite.contains(
+                        "new Float4(shaftOn ? CausticaConfig.Rt.Volume.WATER_SHAFT_DENSITY.value() : 0f,"),
+                "Java must push the underwater medium's density, zeroed while the feature is off");
+        String config = Files.readString(CONFIG);
+        assertTrue(config.contains("bool(\"caustica.rt.volume.shafts\", \"volume.shafts\", true)"),
+                "the shaft master switch ships on: a clear-air effect nobody can see is not shipped");
+        String settings = Files.readString(SETTINGS);
+        assertTrue(settings.contains("\"volume.shafts\", RT + \"shafts\""),
+                "the shaft switch must be reachable from the settings surface");
     }
 }

@@ -74,6 +74,8 @@ public static const uint WORLD_FLAG_VOLUME_DEBUG = 1u << 12u;  // write the volu
 // the fallback, and every consumer that only needs the layer's mean opacity (the NEE probes, the fog sun
 // legs, the continuation-ray attenuation) keeps reading it through WORLD_FLAG_CLOUD either way.
 public static const uint WORLD_FLAG_CLOUD_VOLUMETRIC = 1u << 13u;
+// Clear-air sun shafts (the god-ray layer that does not need the height fog to exist).
+public static const uint WORLD_FLAG_SHAFTS = 1u << 14u;
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky
 // LUT bakes read sun/moon/look state from the same BDA slot the trace does, so there is exactly one
@@ -226,6 +228,19 @@ public struct WorldPush {
     // (the sea level minus the terrain origin, the same anchoring fog0.z uses). The spray strength
     // itself rides weather.z, whose lane the plan reserves for it.
     public float4   water1;
+    // ---- Clear-air sun shafts (volume.slang's shaft integrator). x extinction (1/block; 0 = the
+    // feature is off, the same zero-when-inert invariant the rest of the block keeps), y the
+    // Henyey–Greenstein anisotropy of the shaft phase, z the integration reach in blocks, w the
+    // strength multiplier applied to the finished in-scatter. The medium is uniform in height on
+    // purpose: a beam is the projection of its occluder's shadow volume, so a ground-hugging profile
+    // would tilt every beam toward the horizon.
+    public float4   shaft;
+    // ---- Underwater sun shafts. x extinction of the dedicated water shaft medium (1/block; 0 = the
+    // feature is off). Deliberately NOT the water body's own scattering (water1.x): that fraction also
+    // drives the body's ambient glow, and a player who wants beams without the milky water it brings
+    // has no way to separate the two. This is its own medium, with its own density, lit by the same
+    // shaft integrator; yzw are reserved (the phase anisotropy is the water body's, read from Medium).
+    public float4   waterShaft;
 };
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
@@ -372,6 +387,14 @@ public static const uint ENTITY_PRIM_UNLIT = 1u;
 // and the layer count in the high 16.
 public static const uint ENTITY_PRIM_END_PORTAL = 2u;
 
+// The submission carries vanilla's hurt / spawn-flash overlay (the OverlayTexture texel vanilla passes
+// every entity submission as UV1): bits 2..5 are the texel column and bit 6 selects the hurt row.
+// RtEntityCollector packs them from that overlayCoords argument — see RtEntityOverlay for the texture's
+// layout and for why the overlay rides the primitive instead of the entity record.
+public static const uint ENTITY_PRIM_OVERLAY_U_SHIFT = 2u;
+public static const uint ENTITY_PRIM_OVERLAY_U_MASK = 0xFu;
+public static const uint ENTITY_PRIM_OVERLAY_HURT = 0x40u;
+
 // Terrain per-triangle record (48 B). The final 16-byte lane contains integer geometry-local metadata;
 // shared surface parameters live once in MaterialHeader instead of being copied into every triangle.
 public struct TerrainPrim {
@@ -513,4 +536,32 @@ public float3 srgbToLinear(float3 color) {
     float3 lo = color / 12.92;
     float3 hi = pow((color + 0.055) / 1.055, float3(2.4));
     return lerp(lo, hi, step(float3(0.04045), color));
+}
+
+public float3 linearToSrgb(float3 color) {
+    // The max() matters: pow() of a negative base is NaN, and lerp()'s step already zeroed weight still
+    // multiplies it — 0 * NaN is NaN.
+    float3 c = max(color, float3(0.0));
+    float3 lo = c * 12.92;
+    float3 hi = 1.055 * pow(c, float3(1.0 / 2.4)) - 0.055;
+    return lerp(lo, hi, step(float3(0.0031308), c));
+}
+
+// The OverlayTexture texel a prim's flag bits select. Both regions are constant along the axis that
+// matters: the hurt row is red at alpha 178/255, and the white row's alpha ramps 1 -> 0.25 with the column
+// (OverlayTexture fills (1 - u/15 * 0.75) * 255, i.e. 0.05 per column). Column 0 is a no-op, so both
+// "never had an overlay" and "the spawn flash has not started" leave the colour untouched.
+public float4 entityOverlayRgba(uint flags) {
+    if ((flags & ENTITY_PRIM_OVERLAY_HURT) != 0u) {
+        return float4(1.0, 0.0, 0.0, 178.0 / 255.0);
+    }
+    uint u = (flags >> ENTITY_PRIM_OVERLAY_U_SHIFT) & ENTITY_PRIM_OVERLAY_U_MASK;
+    return float4(1.0, 1.0, 1.0, 1.0 - 0.05 * float(u));
+}
+
+// Apply that overlay where vanilla's entity.fsh does — over the vertex-tinted colour, before the material's
+// own alpha model. Vanilla mixes in display-encoded space, so the colour is encoded back, mixed and
+// decoded; mixing linearly instead leaves a hurt entity visibly lighter than the game draws it.
+public float3 applyEntityOverlay(float3 color709, float4 overlay) {
+    return overlay.a >= 1.0 ? color709 : srgbToLinear(lerp(overlay.rgb, linearToSrgb(color709), overlay.a));
 }

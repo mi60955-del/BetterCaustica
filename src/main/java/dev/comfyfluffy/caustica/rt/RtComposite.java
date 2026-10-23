@@ -64,6 +64,7 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtDebugPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtBloomPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSkyLut;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
+import dev.comfyfluffy.caustica.rt.pipeline.RtSharpenPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
 import dev.comfyfluffy.caustica.rt.pipeline.RtFgInterpPipeline;
@@ -80,6 +81,7 @@ import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
@@ -136,8 +138,15 @@ public final class RtComposite {
     private static final int WORLD_FLAG_VOLUME_SHADOW = 1 << 10;
     private static final int WORLD_FLAG_VOLUME_MARCH = 1 << 11;
     private static final int WORLD_FLAG_VOLUME_DEBUG = 1 << 12;
+    /** Raygen records of the world pipeline's SBT; 2/3 are the volume-free twins of 0/1. */
+    private static final int RAYGEN_PRIMARY = 0;
+    private static final int RAYGEN_INDIRECT = 1;
+    private static final int RAYGEN_PRIMARY_LEAN = 2;
+    private static final int RAYGEN_INDIRECT_LEAN = 3;
     /** The volumetric cloud slab (Phase 5) walks the layer instead of crossing it once. */
     private static final int WORLD_FLAG_CLOUD_VOLUMETRIC = 1 << 13;
+    /** Clear-air sun shafts: airlight independent of the height fog. */
+    private static final int WORLD_FLAG_SHAFTS = 1 << 14;
     // Debug views the primary raygen fills the volume debug image for; one channel per view.
     private static final int DEBUG_VIEW_VOLUME_FIRST = 10;
     private static final int DEBUG_VIEW_VOLUME_LAST = 13;
@@ -205,6 +214,7 @@ public final class RtComposite {
     private PushSlot[] pushRing;
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
+    private RtSharpenPipeline sharpenPipeline;
     private RtBloomPipeline bloomPipeline;
     // Atmosphere LUTs (transmittance + multiple scattering + this frame's sky view). Device-lifetime; the
     // two static tables are baked on the first frame that records the pass.
@@ -223,6 +233,11 @@ public final class RtComposite {
     // render pixel (base + optional transmission); Pass B resamples them at the configured SPP.
     private RtBuffer continuationQueue;
     private RtImage displayImage;
+    // The display mapper's own output, before sharpening: the mapper writes these and the sharpen pass reads
+    // them, so the 3x3 taps never race a neighbouring thread's write to the image being produced. The HDR
+    // member exists only while HDR output is enabled, exactly like hdrDisplayImage.
+    private RtImage displayComposeImage;
+    private RtImage hdrComposeImage;
     // Bloom pyramid, finest first: level 0 is half display resolution and each level halves again. The
     // display mapper reads level 0, which the upsample sweep leaves holding the sum of every band.
     private RtImage[] bloomLevels = new RtImage[0];
@@ -284,6 +299,24 @@ public final class RtComposite {
     private RtFgInterpPipeline fgInterpPipeline;
     /** Packs the swapchain size of the last logged missing-HUD-less warning, so it warns once per size. */
     private int fgHudlessMismatch = -1;
+    /** No traced guides yet: routine on menu/loading frames, so it is counted without being logged. */
+    private static final int FG_FSR_SKIP_GUIDES = 1;
+    /** The FidelityFX context is absent or could not be built. */
+    private static final int FG_FSR_SKIP_NO_CONTEXT = 2;
+    /** A context exists but a rebuild is still waiting for the resize to settle. */
+    private static final int FG_FSR_SKIP_SETTLING = 3;
+    /** The context is up and the inputs were valid, but the dispatch itself returned non-OK. */
+    private static final int FG_FSR_SKIP_DISPATCH_FAILED = 4;
+    /**
+     * Why the last FSR call produced no generated frame, and when that reason was last reported. FSR's own
+     * diagnostics only speak when a call fails; a context that never came up, or a dispatch the SDK rejects,
+     * otherwise costs the feature silently and looks identical to frame generation simply not running.
+     */
+    private int fgFsrSkipReason = -1;
+    private long fgFsrSkipLoggedNs;
+    private int fgFsrSkipStreak;
+    /** Shortest gap between two warnings for the same reason, so a persistent cause costs one line per interval. */
+    private static final long FG_FSR_SKIP_RELOG_NS = 2_000_000_000L;
     private RtImage fgSelfInterp;
     private RtImage fgSelfHistory;
     private boolean fgSelfHistoryWritten;
@@ -302,8 +335,11 @@ public final class RtComposite {
     private RtImage gSpecMotion;
     // Per-pixel volumetric diagnostics (debug views 10..13), render-res like the guides. Written by the
     // primary raygen only on frames whose WorldPush carries WORLD_FLAG_VOLUME_DEBUG; the debug present
-    // pass shows one channel per view.
+    // pass shows one channel per view. Allocated only while one of those views is selected: it is a
+    // render-res RGBA16F image that nothing else reads.
     private RtImage volumeDebug;
+    /** Bound in volumeDebug's slot while no view samples it, so the descriptor stays format-legal. */
+    private RtImage volumeDebugPlaceholder;
     // Display-res RT image the display mapper reads: DLSS-RR writes it (render -> display denoise+upscale), or a
     // linear blit of `output` fills it when RR is off/unavailable (the no-RR reference / fallback).
     private RtImage rrOutput;
@@ -321,6 +357,8 @@ public final class RtComposite {
     // Same idea for the HDR output toggle: it decides whether hdrDisplayImage exists at all, so a runtime
     // switch must trigger the ensureOutput rebuild that allocates or frees it.
     private boolean renderSizeHdrEnabled;
+    // ...and for the volume-debug image, which only exists while a view that samples it is selected.
+    private boolean renderSizeVolumeDebug;
 
     // Motion-vector reprojection state: the previous frame's camera-relative view-projection and
     // camera position, read into the push constant each frame then advanced at frame end.
@@ -723,6 +761,9 @@ public final class RtComposite {
             if (displayPipeline == null) {
                 displayPipeline = RtDisplayPipeline.create(ctx);
             }
+            if (sharpenPipeline == null) {
+                sharpenPipeline = RtSharpenPipeline.create(ctx);
+            }
             if (bloomPipeline == null) {
                 bloomPipeline = RtBloomPipeline.create(ctx);
             }
@@ -805,14 +846,17 @@ public final class RtComposite {
             // hdrToneLut/lookLut may have been hot-swapped just above; setImages is a no-op if the bound
             // views already match, so this is cheap on every other frame.
             RtToneLut boundLookLut = lookLut;
-            displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayBindingView(ctx),
+            displayPipeline.setImages(displayComposeImage.view, rrOutput.view, exposure.image().view,
+                    hdrBindingView(ctx, hdrComposeImage),
                     sdrToneLut.view(), sdrToneLut.sampler(), hdrToneLut.view(), hdrToneLut.sampler(),
                     boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler(),
                     exposure.stateBuffer());
             bloomPipeline.setImages(rrOutput.view, exposure.image().view, bloomLevels);
+            sharpenPipeline.setImages(displayImage.view, hdrBindingView(ctx, hdrDisplayImage),
+                    displayComposeImage.view, hdrBindingView(ctx, hdrComposeImage));
             debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
                     gMotion.view, gSpecAlbedo.view, gSpecMotion.view, rrOutput.view, exposure.image().view,
-                    volumeDebug.view, exposure.stateBuffer());
+                    volumeDebugView(), exposure.stateBuffer());
             // Cheap idempotent check every frame (not just on resize): if the exposure mode is switched
             // manual -> auto at runtime (video settings), the auto-mode histogram/state/pipeline must be
             // allocated before recordFrame's exposure.record() below needs them, or it throws.
@@ -828,7 +872,9 @@ public final class RtComposite {
             recordFrame(ctx, active, nativeColor);
             if (!loggedActive) {
                 loggedActive = true;
-                CausticaMod.LOGGER.info("RT composite active (terrain): {}x{}, RT output replaces the world target", width, height);
+                CausticaMod.LOGGER.info("RT composite active (terrain): {}x{}, RT output replaces the world target{}"
+                        , width, height,
+                        RtAccel.cutoutOpaqueProbeActive() ? " [cutout any-hit ceiling probe ON]" : "");
             }
             return true;
         } catch (Throwable t) {
@@ -887,7 +933,14 @@ public final class RtComposite {
             bindlessTextureCapacity = RtEntityTextures.maxTextures();
             worldPipeline = RtPipeline.create(ctx, new String[]{
                             RtDeviceBringup.worldPrimaryRaygenShader(),
-                            RtDeviceBringup.worldRaygenShader()},
+                            RtDeviceBringup.worldRaygenShader(),
+                            // The same two passes with the volumetric scatter compiled out. Traced
+                            // instead of the first two on frames where every volume switch is off: the
+                            // fog/shaft calls then never execute, but their code still costs registers,
+                            // and that was 5 ms of the frame. Extra records, not a second pipeline — a
+                            // second pipeline reached the same shaders but hung the render thread.
+                            RtDeviceBringup.worldPrimaryLeanRaygenShader(),
+                            RtDeviceBringup.worldLeanRaygenShader()},
                     new String[]{"sky.rmiss.spv", "guide.rmiss.spv"},
                     "closest_hit.rchit.spv", "any_hit.rahit.spv",
                     WorldPushConstantsData.BYTE_SIZE, bindlessTextureCapacity);
@@ -1043,9 +1096,34 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecMotion.view);
         bindReservoirImages();
-        if (volumeDebug != null) {
-            worldPipeline.setVolumeDebugImage(volumeDebug.view);
+        // Always bound: the trace writes this slot on frames flagged for volume diagnostics, and the
+        // placeholder keeps that write legal while no debug view samples the image.
+        long volumeView = volumeDebugView();
+        if (volumeView != 0L) {
+            worldPipeline.setVolumeDebugImage(volumeView);
         }
+    }
+
+    /** The view for the volume-debug slot: the real image, or the 1x1 stand-in when none is needed. */
+    private long volumeDebugView() {
+        if (volumeDebug != null) {
+            return volumeDebug.view;
+        }
+        if (volumeDebugPlaceholder == null) {
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx == null) {
+                return 0L;
+            }
+            volumeDebugPlaceholder = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    "RT volume debug placeholder");
+        }
+        return volumeDebugPlaceholder.view;
+    }
+
+    /** Whether the selected debug view reads per-pixel volume diagnostics (views 10..13). */
+    private static boolean volumeDebugRequested() {
+        int view = debugView();
+        return view >= 10 && view <= 13;
     }
 
     /** Rebind the reservoir pair so the trace reads the image last frame wrote and writes the other. */
@@ -1136,12 +1214,17 @@ public final class RtComposite {
         boolean rrEnabled = RtDlssRr.enabled();
         int rrQuality = rrEnabled ? RtDlssRr.quality() : Integer.MIN_VALUE;
         boolean hdrEnabled = CausticaConfig.Rt.Hdr.enabled();
+        // Decides whether the image exists at all, so a runtime toggle has to reach the rebuild below
+        // rather than leaving a stale (or absent) one bound.
+        boolean volumeDebugWanted = volumeDebugRequested();
         if (output != null && continuationQueue != null
-                && displayImage != null && rrOutput != null
+                && displayImage != null && displayComposeImage != null && rrOutput != null
                 && bloomLevels.length > 0 && exposure.ready()
                 && displayW == width && displayH == height
                 && renderSizeRrEnabled == rrEnabled && renderSizeRrQuality == rrQuality
-                && renderSizeHdrEnabled == hdrEnabled && hdrEnabled == (hdrDisplayImage != null)) {
+                && renderSizeHdrEnabled == hdrEnabled && hdrEnabled == (hdrDisplayImage != null)
+                && hdrEnabled == (hdrComposeImage != null)
+                && renderSizeVolumeDebug == volumeDebugWanted) {
             return;
         }
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
@@ -1152,9 +1235,17 @@ public final class RtComposite {
             if (displayImage != null) {
                 displayImage.destroy();
             }
+            if (displayComposeImage != null) {
+                displayComposeImage.destroy();
+                displayComposeImage = null;
+            }
             if (hdrDisplayImage != null) {
                 hdrDisplayImage.destroy();
                 hdrDisplayImage = null;
+            }
+            if (hdrComposeImage != null) {
+                hdrComposeImage.destroy();
+                hdrComposeImage = null;
             }
             destroyBloomLevels();
             if (output != null) {
@@ -1192,13 +1283,20 @@ public final class RtComposite {
                     VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
                     "path continuation queue " + renderW + "x" + renderH + "x2");
             displayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM, "RT display image " + width + "x" + height);
-            // PQ-encoded ([0,1], ST.2084) HDR display image, written in parallel by display.comp when HDR
-            // mode is active. Allocated only while HDR output is enabled: at display resolution it costs
-            // ~29 MB at 1440p / ~66 MB at 4K and is never read when the flag is off. While it is absent
-            // the display pipeline's HDR slot binds the 1x1 placeholder (see hdrDisplayBindingView).
+            // Same format as displayImage: the sharpen pass stores what it read plus a high-pass term in the
+            // same code values, so separating the two costs one more display-res copy of the image and buys
+            // each thread an unmodified 3x3 neighbourhood.
+            displayComposeImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM,
+                    "RT display compose " + width + "x" + height);
+            // PQ-encoded ([0,1], ST.2084) HDR display image, paired with hdrComposeImage exactly like the SDR
+            // pair above and written by the sharpen pass. Allocated only while HDR output is enabled: both
+            // images together cost ~58 MB at 1440p / ~132 MB at 4K and are never read when the flag is off.
+            // While they are absent the display-chain HDR slots bind the 1x1 placeholder (see hdrBindingView).
             if (hdrEnabled) {
                 hdrDisplayImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         "RT HDR display image " + width + "x" + height);
+                hdrComposeImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        "RT HDR display compose " + width + "x" + height);
             }
             // Bloom pyramid. Level 0 is half display resolution (the prefilter's 13-tap already covers a 5x5
             // display-pixel footprint, so nothing is lost by starting there); each further level halves again
@@ -1214,7 +1312,10 @@ public final class RtComposite {
                 bloomWidth = Math.max(1, bloomWidth / 2);
                 bloomHeight = Math.max(1, bloomHeight / 2);
             }
-            // Guide buffers match the trace (render) resolution; DLSS-RR consumes them at render res.
+            // Guide buffers match the trace (render) resolution. They are not RR-only: the indirect
+            // pass reads the normal and depth history for its temporal reservoir reuse, exposure
+            // metering reads depth and albedo, and the screenshot exporter reads depth and motion, so
+            // every one of them has to exist at full size on the no-RR path too.
             gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide normal roughness " + renderW + "x" + renderH);
             gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide diffuse albedo " + renderW + "x" + renderH);
             gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide linear depth " + renderW + "x" + renderH);
@@ -1239,9 +1340,12 @@ public final class RtComposite {
                             "reservoir sample B " + renderW + "x" + renderH)};
             reservoirWrite = 0;
             // Per-pixel volumetric diagnostics, same render resolution as the guides the primary pass
-            // writes them from.
-            volumeDebug = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                    "volume debug " + renderW + "x" + renderH);
+            // writes them from. Only the dedicated volume views read them.
+            renderSizeVolumeDebug = volumeDebugWanted;
+            if (volumeDebugWanted) {
+                volumeDebug = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        "volume debug " + renderW + "x" + renderH);
+            }
             // Display-res RT image the display mapper reads. Always present (DLSS-RR target, or blit-upscale fallback).
             rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
             // Also creates the 1x1 exposure image, so it stays inside the init-batch window.
@@ -1257,24 +1361,27 @@ public final class RtComposite {
             bindGuideImages();
         }
         RtToneLut boundLookLut = lookLut;
-        displayPipeline.setImages(displayImage.view, rrOutput.view, exposure.image().view, hdrDisplayBindingView(ctx),
+        displayPipeline.setImages(displayComposeImage.view, rrOutput.view, exposure.image().view,
+                hdrBindingView(ctx, hdrComposeImage),
                 sdrToneLut.view(), sdrToneLut.sampler(), hdrToneLut.view(), hdrToneLut.sampler(),
                 boundLookLut.view(), boundLookLut.sampler(), bloomLevels[0].view, bloomPipeline.sampler(),
                 exposure.stateBuffer());
         bloomPipeline.setImages(rrOutput.view, exposure.image().view, bloomLevels);
+        sharpenPipeline.setImages(displayImage.view, hdrBindingView(ctx, hdrDisplayImage),
+                displayComposeImage.view, hdrBindingView(ctx, hdrComposeImage));
         debugPresentPipeline.setImages(displayImage.view, gNormal.view, gAlbedo.view, gDepth.view,
                 gMotion.view, gSpecAlbedo.view, gSpecMotion.view, rrOutput.view, exposure.image().view,
-                volumeDebug.view, exposure.stateBuffer());
+                volumeDebugView(), exposure.stateBuffer());
     }
 
     /**
-     * The view bound into the display pipeline's HDR output slot: the real HDR display image while HDR
-     * output is enabled, otherwise the persistent 1x1 placeholder that keeps the format-qualified
-     * descriptor legally bound without pinning a display-resolution image.
+     * The view bound into a display-chain pass's HDR slot: the real image while HDR output is enabled,
+     * otherwise the persistent 1x1 placeholder that keeps the format-qualified descriptor legally bound
+     * without pinning a display-resolution image.
      */
-    private long hdrDisplayBindingView(RtContext ctx) {
-        if (hdrDisplayImage != null) {
-            return hdrDisplayImage.view;
+    private long hdrBindingView(RtContext ctx, RtImage hdrImage) {
+        if (hdrImage != null) {
+            return hdrImage.view;
         }
         if (hdrBindingPlaceholder == null) {
             hdrBindingPlaceholder = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1510,6 +1617,17 @@ public final class RtComposite {
             // pushed as zero while the fog is off — otherwise the debug views would keep showing a fog
             // the flags no longer render.
             boolean fogOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit;
+            // Clear-air sun shafts: their own medium, so their own switch, and no dependence on any
+            // fog setting. The sky-light gate is shared with the fog because the sun term is the same
+            // derived celestial body — a dimension with no sun has nothing to scatter.
+            boolean shaftOn = CausticaConfig.Rt.Volume.SHAFT_ENABLED.value() && skyLit;
+            if (shaftOn) {
+                flags |= WORLD_FLAG_SHAFTS;
+            }
+            // The volume-free raygen records are only correct while nothing that consumes those integrals
+            // is on — that is exactly what this names. Any of them on, and the full records run.
+            boolean leanVolumePath = (flags & (WORLD_FLAG_FOG | WORLD_FLAG_CLOUD
+                    | WORLD_FLAG_VOLUME_DEBUG)) == 0 && !shaftOn;
             // Weather drives the volume block: the levels are pushed whether or not a feature currently
             // consumes them, so every volume shader reads one consistent weather snapshot. The previous
             // frame's rain level rides along so temporal-stability work can interpolate.
@@ -1519,21 +1637,13 @@ public final class RtComposite {
             float storm = CausticaConfig.Rt.Volume.stormLevel(rainLevel, thunderLevel);
             float cloudRainBoost = CausticaConfig.Rt.Volume.CLOUD_RAIN_BOOST.value();
             // Fog density over the day: dawn and dusk are the peak (low-sun ground mist is the look
-            // people expect from fog), while noon and night keep a fraction of it. Sun elevation is
-            // sin(2π·dayFraction) against the same fraction the GameTime lane pushes: +1 at noon,
-            // 0 at 06:00/18:00, -1 at midnight. A gaussian in elevation (σ ≈ 14°) is the twilight
-            // term; smoothstep plateaus hold noon at 20% and night at 25% of the peak so the fog
-            // never fully leaves. Both plateaus ramp in past ±0.10 elevation so the twilight peak
-            // owns the horizon stretch unopposed.
+            // people expect from fog), while noon and night keep whatever fraction the day/night
+            // decay leaves them. Sun elevation is sin(2π·dayFraction) against the same fraction the
+            // GameTime lane pushes: +1 at noon, 0 at 06:00/18:00, -1 at midnight.
             float timeOfDayFrac = (level.getGameTime() % 24000L + partialTick) / 24000.0f;
             float sunElevation = (float) Math.sin(timeOfDayFrac * 2.0 * Math.PI);
-            float twilight = (float) Math.exp(-(sunElevation * sunElevation) / (0.25f * 0.25f));
-            float dayPlateau = Math.clamp((sunElevation - 0.10f) / 0.30f, 0.0f, 1.0f);
-            dayPlateau = dayPlateau * dayPlateau * (3.0f - 2.0f * dayPlateau);
-            float nightPlateau = Math.clamp((-sunElevation - 0.10f) / 0.30f, 0.0f, 1.0f);
-            nightPlateau = nightPlateau * nightPlateau * (3.0f - 2.0f * nightPlateau);
-            float fogDayFactor = Math.max(twilight,
-                    Math.max(dayPlateau * 0.20f, nightPlateau * 0.25f));
+            float fogDayFactor = CausticaConfig.Rt.Volume.fogDayFactor(sunElevation,
+                    CausticaConfig.Rt.Volume.FOG_DAY_DECAY.value());
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1670,8 +1780,25 @@ public final class RtComposite {
                     // water phase's Henyey–Greenstein g (forward-biased per the plan's 0.5..0.9 range),
                     // z spray band height in blocks, w the band's base: the sea level, already rebased
                     // like fog0.z so the band stays pinned as the terrain rebase shifts.
-                    new Float4(CausticaConfig.Rt.Composite.WATER_TURBIDITY.value(), 0.6f, 1.5f,
-                            (float) (level.getSeaLevel() - terrain.blockY))
+                    // x is the retired turbidity lane and stays zero: the water body no longer scatters,
+                    // its column is the shaft layer's own medium (see the block below).
+                    new Float4(0f, 0.6f, 1.5f,
+                            (float) (level.getSeaLevel() - terrain.blockY)),
+                    // ---- Clear-air sun shafts. x extinction (1/block, zero while the feature is off,
+                    // which is the shader's own early-out as well as the flag's), y the phase's
+                    // Henyey–Greenstein g, z the integration reach in blocks, w the strength on the
+                    // finished in-scatter. Independent of every fog lane above: the point of a separate
+                    // medium is that god rays do not arrive with the fog's veil.
+                    new Float4(shaftOn ? CausticaConfig.Rt.Volume.SHAFT_DENSITY.value() : 0f,
+                            CausticaConfig.Rt.Volume.SHAFT_ANISOTROPY.value(),
+                            CausticaConfig.Rt.Volume.SHAFT_DISTANCE.value(),
+                            shaftOn ? CausticaConfig.Rt.Volume.SHAFT_INTENSITY.value() : 0f),
+                    // ---- Underwater shafts. x the dedicated water medium's extinction, independent of
+                    // the water body's own scattering on purpose: that one carries the ambient glow, and
+                    // the point of this lane is to have beams without it. y the ceiling on the forward
+                    // lobe, which is what stops a sun-facing water surface from turning white.
+                    new Float4(shaftOn ? CausticaConfig.Rt.Volume.WATER_SHAFT_DENSITY.value() : 0f,
+                            shaftOn ? CausticaConfig.Rt.Volume.WATER_SHAFT_CEILING.value() : 0f, 0f, 0f)
             ).write(push);
             previousRainLevel = rainLevel;
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
@@ -1742,7 +1869,8 @@ public final class RtComposite {
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world primary trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.tracePrimary")) {
-                active.trace(cmd, renderW, renderH, pushConstants, 0);
+                active.trace(cmd, renderW, renderH, pushConstants,
+                        leanVolumePath ? RAYGEN_PRIMARY_LEAN : RAYGEN_PRIMARY);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // continuation/guide writes visible to pass B
             // The reservoir write only reaches pixels that get a bounce-0 diffuse vertex, so clear this
@@ -1751,7 +1879,8 @@ public final class RtComposite {
             clearReservoir(ctx, cmd, stack);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world indirect trace");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.traceIndirect")) {
-                active.trace(cmd, renderW, renderH, pushConstants, 1);
+                active.trace(cmd, renderW, renderH, pushConstants,
+                        leanVolumePath ? RAYGEN_INDIRECT_LEAN : RAYGEN_INDIRECT);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
             // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
@@ -1806,14 +1935,28 @@ public final class RtComposite {
                 displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                         sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
                         CausticaConfig.Rt.Tonemap.LOOK_ENABLED.value(), lookLut.size,
-                        LOOK.bloom().strength() / bloomLevels.length,
+                        LOOK.bloom().strength() * CausticaConfig.Rt.Tonemap.BLOOM_STRENGTH.value()
+                                / bloomLevels.length,
                         CausticaConfig.Rt.Tonemap.ADVANCED_GRADING.value(),
                         CausticaConfig.Rt.Tonemap.AGX_GAIN.value(),
                         CausticaConfig.Rt.Tonemap.AGX_SATURATION.value(),
+                        CausticaConfig.Rt.Tonemap.AGX_CONTRAST.value(),
+                        CausticaConfig.Rt.Tonemap.AGX_RANGE.value(),
                         // Needs the meter, not just the setting: in manual exposure mode evScene is
                         // never refreshed, so there is no absolute luminance to adapt to.
                         CausticaConfig.Rt.Tonemap.PURKINJE.value() && exposure.isAuto(),
                         CausticaConfig.Rt.Tonemap.PURKINJE_STRENGTH.value());
+            }
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // compose images visible to the sharpen pass
+
+            // Sharpening closes the display chain: it reads the mapper's compose pair and writes the images
+            // every present path already consumes, so the copy below, the HDR present and the FG hudless
+            // captures all see the sharpened frame without knowing this pass exists.
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display sharpen");
+                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.sharpen")) {
+                sharpenPipeline.dispatch(cmd, displayW, displayH,
+                        CausticaConfig.Rt.Sharpen.ENABLED.value(), CausticaConfig.Rt.Sharpen.AMOUNT.value(),
+                        CausticaConfig.Rt.Hdr.enabled());
             }
             hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite
@@ -2157,6 +2300,14 @@ public final class RtComposite {
             hdrDisplayImage.destroy();
             hdrDisplayImage = null;
         }
+        if (displayComposeImage != null) {
+            displayComposeImage.destroy();
+            displayComposeImage = null;
+        }
+        if (hdrComposeImage != null) {
+            hdrComposeImage.destroy();
+            hdrComposeImage = null;
+        }
         if (hdrBindingPlaceholder != null) {
             hdrBindingPlaceholder.destroy();
             hdrBindingPlaceholder = null;
@@ -2185,6 +2336,10 @@ public final class RtComposite {
         if (displayPipeline != null) {
             displayPipeline.destroy();
             displayPipeline = null;
+        }
+        if (sharpenPipeline != null) {
+            sharpenPipeline.destroy();
+            sharpenPipeline = null;
         }
         if (bloomPipeline != null) {
             bloomPipeline.destroy();
@@ -2261,6 +2416,10 @@ public final class RtComposite {
         materialBindingsReady = false;
         materialEpochTraceGate = false;
         RtMaterialRegistry.INSTANCE.destroy();
+        if (volumeDebugPlaceholder != null) {
+            volumeDebugPlaceholder.destroy();
+            volumeDebugPlaceholder = null;
+        }
         if (pushRing != null) {
             for (PushSlot slot : pushRing) {
                 if (slot != null) {
@@ -2380,6 +2539,20 @@ public final class RtComposite {
 
     public long hdrBackbufferImage() {
         return hdrDisplayImage != null ? hdrDisplayImage.image : 0L;
+    }
+
+    /**
+     * The HDR backbuffer's own extent, which is what frame generation must be told. A swapchain extent can
+     * differ from this image by a pixel in either axis, and describing a shorter image as the taller size
+     * puts the generated frame on a different vertical scale from the real one — the two are presented on
+     * alternate frames, so that reads as the whole screen vibrating. 0 when the HDR image is absent.
+     */
+    public int hdrBackbufferWidth() {
+        return hdrDisplayImage != null ? hdrDisplayImage.width : 0;
+    }
+
+    public int hdrBackbufferHeight() {
+        return hdrDisplayImage != null ? hdrDisplayImage.height : 0;
     }
 
     /**
@@ -2803,15 +2976,23 @@ public final class RtComposite {
     public RtImage fgInterpolateFsr(VulkanCommandEncoder enc, long backbufferImage,
             int srcW, int srcH, boolean hdrBackbuffer) {
         if (failed || gDepth == null || gMotion == null || !frameCaptured) {
-            return null;
+            return fgFsrSkip(FG_FSR_SKIP_GUIDES,
+                    () -> "no traced guides yet (depth=" + (gDepth != null) + " motion=" + (gMotion != null)
+                            + " cameraCaptured=" + frameCaptured + ")");
         }
         RtContext ctx = RtContext.currentOrNull();
         if (ctx == null) {
-            return null;
+            return fgFsrSkip(FG_FSR_SKIP_NO_CONTEXT, () -> "no RT context");
         }
         final int fmt = hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : VK10.VK_FORMAT_R8G8B8A8_UNORM;
         if (!RtFsrFg.INSTANCE.ensureContext(srcW, srcH, renderW, renderH, fmt)) {
-            return null;
+            // A refused ensureContext is either a context that could not be built (already reported once at
+            // creation) or the debounce that holds a rebuild until a window drag settles. Only the first is
+            // worth a warning; the second is routine and resolves on its own.
+            return RtFsrFg.INSTANCE.isReady()
+                    ? fgFsrSkip(FG_FSR_SKIP_SETTLING,
+                            () -> "context rebuild is waiting for the resize to settle at " + srcW + "x" + srcH)
+                    : fgFsrSkip(FG_FSR_SKIP_NO_CONTEXT, () -> "FidelityFX context could not be brought up");
         }
         // The output is allocated at the colour input's extent too, so the backend writes one image whose
         // geometry matches its input; the extra present stretches it to the swapchain the same way
@@ -2854,10 +3035,32 @@ public final class RtComposite {
         }
         fgReset = false;
         if (!ok) {
-            return null;
+            return fgFsrSkip(FG_FSR_SKIP_DISPATCH_FAILED,
+                    () -> "ffxshim_frame returned non-OK at " + srcW + "x" + srcH);
         }
         enc.execute(cmd);
         return out;
+    }
+
+    /**
+     * Record that this call produced no generated frame, and hand the caller the {@code null} that means
+     * "duplicate the rendered frame instead". Causes that mean frame generation was asked for and could not
+     * deliver are reported at most once per {@link #FG_FSR_SKIP_RELOG_NS} while they persist; the two routine
+     * ones (no traced guides yet, a resize still settling) are counted without a line, because they resolve
+     * themselves and would otherwise fill the log at every menu frame and every window drag. {@code detail}
+     * is a supplier so nothing is built on the frames that are not logged.
+     */
+    private RtImage fgFsrSkip(int reason, Supplier<String> detail) {
+        fgFsrSkipStreak++;
+        boolean reportable = reason == FG_FSR_SKIP_NO_CONTEXT || reason == FG_FSR_SKIP_DISPATCH_FAILED;
+        long now = System.nanoTime();
+        if (reportable && (reason != fgFsrSkipReason || now - fgFsrSkipLoggedNs >= FG_FSR_SKIP_RELOG_NS)) {
+            fgFsrSkipReason = reason;
+            fgFsrSkipLoggedNs = now;
+            CausticaMod.LOGGER.warn("FSR-FG produced no generated frame ({} consecutive calls): {}",
+                    fgFsrSkipStreak, detail.get());
+        }
+        return null;
     }
 
     /**

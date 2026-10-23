@@ -206,10 +206,19 @@ float sprayDensity(WorldPush push, float3 pos) {
 
 // The march tier's density at one point. Returns the plain analytic profile while the noise amplitude
 // is zero, so the marched integrator degenerates to integrating the analytic field.
+// The march tier's density at one point. Returns the plain analytic profile while the noise amplitude
+// is zero, so the marched integrator degenerates to integrating the analytic field. It also returns the
+// plain profile wherever the profile times the noise's largest multiplier sits below
+// FOG_NOISE_MIN_DENSITY: there the 24-lattice-hash FBM can move the sample by less than the density is
+// worth, so the modulation is skipped and the segment's optical depth error stays bounded by that
+// constant per block of skipped stretch — invisible next to the noise floor the estimator already runs
+// at, and the reason the steps above the fog's significant band stop paying for noise.
+public static const float FOG_NOISE_MIN_DENSITY = 1.0e-6;
+
 public float fogMarchDensity(WorldPush push, float3 pos) {
     float base = fogDensityAt(push, pos.y);
     float amp = push.fog1.z;
-    if (base <= 0.0 || amp <= 0.0) {
+    if (base <= 0.0 || amp <= 0.0 || base * (1.0 + abs(amp)) < FOG_NOISE_MIN_DENSITY) {
         return base + sprayDensity(push, pos);
     }
     // The wind drift arrives pre-accumulated per axis (Java integrates speed x direction over the
@@ -247,7 +256,21 @@ public static const float CLOUD_DIR_JITTER = 0.17;      // rad the local wind di
 public static const float CLOUD_DIR_CELL = 900.0;       // blocks that wander varies over
 public static const float CLOUD_EXTINCTION = 0.22;      // 1/block at unit density (water-cloud order)
 public static const float CLOUD_G = 0.4;                // phase anisotropy, the fog tier's forward doctrine
-public static const float3 CLOUD_ALBEDO = float3(0.86, 0.87, 0.90); // BT.709-linear, sky.rmiss space
+public static const float3 CLOUD_ALBEDO = float3(0.86, 0.87, 0.90); // BT-709-linear, sky.rmiss space
+// The phase a sample is lit by: an isotropic share plus the single-scatter lobe, mostly intact. The lobe
+// alone spans nearly two orders of magnitude between looking into the body and looking away from it (the
+// shipped g puts 94x between those two directions in this tier), which drew one and the same deck blown
+// white on the body's side of the sky and black on the other. Taking that range out entirely is worse: a
+// deck with no directional falloff reads as one flat bright sheet, and the falloff IS what makes the cloud
+// field read as shape. The share below only lifts the extreme - the directions more than ~75 degrees off
+// the body, where the lobe has nothing left - and the lobe keeps the rest of its range.
+public static const float CLOUD_SCATTER_FLOOR = 0.15;   // the isotropic share every sample carries
+public static const float CLOUD_SCATTER_LOBE = 0.85;    // how much of the single-scatter lobe survives
+// How much of the column above a sample occludes the SKY that lights it. Light reaches a deck's base from
+// the whole hemisphere - the sides and the gaps included - so this stays well below the sun leg's own
+// occlusion. It is also what makes the base darker than the crown, so it cannot be driven to zero either:
+// the deck's own vertical gradient is this weight's whole job.
+public static const float CLOUD_AMBIENT_OCCLUSION = 0.20;
 
 // Dave Hoskins' hash12, the 2D twin of fogHash13 (and of sky.rmiss's star hash). No lattice wrap:
 // the streak lattice has no period to wrap into — real stratus streaks run along an arbitrary wind
@@ -324,6 +347,7 @@ public struct CloudFieldFrame {
     float  gateMix;    // how strongly the macro gate applies (the patchiness setting)
     float  cLocal;     // the gate-modulated coverage: below ~0.02 the sky reads as clear
     float2 evolve;     // the field's evolution phase, per layer a different multiple of it (see below)
+    float  stepLen;    // the slab walk's sample spacing; 0 on the plane-crossing consumers, which never walk
 };
 
 // The frame at one lattice position `p` (rebased XZ + exact anchor + drift, before the broaden scaling).
@@ -389,6 +413,10 @@ public CloudFieldFrame cloudFieldFrameAt(WorldPush push, float2 p) {
     // transition width grows with it (both calibrated, see CLOUD_REMAP_* above).
     f.threshold = 1.0 - CLOUD_REMAP_K * pow(f.cLocal, CLOUD_REMAP_GAMMA);
     f.width = max(CLOUD_REMAP_W0 + CLOUD_REMAP_W1 * f.cLocal, 1.0e-3);
+    // The plane-crossing consumers never walk, so their frames carry no step length and the slab
+    // density's finest octave runs at full rate for them; the walk overwrites the lane with its own
+    // sample spacing, which is what the density's LOD reads (see cloudSlabDensity).
+    f.stepLen = 0.0;
     return f;
 }
 
@@ -400,9 +428,16 @@ public float cloudCoverageAt(CloudFieldFrame f, float2 p) {
     float2 q = float2(dot(s, f.dir) / f.cellAlong, dot(s, f.perp) / f.cellCross);
     q += (float2(cloudValueNoise(q * 0.35 + 17.0 + f.evolve),
                  cloudValueNoise(q * 0.35 + 91.0 + f.evolve)) - 0.5) * 1.1;
+    // TWO octaves, not three. The third's cells run a quarter of the base cell across - about 47 blocks at
+    // the shipped 120-block slab, i.e. below the size of a cloud element and below what a sight line that
+    // grazes the layer can carry: a pixel looking 3 degrees up covers a ~108-block footprint of the plane
+    // and the walk steps ~96 blocks there, so that octave arrives as lace and moire rather than as shape,
+    // and it is what turned the deck's lower half into a lid over the horizon. At two octaves the finest
+    // cell is half the base cell, inside the slab's own element scale, and the high-frequency content the
+    // field still needs comes from the two deliberately anisotropic taps below.
     // The cross-wind feathering octave is a stratus device - it feathers the long rims of lanes. A
     // cumulus heap has no long rims to feather, so it fades out with the type dial.
-    float n = cloudFbm(q, 3) - 0.07 * cloudValueNoise(q * 0.25 + 7.0 + f.evolve * 1.7)
+    float n = cloudFbm(q, 2) - 0.07 * cloudValueNoise(q * 0.25 + 7.0 + f.evolve * 1.7)
             - 0.12 * (1.0 - f.cumulus) * cloudValueNoise(q * float2(1.0, 6.0) + 31.0 + f.evolve * 2.3);
     return saturate((n - f.threshold) / f.width);
 }
@@ -448,6 +483,25 @@ public float cloudShadowTransmittance(float3 pos, float3 sunDir) {
     return exp(-tau);
 }
 
+// The colour the pushed illuminance is tinted with, and how far it may be pulled off white. The derived
+// body's colour is normalised to unit LUMINANCE rather than to its brightest channel, so the deck keeps the
+// level the look constant means and only its hue moves: normalising to the brightest channel would dim the
+// deck by the colour's own luminance - 0.42 for a one-degree sun - and a warm deck two stops down reads as
+// brown. Applied at full strength even the luminance-normalised one-degree sunset colour (red at 2.4, blue
+// at 0.12) is an impossible light, and the ACES highlight roll-off turned the deck khaki rather than a
+// sunset, which is why the trim is a constant and not the raw colour. A body that is down derives a zero
+// colour, and that returns zero: no light, whatever the look constant says.
+public static const float CLOUD_LIGHT_TINT = 0.5;
+
+public float3 cloudLightTint(float3 derivedIlluminance) {
+    float lum = dot(derivedIlluminance, float3(0.2126, 0.7152, 0.0722));
+    if (lum <= 1.0e-9) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float3 chroma = derivedIlluminance / lum;
+    return lerp(float3(1.0, 1.0, 1.0), chroma, CLOUD_LIGHT_TINT);
+}
+
 // The planar sheet as sky.rmiss renders it: single scatter of the dominant celestial where the view
 // ray crosses the pushed cloud plane, plus the sky-dome ambient, with the sheet's transmittance out
 // for the caller to attenuate the sky behind it (atmosphere, stars, discs) with. The slab has no
@@ -490,17 +544,20 @@ public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyS
     // ends, so cloudL + 0 x sky approached zero and the far edge read as a black silhouette band.
     float opacity = (1.0 - exp(-tau)) * fade;
     cloudT = 1.0 - opacity;
-    // The dominant celestial, straight from the sky state (the miss shader has no derived
-    // celestialLight): the self-shadow IS this same optical depth at the light's own elevation.
-    // The body must actually be ABOVE the horizon to light the sheet. The pushed illuminance is a
-    // look constant that does not fall to zero when its body sets (the drawn disc only goes dark
-    // because extinction does), so an ungated sun term kept its full 128 klx all night and lit the
-    // clouds like noon. With neither body up the term is exactly zero and only the sky ambient
-    // (dark at night) remains.
-    bool sunUp = state.sunIlluminance > 0.0 && state.sunDir.y > 0.0;
-    bool moonUp = state.moonIlluminance > 0.0 && state.moonDir.y > 0.0;
-    float3 lightDir = sunUp ? state.sunDir : state.moonDir;
-    float lightIll = sunUp ? state.sunIlluminance : (moonUp ? state.moonIlluminance : 0.0);
+    // Which body lights the sheet, and what colour its light arrives in, come from the DERIVED celestial —
+    // the same derivation world.rgen hands the fog, so the sky, the fog and the sheet cannot disagree about
+    // which body is up. Its LEVEL deliberately does not: the atmosphere's transmittance along a
+    // one-degree sun leaves a rounding error, and lighting the deck with that literal left the whole deck
+    // black at an hour when a real one burns. The level stays the pushed look constant, which is what keeps
+    // the deck's brightness on its daytime curve, and what the derived light contributes is a fraction of
+    // its chromaticity (see cloudLightTint). A body that is down arrives at zero transmittance, so its tint
+    // is nothing and the deck darkens by itself — the atmosphere is the horizon gate, with no separate
+    // elevation test needed.
+    CelestialLight light = dominantCelestialLight(state, transmittanceLut);
+    float3 lightDir = light.dir;
+    float lightLevel = dot(lightDir, state.sunDir) >= dot(lightDir, state.moonDir)
+            ? state.sunIlluminance : state.moonIlluminance;
+    float3 lightIll = lightLevel * cloudLightTint(light.illuminance);
     float tauSelf = cov * push.cloud0.w * CLOUD_EXTINCTION * push.cloud0.z / max(lightDir.y, 0.05);
     // Multiple-scatter approximation for the slab's self-shadow. A pure single-scatter sheet darkens a
     // thick deck to ambient-only, which reads as blue-grey daytime clouds and as black cut-outs at night;
@@ -508,11 +565,15 @@ public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyS
     // energy-normalised so an unshadowed sample still reaches exactly 1 — thin edges keep the exact
     // single-scatter value, thick cores keep a lit presence. Phase 5's multi-scatter LUT replaces it.
     float selfT = cloudSelfShadow(tauSelf);
-    float phase = hg(dot(rd, lightDir), CLOUD_G) * 0.7;
-    // The ambient weight is clamped: it is a config lane, and the night this shipped a lane-order
-    // slip fed a growing drift accumulator into it and the sky glowed. A bounded read makes that
-    // class of accident merely wrong instead of blinding.
-    float3 ambient = skyDome(skyViewLut, float3(0.0, 1.0, 0.0), state)
+    float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE * hg(dot(rd, lightDir), CLOUD_G) * 0.7;
+    // The sheet's ambient is the sky's HEMISPHERE irradiance — the same bake the fog and the water read,
+    // evaluated through sky.slang so the three cannot drift apart — and not the radiance of a single
+    // direction. A zenith sample is the coldest, dimmest part of a sunset sky, so a deck hanging under a
+    // bright warm horizon band came out grey. INV_PI turns the cos-weighted integral back into the average
+    // radiance the albedo multiplies. The weight is clamped: it is a config lane, and the night this
+    // shipped a lane-order slip fed a growing drift accumulator into it and the sky glowed. A bounded read
+    // makes that class of accident merely wrong instead of blinding.
+    float3 ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
             * clamp(push.cloudColor.w, 0.0, 2.0);
     return CLOUD_ALBEDO * opacity * (phase * lightIll * selfT + ambient);
 }
@@ -534,6 +595,10 @@ public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyS
 // of a 2D field times a height profile is a layer cake no matter how finely it is walked.
 
 public static const float CLOUD_STEP_MIN = 8.0;        // steps below this alias visibly at the slab's rims
+// Samples the walk spends per slab thickness when the crossing is close to vertical. The vertical
+// profile and the lobe field are resolved at that rate; the pushed step lane is a CEILING the crossing
+// grows into as the perspective thickens it (1/|rd.y|), not a rate every ray must pay.
+public static const float CLOUD_STEPS_PER_THICKNESS = 12.0;
 // How far along a ray the per-ray field frame may be sampled. UNBOUNDED this fans the sky into wedges
 // centred on the camera: a horizon ray crosses the slab kilometres away while an overhead ray crosses it
 // a few hundred blocks up, so each direction reads the wind-direction jitter and the macro gate from a
@@ -560,7 +625,13 @@ public static const float CLOUD_REMAP_W1 = 0.32;
 public static const float CLOUD_LOBE_RATIO = 1.1;      // lobe cell as a fraction of the slab's thickness
 public static const float CLOUD_LOBE_MIN = 24.0;       // blocks; keeps a paper-thin slab from aliasing
 public static const float CLOUD_SHAPE_CONTRAST = 1.8;  // how hard the 3D lobe field drives the boundary
-public static const float CLOUD_EDGE_EROSION = 0.35;   // fine-octave rim erosion (mean-preserving)
+// Rim erosion rides the finest octave in the density - cells of cell/2.6, ~51 blocks at the shipped
+// 120-block slab - so its amplitude is also how much of the far field is drawn by the smallest scale
+// present. At 0.35 that octave dominated the grazing band (the same lace the 2D field's dropped third
+// octave used to contribute) and made the step-count LOD switch that gates it a visible step across the
+// sky. Halved: the rims stay ragged up close, the far field is carried by the lobe field, and the switch
+// moves half as much mass. Mean-preserving either way, so the column's optical depth is untouched.
+public static const float CLOUD_EDGE_EROSION = 0.15;
 public static const float CLOUD_BROADEN = 0.5;         // cumulus planform: sample the 2D field coarser
 public static const float CLOUD_CUMULUS_NORM = 1.3245; // normalises the cumulus shoulder to mean 1
 
@@ -616,8 +687,14 @@ public float cloudSlabDensity(WorldPush push, CloudFieldFrame f, float3 pos) {
     float3 q = float3(dot(w, f.dir), pos.y, dot(w, f.perp)) / cell;
     q.xz += f.evolve * 0.25;                         // the billows churn inside the envelope
     float lobe = cloudFbm3(q, 2);                    // large billows, mean 0.5
-    float detail = cloudFbm3(q * 2.6 + float3(47.0, 11.0, 29.0)
-            + float3(f.evolve, 0.0) * 0.55, 1);      // rims, mean 0.5, scaled with q
+    // The rim octave's cells run cell/2.6 across, so once the walk's step is past half that the octave
+    // is sub-step and only aliasing. Holding its mean 0.5 leaves the erosion factor at exactly 1, so
+    // the LOD costs taps and never mass: the column's optical depth is unchanged.
+    float detail = 0.5;
+    if (f.stepLen <= cell * (1.0 / (2.0 * 2.6))) {
+        detail = cloudFbm3(q * 2.6 + float3(47.0, 11.0, 29.0)
+                + float3(f.evolve, 0.0) * 0.55, 1);      // rims, mean 0.5, scaled with q
+    }
     float contrast = 1.0 + CLOUD_SHAPE_CONTRAST * (lobe * 2.0 - 1.0);
     contrast *= 1.0 - CLOUD_EDGE_EROSION + 2.0 * CLOUD_EDGE_EROSION * detail;
     return saturate(cov * contrast) * cloudHeightProfile(h, f.cumulus) * push.cloud0.w;
@@ -654,18 +731,29 @@ public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, Sky
         return float3(0.0, 0.0, 0.0);
     }
 
-    bool sunUp = state.sunIlluminance > 0.0 && state.sunDir.y > 0.0;
-    bool moonUp = state.moonIlluminance > 0.0 && state.moonDir.y > 0.0;
-    float3 lightDir = sunUp ? state.sunDir : state.moonDir;
-    float lightIll = sunUp ? state.sunIlluminance : (moonUp ? state.moonIlluminance : 0.0);
+    // The same body selection and the same tinted-level rule as the sheet, so the tier toggle cannot change
+    // the light the deck is drawn under.
+    CelestialLight light = dominantCelestialLight(state, transmittanceLut);
+    float3 lightDir = light.dir;
+    float lightLevel = dot(lightDir, state.sunDir) >= dot(lightDir, state.moonDir)
+            ? state.sunIlluminance : state.moonIlluminance;
+    float3 lightIll = lightLevel * cloudLightTint(light.illuminance);
     float cosTheta = dot(rd, lightDir);
     // Beer-Powder along the plan's formula: 2/(1 + exp(-2 cos)) is 1 side-on and swells toward 2 when
     // the view runs with the light, which is what makes a back-lit rim read as a lit rim.
-    float phase = hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));
-    float3 ambient = skyDome(skyViewLut, float3(0.0, 1.0, 0.0), state)
+    float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE
+            * hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));
+    float3 ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
             * clamp(push.cloudColor.w, 0.0, 2.0);
 
     float steps = clamp(push.volumeParams.w, CLOUD_STEP_MIN, 96.0);
+    // The budget scales with the crossing: an overhead sight line crosses the slab's own thickness,
+    // and CLOUD_STEPS_PER_THICKNESS samples resolve what the walk exists for (the vertical profile and
+    // the light gradient). Spending the full pushed lane there would only sample noise cells the step
+    // was already wider than, so the lane is a ceiling the crossing grows into as the perspective
+    // thickens it — grazing rays pay it, vertical ones pay the floor.
+    steps = clamp(ceil((t1 - t0) / max(thickness / CLOUD_STEPS_PER_THICKNESS, 1.0)),
+            CLOUD_STEP_MIN, steps);
     float dt = (t1 - t0) / steps;
     float jitter = frac(interleaveGradientNoise(pix)
             + float(push.frameIndex) * 0.6180339887);
@@ -676,6 +764,8 @@ public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, Sky
     CloudFieldFrame frame = cloudFieldFrameAt(push,
             ro.xz + rd.xz * min(0.5 * (t0 + t1), CLOUD_FRAME_DIST)
             + push.cloud2.xy + push.cloud2.zw);
+    // The walk's sample spacing rides the frame so the density can LOD its finest octave against it.
+    frame.stepLen = dt;
     // A coverage this close to zero leaves at most a hair of cloud anywhere in the crossing (the
     // threshold it implies is past the field's reach), so the walk is skipped rather than paying the
     // per-sample field to discover that 24 times.
@@ -703,8 +793,10 @@ public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, Sky
             // viewer mostly sees of a deck is its BASE, where the direct sun is gone and the brightness
             // comes from light that has bounced many times inside the cloud. Occluding the sky by the
             // same column the sun sees crushed the base to a dark sheet and the whole deck read as thin
-            // — the opposite of the dense mass a cumulus should look like from underneath.
-            float ambT = cloudSelfShadow(tauUp * 0.25);
+            // — the opposite of the dense mass a cumulus should look like from underneath. That softening
+            // is CLOUD_AMBIENT_OCCLUSION, and it is also the only term that can light a base at all: the
+            // phase term there is two orders down on the body's own, so this weight IS the base's level.
+            float ambT = cloudSelfShadow(tauUp * CLOUD_AMBIENT_OCCLUSION);
             float3 scatter = CLOUD_ALBEDO * (phase * lightIll * sunT + ambient * ambT);
             L += T * (1.0 - cellT) * scatter;
             T *= cellT;
@@ -782,19 +874,40 @@ public float fogDensityAt(WorldPush push, float y) {
 // ---- Marched tier: heterogeneous fog with per-sample occlusion --------------------------------------
 //
 // The quality tier Phase 2 adds: uniform stepping over the segment with a pixel-fixed blue-noise
-// jitter, FBM-modulated density, and one geometric shadow ray per sample toward the dominant celestial
-// body. Where the analytic tier culls the fog from shadow with a per-segment probe mean, here every
-// sample carries its own visibility: it gates that sample's sun term AND thins its density (down to
-// fogShadowFloor()), so shafts and shadow volumes come out of the same estimator instead of two.
+// jitter and FBM-modulated density. Every sample's measured visibility gates that sample's sun term
+// and nothing else: the density stays the pushed profile, so the transmittance the caller attenuates
+// with is a property of the air rather than of where the sun happens to reach. Only light is culled.
+// The visibility itself is measured at the stratum budget below rather than traced once per sample.
 //
 // Convergence: with noise amplitude 0 and the shadow switch off every sample sees the plain analytic
 // profile, and the midpoint-quadrature integral converges to the closed form as the step count rises —
 // VolumeFogTest pins that numerically, 8/16/32/64 steps against fogOpticalDepth.
 //
-// Cost: steps density evals + up to steps shadow rays per segment per pixel. The early-outs matter:
-// samples past negligible transmittance stop the march, and shadow rays fire only where the medium is
-// non-zero. volumeParams.z (max integration distance) stays reserved — truncating the integral would
-// desynchronise the out fogT from the throughput attenuation, which must agree.
+// Cost: the march covers only the segment's stretch inside the medium's significant band (see the span
+// clamp below), spending steps density evals there, and the shadow probes ride a stratum budget — at
+// most FOG_MARCH_PROBE_STRATA geometry shadow rays and cloud-shadow field evaluations per segment,
+// wherever in the band the non-empty samples land. The early-outs matter: a segment entirely above the
+// band returns without marching, samples past negligible transmittance stop the march, and the probes
+// fire only where the medium is non-zero. volumeParams.z (max integration distance) stays reserved —
+// truncating the integral would desynchronise the out fogT from the throughput attenuation, which must
+// agree.
+public static const float FOG_SPAN_TAU = 2.0e-3;      // bound on the optical depth the span clamp excludes
+public static const int FOG_MARCH_PROBE_STRATA = 8;   // shadow-probe budget per marched segment
+
+// The radiance a fog sample scatters toward the eye from the sky: the SKY ALONG THE VIEW RAY itself,
+// not the hemisphere's average irradiance. This is the term that decides whether a thick fog reads as
+// air or as a dark wall, because the in-scatter converges to `albedo * fogSkyRadiance(rd)` as the
+// transmittance falls. Sampling the same radiance the miss shader would have returned is what makes a
+// fully opaque fog dissolve into the sky it hides; the hemisphere average cannot do that — a sunset's
+// energy sits in a few degrees above the horizon while the average is dominated by the cold upper dome,
+// so a fog bank built on it reads several stops darker than the sky behind it at exactly the elevation
+// where the eye compares the two. Below-horizon rays mirror to their horizon elevation for the reason
+// world.rmiss mirrors an escaping ray: the view LUT's lower half is the space floor, and air seen
+// downward is haze, not space.
+public float3 fogSkyRadiance(float3 rd) {
+    SkyState state = skyState(worldPush);
+    return skyDiffuseRadiance(skyViewLut, float3(rd.x, abs(rd.y), rd.z), state);
+}
 
 public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 pix,
                                          bool shadowAllowed, out float fogT) {
@@ -804,13 +917,52 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
     if (sigma0 <= 0.0 || dot(albedo, float3(1.0, 1.0, 1.0)) == 0.0 || t <= RAY_TMIN) {
         return float3(0.0, 0.0, 0.0);
     }
+    // The significant band. The density is a function of height alone and is bounded by the analytic
+    // profile times the noise's largest multiplier, so above
+    //     yTop = baseY + H * ln(sigma0 * (1 + |amp|) / eps),  eps = FOG_SPAN_TAU / t,
+    // every block of path carries less than eps of density: the excluded stretch's optical depth — and
+    // with it the error in both the returned transmittance and the skipped in-scatter — is bounded by
+    // FOG_SPAN_TAU whatever the geometry, orders below anything the estimator can resolve. The march
+    // covers only the segment's stretch at or below yTop: a segment entirely above returns without
+    // marching, and one crossing the height concentrates its whole step budget on the density that can
+    // actually read instead of striding the empty tail above the fog.
+    float peak = sigma0 * (1.0 + abs(worldPush.fog1.z));
+    float eps = FOG_SPAN_TAU / t;
+    if (peak <= eps) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float yTop = worldPush.fog0.z + max(worldPush.fog0.y, 1.0e-4) * log(peak / eps);
+    // The spray band is a second density source at its own height; while it is live its top joins the
+    // significant range. Conservatively the span then also covers the fog-free stretch between band
+    // and fog top — a few wasted steps, never a wrong one.
+    if ((worldPush.flags & WORLD_FLAG_SPRAY) != 0u) {
+        yTop = max(yTop, worldPush.water1.w + max(worldPush.water1.z, 0.05));
+    }
+    float yEnd = ro.y + rd.y * t;
+    if (min(ro.y, yEnd) > yTop) {
+        return float3(0.0, 0.0, 0.0); // the whole segment sits above the medium
+    }
+    float t0 = 0.0;
+    float t1 = t;
+    if (max(ro.y, yEnd) > yTop && abs(rd.y) > 1.0e-6) {
+        float tTop = clamp((yTop - ro.y) / rd.y, 0.0, t);
+        if (rd.y > 0.0) {
+            t1 = tTop;
+        } else {
+            t0 = tTop;
+        }
+    }
+    if (t1 <= t0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
     int steps = int(clamp(worldPush.volumeParams.x, 1.0, 64.0));
     float jitterStrength = clamp(worldPush.volumeParams.y, 0.0, 1.0);
     bool shadow = shadowAllowed
             && (worldPush.flags & WORLD_FLAG_VOLUME_SHADOW) != 0u
             && celestialLight.halfAngle > 0.0;
 
-    float dt = t / float(steps);
+    float dt = (t1 - t0) / float(steps);
     // Pixel-fixed interleave gradient with the golden-ratio frame walk — the analytic tier's exact
     // doctrine: a per-frame re-roll is a signal the denoiser cannot accumulate, while this pattern
     // dithers step edges into a stable grain the reconstruct averages out.
@@ -818,24 +970,46 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
             + float(worldPush.frameIndex) * 0.6180339887) - 0.5) * jitterStrength;
 
     float phase = hg(dot(rd, celestialLight.dir), worldPush.fog0.w) * 0.7;
-    float3 ambient = worldPush.fogColor.w * skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0))
-            * INV_PI;
+    float3 ambient = worldPush.fogColor.w * fogSkyRadiance(rd);
     float3 sunDir = celestialLight.dir;
 
     float3 L = float3(0.0, 0.0, 0.0);
     float tau = 0.0;
+    // The probes ride a stratum budget: the marched samples split into FOG_MARCH_PROBE_STRATA equal
+    // ranges, and each stratum's first non-empty sample fires the geometry shadow ray and the
+    // cloud-shadow field evaluation once, with the whole stratum reusing both. A stratum spans
+    // steps/FOG_MARCH_PROBE_STRATA samples, so shadow-volume edges quantise at that scale per frame —
+    // the pixel-fixed jitter walks the sample positions inside the strata, and the reconstruct resolves
+    // the quantisation the same way it resolves the step dither. At or below the stratum count every
+    // sample probes, which is the short-segment case where per-sample resolution actually reads.
+    int lastStratum = -1;
+    bool probeValid = false;
+    float stratumVis = 1.0;
+    float stratumCloud = 1.0;
     for (int i = 0; i < steps; i++) {
-        float tMid = (float(i) + u) * dt;
+        int stratum = (i * FOG_MARCH_PROBE_STRATA) / steps;
+        if (stratum != lastStratum) {
+            lastStratum = stratum;
+            probeValid = false;
+        }
+        float tMid = t0 + (float(i) + u) * dt;
         float3 p = ro + rd * tMid;
         float sigma = fogMarchDensity(worldPush, p);
         float vis = 1.0;
-        if (shadow && sigma > 0.0) {
-            vis = luminance(visibility(p, sunDir, 10000.0).transmittance);
+        if (sigma > 0.0) {
+            if (!probeValid) {
+                stratumVis = shadow ? luminance(visibility(p, sunDir, 10000.0).transmittance) : 1.0;
+                stratumCloud = cloudShadowTransmittance(p, sunDir);
+                probeValid = true;
+            }
+            vis = stratumVis;
         }
-        // The shadow-culled medium, per sample: shadowed fog keeps fogShadowFloor() of its density,
-        // exactly the doctrine the analytic tier settled on. Transmittance and both lighting terms
-        // ride the culled density, so a shadowed stretch reads as thin clear air.
-        float sigmaEff = sigma * max(vis, fogShadowFloor());
+        // The medium is the density profile; the visibility gates the sun term below. Thinning the
+        // density instead would make the fog's opacity a function of a probe estimate — a
+        // per-frame-walking, stochastic signal a temporal reconstruct cannot accumulate, and one that
+        // deletes the medium wherever the sun is occluded (the air over the sea reading as a dark band
+        // while the sky-facing segment, which traces no probes, kept its full density).
+        float sigmaEff = sigma;
         if (sigmaEff <= 0.0) {
             continue;
         }
@@ -845,16 +1019,19 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
             break;
         }
         float3 sunTerm = float3(0.0, 0.0, 0.0);
-        if (vis > 0.0) {
-            // Toward-sun transmittance: the analytic profile at the sample's culled density — the
-            // noise modulation of the sun leg is deliberately not marched (a second full march per
-            // sample for a second-order softening of the shafts is not a trade this tier makes).
-            // The cloud shadow rides on top: the same field the sheet renders and the ground NEE
-            // reads, so a clouded sun thins the shafts instead of lighting them.
-            float sunFogT = fogTransmittance(sigma0 * max(vis, fogShadowFloor()),
-                    worldPush.fog0.z, worldPush.fog0.y, p.y, sunDir.y, 10000.0);
+        // The floor rides the sun term, not the medium: a fully shaded stratum keeps this fraction of
+        // its direct light, which softens the fog's shadow edges instead of making the air vanish in them.
+        float sunVis = max(vis, fogShadowFloor());
+        if (sunVis > 0.0) {
+            // Toward-sun transmittance: the analytic profile — the noise modulation of the sun leg is
+            // deliberately not marched (a second full march per sample for a second-order softening of
+            // the shafts is not a trade this tier makes). The cloud shadow rides on top: the same field
+            // the sheet renders and the ground NEE reads, so a clouded sun thins the shafts instead of
+            // lighting them.
+            float sunFogT = fogTransmittance(sigma0, worldPush.fog0.z, worldPush.fog0.y,
+                    p.y, sunDir.y, 10000.0);
             sunTerm = phase * celestialLight.illuminance
-                    * (vis * sunFogT * cloudShadowTransmittance(p, sunDir));
+                    * (sunVis * sunFogT * stratumCloud);
         }
         L += tMid_transmittance * (albedo * sigmaEff) * (sunTerm + ambient) * dt;
         tau += sigmaEff * dt;
@@ -863,111 +1040,34 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
     return L;
 }
 
-// ---- Water medium's own in-scatter (the underwater light shafts) -------------------------------------
+// ---- The water column ------------------------------------------------------------------------------
 //
-// Average transmission of the water surface for downward sky irradiance (Fresnel reflection at
-// near-normal incidence plus a grazing concession) — the constant factor the ambient term pays to
-// enter the water. Deliberately a constant, not a per-sample Fresnel: the sky ambient is diffuse,
-// so a single directional factor is the honest resolution available at this budget.
-public static const float WATER_AMBIENT_SURFACE = 0.92;
-
-// Single scatter over one path segment INSIDE the water stack medium. The water is a constant medium
-// over the segment, so the identity integral the analytic fog leans on holds exactly:
+// The column used to carry two volumetric terms of its own, both driven by `composite.water-turbidity`:
+// a sky-lit ambient that gave it body, and a single-probe sun leg. Together they were the milky water —
+// a depth-attenuated wash with no structure and no shafts — and both are gone. What the column has now
+// is the same structure-gated shaft layer the air uses, on the medium pushed in `waterShaft`: its own
+// extinction decides how far the layer is worth integrating, its ceiling caps the forward lobe so the
+// surface you look up at cannot go white, and the gate draws the beams out of the shadow structure.
 //
-//     L = (sigmaS/sigmaT) * (1 - T(t)) * light
-//
-// with T = exp(-sigmaT * t) in the GREY mean of the per-channel extinction — the throughput itself
-// keeps attenuating per-channel (the caller's existing Beer-Lambert line, untouched), the in-scatter
-// integral just refuses to become per-channel-vector radiance weights for a term that is second-order
-// here. sigmaS/sigmaT IS the pushed turbidity by construction (waterScattering), so no re-derivation.
-//
-// The ambient light field DECAYS WITH DEPTH — the fix for the "white surface from below" blowout: sky
-// irradiance reaches a sample only after crossing the water above it, so ambient(p) = A ·
-// exp(-sigmaT · depth(p)). Fog never needed this (its column sits under open sky), but water saturates
-// the single-scatter integral within a few blocks of opacity-scaled extinction, and without the decay
-// every upward view degenerated to a depth-independent milk veil at ~turbidity × sky brightness. The
-// surface is the pushed sea-level plane (water1.w) — exact for oceans; for elevated water the depth
-// clamps at zero and the term degrades to the un-attenuated form rather than inventing light. The
-// product T(s)·exp(-sigmaT·depth(s)) is still an exponential, so the integral stays closed form:
-//
-//     L_amb = sigmaS · A · exp(-sigmaT·d0) · (1 - exp(-sigmaT·t·(1-rd.y))) / (sigmaT·(1-rd.y))
-//
-// with d0 the segment start's depth below the plane; the rd.y → 1 (straight-up) limit is t, where the
-// along-path and depth attenuations exactly cancel and the integral is bounded by the surface hit.
-//
-// Sun leg: one shadow-ray probe at the segment midpoint — the fog tier's per-path budget (the
-// indirect pass gates the call to the walk's first water segment; the primary pass covers the
-// camera's own underwater stretch).
-// visibility() already crosses the waved surface as an any-hit (tinting the transmittance and
-// reporting the exit distance as waterHitT); on top of that the leg picks up (a) the water's own
-// Beer-Lambert over the underwater stretch of the sun ray and (b) the wave-refraction caustic at the
-// exit point, the same term the underwater terrain NEE applies, so shafts and caustic light pools
-// come from one wave field. The caustic clamp (CAUSTIC_MAX) bounds the term: every factor here is
-// <= 1 except the clamped focus, so the integrator cannot produce fireflies the surface NEE didn't
-// already have.
-//
-// With the shadow switch off there is no probe and hence no surface-exit distance; the sun term is
-// skipped rather than estimated from a guessed depth — the ambient term alone keeps the water lit.
-// Gating is turbidity > 0 && medium.water && extinction > 0 (the callers check the medium); zero
-// turbidity never reaches here, preserving the volume block's zero-when-off invariant.
-public float3 waterSegmentInScatter(float3 ro, float3 rd, float t, float2 pix, Medium medium) {
-    float sigmaT = (medium.extinction.r + medium.extinction.g + medium.extinction.b) / 3.0;
-    float sigmaS = (medium.scattering.r + medium.scattering.g + medium.scattering.b) / 3.0;
-    if (sigmaT <= 0.0 || sigmaS <= 0.0 || t <= RAY_TMIN) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    float3 ambient = worldPush.fogColor.w * skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0))
-            * INV_PI * WATER_AMBIENT_SURFACE;
-    float scatterWeight = 1.0 - exp(-sigmaT * t);
-    // Depth-attenuated ambient integral (see the derivation in the header): d0 is the segment start's
-    // depth below the pushed plane, and the upCos limit handles the straight-up cancellation.
-    float d0 = max(worldPush.water1.w - ro.y, 0.0);
-    float upCos = 1.0 - rd.y;
-    float ambIntegral;
-    if (upCos < 1.0e-4) {
-        ambIntegral = t * exp(-sigmaT * d0);
-    } else {
-        ambIntegral = exp(-sigmaT * d0) * (1.0 - exp(-sigmaT * t * upCos)) / (sigmaT * upCos);
-    }
-    float3 sunPart = float3(0.0, 0.0, 0.0);
-    bool shadow = (worldPush.flags & WORLD_FLAG_VOLUME_SHADOW) != 0u
-            && celestialLight.halfAngle > 0.0;
-    if (shadow) {
-        float3 p = ro + rd * (t * 0.5);
-        VisibilityResult probe = visibility(p, celestialLight.dir, 10000.0);
-        float vis = luminance(probe.transmittance);
-        if (vis > 0.0) {
-            // Underwater stretch of the sun ray: exp over the grey sigma up to the surface crossing.
-            float legT = 1.0;
-            if (probe.waterHitT > 0.0) {
-                legT = exp(-sigmaT * probe.waterHitT);
-                if ((worldPush.flags & 16u) != 0u) { // the water-waves toggle's flag bit
-                    vis *= waterCaustic(p + celestialLight.dir * probe.waterHitT,
-                            celestialLight.dir, probe.waterHitT);
-                }
-            }
-            // The same 70%-energy HG scaling doctrine as the fog's sun term, plus the cloud shadow
-            // the underwater sun leg crosses above the surface — the same field the fog tiers read,
-            // so overcast water loses its shafts with everything else.
-            float phase = hg(dot(rd, celestialLight.dir), medium.phaseG) * 0.7;
-            sunPart = phase * celestialLight.illuminance
-                    * (vis * legT * cloudShadowTransmittance(p, celestialLight.dir));
-        }
-    }
-    return (sigmaS / sigmaT) * scatterWeight * sunPart + sigmaS * ambIntegral * ambient;
-}
+// The body's absorption (`composite.water-opacity`) is untouched: it lives in the surface-radiance path
+// (`medium.extinction`), not in this term, so water still darkens with depth exactly as it did.
 
 // ---- Segment-level lighting assembly ---------------------------------------------------------------
 //
-// The analytic fog tier's single-scatter over one path segment, with the fog CULLED FROM SHADOW:
-// the medium only exists where the dominant celestial body reaches it. The segment's effective
-// density is sigma0 scaled by the mean sun visibility of FOG_SUN_BANDS probes placed at equal
-// in-scatter-weight depths on the unthinned field (bisection on the closed form; the probe grid is
-// pixel-fixed, IGN jitter walking a golden-ratio sequence across frames, so the reconstruct resolves
-// the culled shadow-volume edges into smooth gradients even with a static camera). A sealed room or
-// the shadow side of a hill holds no fog at all — clear air, recovered transmittance — while lit fog
-// keeps its full physical in-scatter, shafts included. The visibility probes ride the UNTHINNED
-// field: what they measure is geometry's occlusion, not the culled medium's.
+// The analytic fog tier's single-scatter over one path segment. The MEDIUM is the height profile alone:
+// density and transmittance must not depend on where the sun happens to reach. Tying them to visibility
+// makes the fog's opacity a function of a four-probe estimate — a stochastic, per-frame-walking signal
+// no temporal reconstruct can accumulate, and one that deletes the medium wherever the probes land in
+// shadow. That is what turned the air over the sea into a dark band while the sky-facing segment, which
+// traces no probes at all, kept its full density: the two halves of the horizon were integrating
+// different media.
+//
+// Visibility therefore gates LIGHT, not matter. FOG_SUN_BANDS probes placed at equal in-scatter-weight
+// depths (bisection on the closed form; pixel-fixed IGN jitter walked by a golden-ratio sequence, so the
+// reconstruct resolves their quantisation) each contribute their own measured visibility to their own
+// stratum's direct term, and a stratum the sun does not reach contributes none of it. The sky ambient is
+// not gated at all — shadowed air still scatters sky light, which is what makes a backlit valley read as
+// blue haze instead of as clear air.
 //
 // Writes the segment's fog transmittance so the caller attenuates throughput with the same quantity
 // the in-scatter used. `celestialLight` (world_core) must have been derived for this frame and
@@ -975,13 +1075,10 @@ public float3 waterSegmentInScatter(float3 ro, float3 rd, float t, float2 pix, M
 // it only when they actually call this.
 public static const int FOG_SUN_BANDS = 4;
 
-// Density fraction fully shadowed fog keeps — a live slider (volume.fog-shadow-floor) riding the
-// reserved fog1.w lane, no longer a compile-time constant. History: a hard cull to zero read as
-// sterile (shadow volumes lost every depth cue and their edges snapped hard against the lit medium);
-// the first floor (25%) kept too much milk in sealed rooms, so the default now holds only a whisper
-// of aerial perspective in shadow. 0 reproduces the hard cull, 0.95 saturates toward no culling at
-// all. The per-stratum sun in-scatter is NOT floored — direct sun through a shadowed stratum stays
-// zero, so the floor feeds the ambient glow and the transmittance only.
+// Direct-sun fraction a fully shaded stratum keeps — the live slider volume.fog-shadow-floor riding
+// fog1.w. A lighting control, never a density one: the medium is the same everywhere, so the slider
+// decides how hard the fog's shadow edges read (0 = direct sun fully culled inside shadow, 0.95 = the
+// sun reaches almost everywhere) without changing how much air the ray crosses.
 public float fogShadowFloor() {
     return clamp(worldPush.fog1.w, 0.0, 0.95);
 }
@@ -1030,10 +1127,18 @@ public float fogT_toSunRo(float3 ro, float3 sunDir, float sigma) {
 public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
                                   bool allowShadowCull, out float fogT) {
     // Tier dispatch: the march flag routes the whole segment to the heterogeneous integrator, which
-    // reuses the same shadow switch, phase, ambient and culling doctrine. `allowShadowCull` keeps its
+    // reuses the same shadow switch, phase, ambient and lighting doctrine. `allowShadowCull` keeps its
     // meaning — the sky-facing miss segment passes false and its march runs without shadow rays, the
     // same cost gate the analytic tier's probes honour.
-    if ((worldPush.flags & WORLD_FLAG_VOLUME_MARCH) != 0u && worldPush.volumeParams.x >= 1.0) {
+    //
+    // The march tier exists to resolve a heterogeneous FIELD: the density noise and the spray band.
+    // With both off it integrates exactly the profile the closed form already owns, so every step it
+    // spends buys nothing but the jitter of its own quadrature — a per-frame signal the reconstruct
+    // cannot accumulate, on a frame that has no field to resolve. Take the closed form then; the flag
+    // stays the tier selector for frames that actually carry one.
+    bool heterogeneous = worldPush.fog1.z > 0.0 || (worldPush.flags & WORLD_FLAG_SPRAY) != 0u;
+    if ((worldPush.flags & WORLD_FLAG_VOLUME_MARCH) != 0u && worldPush.volumeParams.x >= 1.0
+            && heterogeneous) {
         return fogSegmentInScatterMarched(ro, rd, t, pix, allowShadowCull, fogT);
     }
     float sigma0 = worldPush.fog0.x;
@@ -1047,12 +1152,11 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
             && (worldPush.flags & WORLD_FLAG_VOLUME_SHADOW) != 0u
             && celestialLight.halfAngle > 0.0;
 
-    // One shadow probe per equal-weight stratum, placed on the physical (unthinned) field with a
-    // pixel-fixed, frame-walking jitter. Their mean is the segment's lit fraction — the culling
-    // factor for the medium itself. Per-stratum visibilities are kept for the sun term below.
+    // One shadow probe per equal-weight stratum, placed on the field with a pixel-fixed,
+    // frame-walking jitter. Each sample's visibility is kept for its own stratum's sun term; nothing
+    // here touches the medium, so the transmittance below is a property of the air alone.
     float vis[FOG_SUN_BANDS];
     float stratumDepth[FOG_SUN_BANDS];
-    float visBar = 1.0;
     float noise = frac(interleaveGradientNoise(pix)
             + float(worldPush.frameIndex) * 0.6180339887);
     for (int k = 0; k < FOG_SUN_BANDS; k++) {
@@ -1063,31 +1167,27 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
         float scatterWeightFull = 1.0 - fogTransmittance(sigma0, worldPush.fog0.z,
                 worldPush.fog0.y, ro.y, rd.y, t);
         if (scatterWeightFull > 1.0e-4) {
-            visBar = 0.0;
             for (int k = 0; k < FOG_SUN_BANDS; k++) {
                 float stratumStart = scatterWeightFull * (float(k) + noise) / float(FOG_SUN_BANDS);
                 stratumDepth[k] = fogDepthAtWeight(sigma0, worldPush.fog0.z, worldPush.fog0.y,
                         ro.y, rd.y, t, stratumStart + scatterWeightFull * 0.5 / float(FOG_SUN_BANDS));
                 vis[k] = luminance(visibility(ro + rd * stratumDepth[k], celestialLight.dir,
                         10000.0).transmittance);
-                visBar += vis[k];
             }
-            visBar /= float(FOG_SUN_BANDS);
         }
     }
 
-    // The culled medium: fog thins with shadow down to the floor. Transmittance, the sun strata and
-    // the ambient all ride this density, so a shadowed stretch reads as thin clear air rather than
-    // a dark veil or a vacuum.
-    float sigma = sigma0 * max(visBar, fogShadowFloor());
+    // The medium: the height profile, unmodulated by light. `fogT` is what the caller attenuates its
+    // throughput with, so it has to be the same quantity every frame for a given ray — a visibility-
+    // scaled sigma made it a per-pixel lottery and let a shadowed stretch read as clear air.
+    float sigma = sigma0;
     fogT = fogTransmittance(sigma, worldPush.fog0.z, worldPush.fog0.y, ro.y, rd.y, t);
     float scatterWeight = 1.0 - fogT;
     // HG lobe scaled to 70% energy: a pure forward lobe blows out when the view aligns with the
     // sun down a bright shaft. No isotropic floor — a floor at side/back angles reads as a uniform
     // milk wash, and the strata probes already light the lit medium geometrically.
     float phase = hg(dot(rd, celestialLight.dir), worldPush.fog0.w) * 0.7;
-    float3 ambient = worldPush.fogColor.w * skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0))
-            * INV_PI;
+    float3 ambient = worldPush.fogColor.w * fogSkyRadiance(rd);
     float3 sunPart = float3(0.0, 0.0, 0.0);
     if (!shadowCull) {
         // Unshadowed sun term: the closed form with V = 1 everywhere, sun transmittance taken at
@@ -1097,18 +1197,178 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
                 * fogT_toSunRo(ro, celestialLight.dir, sigma)
                 * cloudShadowTransmittance(ro, celestialLight.dir));
     } else if (scatterWeight > 1.0e-4) {
-        // Per-stratum sun in-scatter: the stratum's share of the culled medium times its own
-        // measured visibility times the closed-form fog transmittance from its probe toward the
-        // sun. Strata whose probe landed in shadow contribute nothing — that IS the culling. The
-        // cloud shadow multiplies the same field every other sun leg reads.
+        // Per-stratum sun in-scatter: the stratum's share of the medium times its own measured
+        // visibility times the closed-form fog transmittance from its probe toward the sun. Strata
+        // whose probe landed in shadow contribute none of it — that IS the culling, and it is light
+        // only. The cloud shadow multiplies the same field every other sun leg reads.
         float stratumWeight = scatterWeight / float(FOG_SUN_BANDS);
         for (int k = 0; k < FOG_SUN_BANDS; k++) {
             float3 probe = ro + rd * stratumDepth[k];
             float sunFogT = fogTransmittance(sigma, worldPush.fog0.z, worldPush.fog0.y,
                     probe.y, celestialLight.dir.y, 10000.0);
-            sunPart += phase * celestialLight.illuminance * (stratumWeight * vis[k] * sunFogT
+            float sunVis = max(vis[k], fogShadowFloor());
+            sunPart += phase * celestialLight.illuminance * (stratumWeight * sunVis * sunFogT
                     * cloudShadowTransmittance(probe, celestialLight.dir));
         }
     }
     return albedo * (sunPart + scatterWeight * ambient);
+}
+
+// ---- Sun shafts: one integrator for the air and for the water --------------------------------------
+//
+// Airlight: the sun's beams made visible by the medium itself, with no height fog involved. The two are
+// separate media on purpose. The fog's transmittance is what makes a scene hazy, so god rays that
+// "need fog" always arrive with a veil; a shaft medium adds light and attenuates nothing, which is the
+// only way to have beams in clear air. The same integrator runs underwater, where the medium is the
+// water body's own scattering instead of the pushed air density.
+//
+// The integral is the segment's single scatter over a uniform medium,
+//
+//     L = structure * strength * phase * E * ∫_0^min(t, reach) sigma*exp(-sigma*s) * V(s) * cloudShadow(s) ds
+//
+// split into SHAFT_STRATA strata of equal in-scatter weight, so the strata follow the medium's own
+// e-folding instead of even spacing: air (sigma ~ 1e-3) puts them almost uniformly along the reach,
+// while water (sigma ~ 0.1-0.5) packs them into the few blocks the light actually crosses. A point-
+// sampled sun visibility V sits inside each stratum. There is no ambient term: sky light scattered
+// toward the eye is not a beam, and adding it would only lift the shade the beams have to contrast
+// with. The water column has no ambient of its own any more; see the section at the end.
+//
+// `structure` is what makes this read as a Tyndall beam instead of as fog. A path that never leaves the
+// light scatters uniformly along its whole length, and that smooth lift — added to every sunlit wall,
+// every open field, the sky-facing half of every room — is indistinguishable from a mist veil. It is
+// also the one part of this integral the sky LUT already renders as the atmosphere's own in-scatter.
+// So the term is faded out by the lit fraction of the path: fully-lit air contributes nothing, air that
+// straddles a shadow boundary contributes in full, and half-lit air keeps half. What survives is exactly the shadow structure the
+// eye reads as a shaft, which is also why the beams are only drawn where the sun is occluded somewhere
+// along the line of sight — the physical reason they are visible at all.
+//
+// The trade is deliberate: a camera that sits inside a beam and looks along it sees no lift from that
+// beam, because along such a path every probe is lit and there is no edge to see. That is the same
+// bargain every screen-space god-ray effect makes, and the alternative — a veil over the whole frame —
+// is what this gate exists to remove.
+//
+// V is the same ray-traced sun visibility the terrain NEE uses, sampled once per stratum and jittered
+// by the pixel-fixed interleave hash walked by the golden-ratio frame index — the doctrine the fog's
+// strata follow, so the temporal reconstruct resolves the probe positions into continuous shadow
+// volumes instead of a per-frame re-roll it cannot accumulate. The stratum count is higher than the
+// fog's four because the lit fraction needs enough samples to place the shadow boundary: at four, the
+// gate quantises in quarters and the beam edges step.
+//
+// Callers integrate only the stretch in front of geometry — never a sky miss. The sky LUT already
+// carries the atmosphere's own in-scatter, so airlight along a ray that escapes to the sky would count
+// that scattering twice and read as an aureole around the sun rather than as a beam.
+public static const int SHAFT_STRATA = 8;
+
+// The fog's own HG energy scaling, so a footer and a beam lit by the same sun agree in level.
+public static const float SHAFT_PHASE_ENERGY = 0.7;
+
+// Underwater the term is shaped differently from the air one, for two reasons that only exist in water.
+// Its forward lobe has to be CAPPED (`waterShaft.y`, volume.water-shaft-fill): a long grazing path to
+// the surface plus the peak of the lobe is an order of magnitude over the water it sits in front of, and
+// the surface you look up at goes white. And its gate keeps a floor (`WATER_SHAFT_STRUCTURE_FLOOR`),
+// because the gate alone peaks in a band a few pixels wide when the occluder is a bank or a tree, which
+// reads as no shafts at all rather than as shafts.
+public static const float WATER_SHAFT_STRUCTURE_FLOOR = 0.45;
+
+// Depth at which the medium's cumulative in-scatter weight reaches k/SHAFT_STRATA of the stretch's
+// total: the inverse of exp(-sigma*s). Equal weight per stratum is what keeps a dense medium sampling
+// the blocks the light actually crosses, and it degenerates to even spacing in the thin limit, which is
+// exactly where the air medium sits.
+public float shaftDepthAtWeight(float sigma, float reach, int k) {
+    if (k <= 0) {
+        return 0.0;
+    }
+    if (k >= SHAFT_STRATA) {
+        return reach;
+    }
+    float total = 1.0 - exp(-sigma * reach);
+    float weight = float(k) * total / float(SHAFT_STRATA);
+    return -log(max(1.0 - weight, 1.0e-6)) / sigma;
+}
+
+// `sigma` is the medium's extinction (pushed air density, or the water body's grey extinction), `g` its
+// phase anisotropy, and `underwater` selects the water's surface leg: the sun ray has to cross the
+// water surface, so it picks up the rest of the body's Beer-Lambert and the wave focus at the exit
+// point, which is what lights an underwater shaft in the first place.
+public float3 shaftInScatter(float3 ro, float3 rd, float t, float2 pix,
+                             float sigma, float g, bool underwater, out float shaftShare) {
+    shaftShare = 0.0;
+    float strength = worldPush.shaft.w;
+    if (sigma <= 0.0 || strength <= 0.0 || t <= RAY_TMIN) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    if (dot(celestialLight.illuminance, float3(1.0, 1.0, 1.0)) <= 0.0) {
+        return float3(0.0, 0.0, 0.0); // no body above the horizon: nothing to scatter
+    }
+    float reach = min(t, max(worldPush.shaft.z, 1.0));
+    // Air beams are still swallowed by fog. Water's own extinction is already inside sigma, and the air
+    // fog does not exist below the surface.
+    float fogT = underwater ? 1.0 : fogTransmittance(worldPush.fog0.x, worldPush.fog0.z,
+            worldPush.fog0.y, ro.y, rd.y, reach);
+    float total = 1.0 - exp(-sigma * reach);
+    float shaftWeight = total * fogT;
+    if (shaftWeight <= 1.0e-4) {
+        return float3(0.0, 0.0, 0.0); // a hit right in front of the eye: too little medium to read
+    }
+    float phase = hg(dot(rd, celestialLight.dir), g) * SHAFT_PHASE_ENERGY;
+    if (underwater) {
+        // The cap is the whole reason the underwater layer survives a look straight at the sun: with the
+        // lobe at its peak and a long grazing path to the surface, the physical value runs an order of
+        // magnitude over the water it sits in front of, and the surface turns white. A ceiling keeps the
+        // water body's own level while the shadow structure still draws the beams.
+        phase = min(phase, worldPush.waterShaft.y);
+    }
+    float noise = frac(interleaveGradientNoise(pix)
+            + float(worldPush.frameIndex) * 0.6180339887);
+    float weight = total / float(SHAFT_STRATA);
+    bool waterWaves = (worldPush.flags & 16u) != 0u;
+    float caustic = 1.0;
+    bool causticKnown = false;
+    float3 sun = float3(0.0, 0.0, 0.0);
+    float lit = 0.0;
+    for (int k = 0; k < SHAFT_STRATA; k++) {
+        float a = shaftDepthAtWeight(sigma, reach, k);
+        float b = shaftDepthAtWeight(sigma, reach, k + 1);
+        float3 p = ro + rd * (a + (b - a) * noise);
+        VisibilityResult probe = visibility(p, celestialLight.dir, 10000.0);
+        float3 vis = probe.transmittance;
+        if (underwater && probe.waterHitT > 0.0) {
+            // The underwater stretch of the sun leg up to the surface, then the focus the wave field
+            // gives the light as it crosses. One caustic sample serves the whole shaft: every probe sits
+            // within a few blocks of the surface entry, where the pattern does not move enough to pay
+            // the wave solve eight times over.
+            vis *= exp(-sigma * probe.waterHitT);
+            if (!causticKnown) {
+                caustic = waterWaves
+                        ? waterCaustic(p + celestialLight.dir * probe.waterHitT, celestialLight.dir,
+                                probe.waterHitT)
+                        : 1.0;
+                causticKnown = true;
+            }
+            vis *= caustic;
+        }
+        // Per-channel, so a beam that has crossed stained glass carries its tint like every other sun
+        // path does; solids and cutout leaves terminate it. The gate reads the grey mean: what matters
+        // there is whether the path is lit, not in what colour.
+        lit += dot(vis, float3(0.3333333, 0.3333333, 0.3333333));
+        sun += vis * (weight * cloudShadowTransmittance(p, celestialLight.dir));
+    }
+    lit *= 1.0 / float(SHAFT_STRATA);
+    // Linear in the lit fraction, deliberately: a smoothstep here multiplies the estimator's own
+    // quantisation (one probe is 1/SHAFT_STRATA of the ramp) by its slope, and at a forward-scattering
+    // phase the term is bright enough that those steps read as contour arcs across a lit wall. Linear
+    // keeps every step at 1/SHAFT_STRATA of the term, which the reconstruct averages away.
+    float structure = clamp(1.0 - lit, 0.0, 1.0);
+    if (underwater) {
+        // Water does not use the gate the way air does. The gate's product is largest exactly where a
+        // path is half lit, which for a big occluder — a bank, a tree, a hull — is a band a few pixels
+        // wide; open water and deep shade both fall to zero, and the view reads as "no shafts at all".
+        // What reads underwater is the SHADOW the occluder casts into the water, so the term keeps its
+        // visibility modulation and only leans on the gate for contrast: fully-lit water keeps 45%,
+        // shadow-crossing water the lot. The forward peak is capped separately (see `phase`), which is
+        // what keeps this from becoming a white sheet.
+        structure = lerp(WATER_SHAFT_STRUCTURE_FLOOR, 1.0, structure);
+    }
+    shaftShare = shaftWeight * structure;
+    return sun * (phase * celestialLight.illuminance * (strength * fogT * structure));
 }

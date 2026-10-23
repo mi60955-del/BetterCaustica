@@ -248,7 +248,7 @@ public final class NgxRuntime {
     private static List<String> bundledFeatureLibraryNames() {
         List<String> names = new ArrayList<>();
         FabricLoader.getInstance().getModContainer("bettercaustica").ifPresent(container -> {
-            String nativeDir = "bettercaustica/natives/" + PLATFORM_NATIVES.platformDir();
+            String nativeDir = "caustica/natives/" + PLATFORM_NATIVES.platformDir();
             for (Path root : container.getRootPaths()) {
                 Path dir = root.resolve(nativeDir);
                 if (!Files.isDirectory(dir)) {

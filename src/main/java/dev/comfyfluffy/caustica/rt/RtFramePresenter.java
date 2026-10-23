@@ -82,6 +82,8 @@ public final class RtFramePresenter {
     private long presentFailures;
     private int lastPresentResult = VK10.VK_SUCCESS;
     private int swapchainImageCount = -1;
+    /** Swapchain image count of the last "no room for a generated frame" warning, so it warns once per size. */
+    private int fgStarvedCapacity = -1;
     // The presenter's own share of the frame. Comparing these against the flush-to-flush interval says
     // whether a long frame is spent here or inside Minecraft's frame (its own acquire or fence wait).
     private long prepareNanosSum;
@@ -132,7 +134,10 @@ public final class RtFramePresenter {
 
     /** Whether FG extra-present should run this frame (enabled, a backend that can, in a world). */
     public boolean isActive() {
-        if (failed || !RtDlssFg.enabled() || Minecraft.getInstance().level == null) {
+        // Frame generation consumes this renderer's own motion vectors and depth, so it has nothing to
+        // interpolate while the hot switch has RT off; presenting generated frames there would show
+        // stale geometry over a vanilla image.
+        if (failed || !RtDlssFg.enabled() || !RtComposite.enabled() || Minecraft.getInstance().level == null) {
             return false;
         }
         return switch (backend()) {
@@ -194,8 +199,18 @@ public final class RtFramePresenter {
         requestedGeneratedInWindow = generatedCount;
         generatedCount = Math.min(generatedCount, swapchainImages.size() - 2);
         if (generatedCount <= 0) {
+            // Distinguishable from "the backend produced nothing": no dispatch is ever recorded in this
+            // state, so the backend's own diagnostics stay silent and the feature looks switched off.
+            if (fgStarvedCapacity != swapchainImages.size()) {
+                fgStarvedCapacity = swapchainImages.size();
+                CausticaMod.LOGGER.warn("FG has no room for a generated frame: the swapchain holds {} image(s) "
+                                + "but {} are needed (one for Minecraft's own frame, one held back, plus one per "
+                                + "generated frame); only the rendered frame is presented",
+                        swapchainImages.size(), requestedGeneratedInWindow + 2);
+            }
             return;
         }
+        fgStarvedCapacity = -1;
         final long prepareStartNs = System.nanoTime();
         try {
             ensureCapacity(device, swapchainImages.size() + 1, generatedCount);

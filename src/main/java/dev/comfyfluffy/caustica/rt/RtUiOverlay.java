@@ -66,15 +66,18 @@ public final class RtUiOverlay {
     }
 
     /**
-     * Runs regardless of HDR mode because the GUI redirect and composite-back reproduce vanilla in SDR,
-     * while {@code RtWorldOverlay}'s composite point is this same
-     * seam and needs it to fire every frame. Active only once the game has finished loading: the composite
-     * pipeline lazily compiles its shaders, which are not available during the loading screen (would crash
-     * with "Couldn't find source for core/screenquad"). Gating the redirect here keeps the loading-screen
-     * GUI on the normal path.
+     * The overlay carries the SDR-authored UI into the RT present path, so it follows the ray-tracing
+     * master switch: with RT off the vanilla GUI pass draws straight into the main target and there is
+     * nothing to composite back, so redirecting would only add a full-screen blit. It also runs
+     * regardless of HDR mode because the redirect plus composite-back reproduce vanilla in SDR, while
+     * {@code RtWorldOverlay}'s composite point is this same seam and needs it to fire every frame.
+     * Active only once the game has finished loading: the composite pipeline lazily compiles its
+     * shaders, which are not available during the loading screen (would crash with "Couldn't find
+     * source for core/screenquad"). Gating the redirect here keeps the loading-screen GUI on the
+     * normal path.
      */
     public static boolean enabled() {
-        return !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
+        return RtComposite.enabled() && !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
     }
 
     /** Whether the overlay holds this frame's UI (for the HDR present path to composite + consume). */

@@ -2,6 +2,7 @@ package dev.comfyfluffy.caustica.rt.entity;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.ParticleEngineAccessor;
 import dev.comfyfluffy.caustica.mixin.ParticleGroupAccessor;
 import net.minecraft.client.Camera;
@@ -54,6 +55,7 @@ import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.objects.ReferenceOpenHashSet;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -318,6 +320,24 @@ public final class RtEntities {
             frameLists[i] = new FrameLists();
         }
     }
+
+    // --- Over-budget capture prioritization + budget observability (see captureEntities) ---
+    // Reused per-frame snapshot of level.entitiesForRendering() and, in the ranked path, its membership
+    // set. Steady-state allocation-free: both are cleared and refilled, never reallocated.
+    private final List<Entity> frameEntities = new ArrayList<>();
+    private final ReferenceOpenHashSet<Entity> frameEntitySet = new ReferenceOpenHashSet<>();
+    // Nearest-first capture order for over-budget frames, rebuilt at most once per RANK_REBUILD_NANOS.
+    // rankedSet mirrors rankedEntities' membership; newcomers are appended at the tail between rebuilds.
+    private final List<Entity> rankedEntities = new ArrayList<>();
+    private final ReferenceOpenHashSet<Entity> rankedSet = new ReferenceOpenHashSet<>();
+    private long lastRankNanos;
+    private static final long RANK_REBUILD_NANOS = 500_000_000L;
+    // Budget observability: how often the capture loop had to stop early, and how many entity-frames
+    // that silently removed from the traced scene (see reportCaptureBudget).
+    private long capHitFrames;
+    private long entitiesDroppedTotal;
+    private long lastCapWarnNanos;
+    private static final long CAP_WARN_INTERVAL_NANOS = 10_000_000_000L;
 
     /**
      * Cached block-entity geometry. The mesh is captured in <b>block-local</b> space (identity submit pose),
@@ -719,114 +739,257 @@ public final class RtEntities {
         glowCamOffsetY = (float) (cameraState.pos.y - rby);
         glowCamOffsetZ = (float) (cameraState.pos.z - rbz);
         resetPoseStack(entityPoseStack);
-        int capturedThisFrame = 0;
+        // Snapshot the renderable set once. The list is reused (no steady-state allocation); the copy is
+        // what lets the over-budget path know both the total and who is still renderable without a second
+        // world query.
+        frameEntities.clear();
         for (Entity entity : level.entitiesForRendering()) {
-            if (build.full() || capturedThisFrame >= maxOrdinaryEntities()) {
-                break;
-            }
-            if (entity.isInvisible()) {
-                continue;
-            }
-            boolean firstPersonSelf = entity == cameraEntity && firstPerson;
-            // With SELF_ENABLED off the first-person body is excluded from every ray, not just primary:
-            // no reflection, shadow, or GI trace of the owner is captured at all.
-            if (firstPersonSelf && !CausticaConfig.Rt.Entities.SELF_ENABLED.value()) {
-                continue;
-            }
-            int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
-            float ix;
-            float iy;
-            float iz;
-            int id = entity.getId();
-            EntityPrev prev = prevVerts.get(id);
-            capture.reset(prev != null ? prev.size / 3 : 0);
-            try {
-                EntityRenderState state;
-                long extractStart = RtFrameStats.FRAME.startStage();
-                try {
-                    state = dispatcher.extractEntity(entity, partial);
-                } finally {
-                    RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
-                }
-                // Derive placement from the extracted state so the submitted pose and TLAS anchor use the
-                // same interpolation result.
-                ix = (float) state.x;
-                iy = (float) state.y;
-                iz = (float) state.z;
-                // extractEntity already ran EntityRenderer.extractNameTags (shouldShowName, crosshair-look,
-                // distance cutoff, the attachment point) as a normal part of building the render state — no
-                // need to reimplement any of that here, just read the result. Name tags billboard to face
-                // the camera every frame (see RtNameTagFeature), so — unlike glow, whose mesh is captured
-                // straight into the SAME rigid entity mesh used for the BLAS — they are never mixed into
-                // `capture`: doing so would make every frame's mesh a non-rigid transform of the last
-                // whenever the camera turns, defeating rigid-reuse/motion-vector fitting for every
-                // name-tagged entity. RtWorldOverlay renders them in a completely separate raster pass.
-                if (nameTags && !firstPersonSelf && state.nameTag != null) {
-                    captureNameTag(level, state, ix, iy, iz, rbx, rby, rbz);
-                }
-                collector.begin(capture, true);
-                resetPoseStack(entityPoseStack);
-                // Capture around the entity anchor. Per-frame placement moves into the TLAS instance,
-                // so ordinary world translation no longer changes the mesh or its float precision.
-                long submitStart = RtFrameStats.FRAME.startStage();
-                try {
-                    dispatcher.submit(state, cameraState, 0.0, 0.0, 0.0, entityPoseStack, collector);
-                } finally {
-                    RtFrameStats.FRAME.endStage("entity.capture.submit", submitStart);
-                }
-            } catch (Throwable t) {
-                // Fail loud instead of skip-and-limp: a capture throw here is almost always our bug, and
-                // swallowing it leaves the entity invisible every frame plus a per-frame MC CrashReport.
-                // Propagate to composite(), which logs the full trace, disables RT, and reverts to vanilla.
-                throw new RuntimeException("RT entity capture failed", t);
-            } finally {
-                collector.begin(null, false);
-                resetPoseStack(entityPoseStack);
-            }
-            if (capture.isEmpty()) {
-                continue; // non-model entity (arrow/etc.) — no body geometry captured
-            }
-            if (glow && !firstPersonSelf) {
-                // Vanilla never draws the local player's own body in first person (no model to outline —
-                // only the held-item hand), so it never shows the Glowing outline on yourself either. Our
-                // capture still meshes the first-person self (for reflections/shadows/GI), so the glow mask
-                // must explicitly skip it to match — otherwise it'd show an outline vanilla never would.
-                int glowColor = collector.outlineColor();
-                if (glowColor != 0) {
-                    glowBatches.add(new GlowEntity(copyTranslatedVertices(capture.verts,
-                            ix - rbx, iy - rby, iz - rbz), capture.idx.toIntArray(), glowColor));
-                }
-            }
-            // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
-            // MV; rigid translation is packed into the table, deformation gets a disp buffer.
-            Motion motion;
-            long motionStart = RtFrameStats.FRAME.startStage();
-            try {
-                motion = uploadVertexMotion(ctx, build, capture.verts, prev, ix, iy, iz);
-            } finally {
-                RtFrameStats.FRAME.endStage("entity.capture.motion", motionStart);
-            }
-            curVerts.put(id, storeEntityPrev(prev, capture.verts, ix, iy, iz));
-            // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
-            // re-references that AS through the instance transform — no upload, no refit.
-            boolean reused;
-            long reuseStart = RtFrameStats.FRAME.startStage();
-            try {
-                reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
-            } finally {
-                RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
-            }
-            if (!reused) {
-                appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
-                        translationTransform(ix - rbx, iy - rby, iz - rbz));
-            }
-            build.logicalCount++;
-            RtFrameStats.FRAME.count("entitiesCaptured", 1);
-            capturedThisFrame++;
+            frameEntities.add(entity);
         }
+        int cap = maxOrdinaryEntities();
+        int renderableCount = frameEntities.size();
+        // Over budget → nearest-first capture from a cached ranking (see beginRankedCapture). Under
+        // budget → the plain path below is the old behavior verbatim: world iteration order, zero added
+        // work. The ranking is also skipped when the frame is already full from block entities +
+        // particles, where re-ordering ordinary entities cannot help anyway.
+        boolean ranked = !build.full() && renderableCount > cap;
+        int capturedThisFrame = 0;
+        boolean budgetExhausted = false;
+        if (ranked) {
+            beginRankedCapture();
+            for (int i = 0; i < rankedEntities.size(); i++) {
+                Entity entity = rankedEntities.get(i);
+                if (build.full() || capturedThisFrame >= cap) {
+                    budgetExhausted = true;
+                    break;
+                }
+                // Entries may have left the render set (despawned / out of tracking range) since the
+                // ranking was built; they must neither be captured nor consume budget. They are purged
+                // at the next rebuild.
+                if (entity.isRemoved() || !frameEntitySet.contains(entity)) {
+                    continue;
+                }
+                if (captureOneEntity(ctx, build, dispatcher, cameraEntity, firstPerson, glow, nameTags,
+                        level, partial, rbx, rby, rbz, entity)) {
+                    capturedThisFrame++;
+                }
+            }
+            // Entities that entered the render set after the last ranking: capture them if budget
+            // remains (they rank properly at the next rebuild), and append them to the ranked cache so
+            // the membership set stays the single source of truth for "already offered" next frame.
+            for (int i = 0; i < frameEntities.size(); i++) {
+                if (build.full() || capturedThisFrame >= cap) {
+                    budgetExhausted = true;
+                    break;
+                }
+                Entity entity = frameEntities.get(i);
+                if (!rankedSet.add(entity)) {
+                    continue; // already offered by the ranked pass this frame
+                }
+                rankedEntities.add(entity);
+                if (captureOneEntity(ctx, build, dispatcher, cameraEntity, firstPerson, glow, nameTags,
+                        level, partial, rbx, rby, rbz, entity)) {
+                    capturedThisFrame++;
+                }
+            }
+        } else {
+            for (int i = 0; i < frameEntities.size(); i++) {
+                Entity entity = frameEntities.get(i);
+                if (build.full() || capturedThisFrame >= cap) {
+                    budgetExhausted = true;
+                    break;
+                }
+                if (captureOneEntity(ctx, build, dispatcher, cameraEntity, firstPerson, glow, nameTags,
+                        level, partial, rbx, rby, rbz, entity)) {
+                    capturedThisFrame++;
+                }
+            }
+        }
+        reportCaptureBudget(build, cap, renderableCount, capturedThisFrame, budgetExhausted);
         Int2ObjectOpenHashMap<EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
         curVerts = oldPrev;
+    }
+
+    /**
+     * Capture one entity into the frame build. Returns {@code true} when it consumed a slot of the
+     * ordinary-entity capture budget (produced body geometry and was counted); {@code false} when it was
+     * skipped without consuming budget (invisible, first-person self with trace-self disabled, or a
+     * non-model entity with no body geometry).
+     */
+    private boolean captureOneEntity(RtContext ctx, FrameBuild build, EntityRenderDispatcher dispatcher,
+            Entity cameraEntity, boolean firstPerson, boolean glow, boolean nameTags, ClientLevel level,
+            float partial, int rbx, int rby, int rbz, Entity entity) {
+        if (entity.isInvisible()) {
+            return false;
+        }
+        boolean firstPersonSelf = entity == cameraEntity && firstPerson;
+        // With SELF_ENABLED off the first-person body is excluded from every ray, not just primary:
+        // no reflection, shadow, or GI trace of the owner is captured at all.
+        if (firstPersonSelf && !CausticaConfig.Rt.Entities.SELF_ENABLED.value()) {
+            return false;
+        }
+        int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
+        float ix;
+        float iy;
+        float iz;
+        int id = entity.getId();
+        EntityPrev prev = prevVerts.get(id);
+        capture.reset(prev != null ? prev.size / 3 : 0);
+        try {
+            EntityRenderState state;
+            long extractStart = RtFrameStats.FRAME.startStage();
+            try {
+                state = dispatcher.extractEntity(entity, partial);
+            } finally {
+                RtFrameStats.FRAME.endStage("entity.capture.extract", extractStart);
+            }
+            // Derive placement from the extracted state so the submitted pose and TLAS anchor use the
+            // same interpolation result.
+            ix = (float) state.x;
+            iy = (float) state.y;
+            iz = (float) state.z;
+            // extractEntity already ran EntityRenderer.extractNameTags (shouldShowName, crosshair-look,
+            // distance cutoff, the attachment point) as a normal part of building the render state — no
+            // need to reimplement any of that here, just read the result. Name tags billboard to face
+            // the camera every frame (see RtNameTagFeature), so — unlike glow, whose mesh is captured
+            // straight into the SAME rigid entity mesh used for the BLAS — they are never mixed into
+            // `capture`: doing so would make every frame's mesh a non-rigid transform of the last
+            // whenever the camera turns, defeating rigid-reuse/motion-vector fitting for every
+            // name-tagged entity. RtWorldOverlay renders them in a completely separate raster pass.
+            if (nameTags && !firstPersonSelf && state.nameTag != null) {
+                captureNameTag(level, state, ix, iy, iz, rbx, rby, rbz);
+            }
+            collector.begin(capture, true);
+            resetPoseStack(entityPoseStack);
+            // Capture around the entity anchor. Per-frame placement moves into the TLAS instance,
+            // so ordinary world translation no longer changes the mesh or its float precision.
+            long submitStart = RtFrameStats.FRAME.startStage();
+            try {
+                dispatcher.submit(state, cameraState, 0.0, 0.0, 0.0, entityPoseStack, collector);
+            } finally {
+                RtFrameStats.FRAME.endStage("entity.capture.submit", submitStart);
+            }
+        } catch (Throwable t) {
+            // Fail loud instead of skip-and-limp: a capture throw here is almost always our bug, and
+            // swallowing it leaves the entity invisible every frame plus a per-frame MC CrashReport.
+            // Propagate to composite(), which logs the full trace, disables RT, and reverts to vanilla.
+            throw new RuntimeException("RT entity capture failed", t);
+        } finally {
+            collector.begin(null, false);
+            resetPoseStack(entityPoseStack);
+        }
+        if (capture.isEmpty()) {
+            return false; // non-model entity (arrow/etc.) — no body geometry captured
+        }
+        if (glow && !firstPersonSelf) {
+            // Vanilla never draws the local player's own body in first person (no model to outline —
+            // only the held-item hand), so it never shows the Glowing outline on yourself either. Our
+            // capture still meshes the first-person self (for reflections/shadows/GI), so the glow mask
+            // must explicitly skip it to match — otherwise it'd show an outline vanilla never would.
+            int glowColor = collector.outlineColor();
+            if (glowColor != 0) {
+                glowBatches.add(new GlowEntity(copyTranslatedVertices(capture.verts,
+                        ix - rbx, iy - rby, iz - rbz), capture.idx.toIntArray(), glowColor));
+            }
+        }
+        // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
+        // MV; rigid translation is packed into the table, deformation gets a disp buffer.
+        Motion motion;
+        long motionStart = RtFrameStats.FRAME.startStage();
+        try {
+            motion = uploadVertexMotion(ctx, build, capture.verts, prev, ix, iy, iz);
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.motion", motionStart);
+        }
+        curVerts.put(id, storeEntityPrev(prev, capture.verts, ix, iy, iz));
+        // Rigid reuse first: a pose that is a rigid transform of the entity's last-built mesh
+        // re-references that AS through the instance transform — no upload, no refit.
+        boolean reused;
+        long reuseStart = RtFrameStats.FRAME.startStage();
+        try {
+            reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
+        } finally {
+            RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
+        }
+        if (!reused) {
+            appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
+                    translationTransform(ix - rbx, iy - rby, iz - rbz));
+        }
+        build.logicalCount++;
+        RtFrameStats.FRAME.count("entitiesCaptured", 1);
+        return true;
+    }
+
+    /**
+     * Over-budget capture order: nearest-first from a cached ranking, rebuilt at most once per
+     * {@link #RANK_REBUILD_NANOS}. {@code MAX_ORDINARY_ENTITIES} bounds per-frame capture cost, but the
+     * old loop broke out in {@code entitiesForRendering()} iteration order — an arbitrary, spatially
+     * clustered subset. Greenfield's spawn plaza holds ~1300 paintings + ~550 item frames within render
+     * distance, so everything after the cap (item frames the player is looking at, armor stands, mobs)
+     * silently vanished from the traced scene every frame, while teleporting away (under cap) made them
+     * reappear — a location-dependent invisibility with nothing in the log.
+     *
+     * <p>Sorting ~2k references is microseconds, but it is still per-frame work on exactly the frames
+     * where the budget is already saturated, so the ranked order is cached and rebuilt on a wall-clock
+     * budget: between rebuilds the cached order is reused as-is (entities that left the render set are
+     * skipped, newcomers are appended at the tail by the caller). Half a second of staleness in who
+     * counts as "near" is imperceptible, and per-frame sort cost is zero. Under-budget frames never
+     * enter this path at all.
+     */
+    private void beginRankedCapture() {
+        frameEntitySet.clear();
+        frameEntitySet.addAll(frameEntities);
+        long now = System.nanoTime();
+        if (rankedEntities.isEmpty() || now - lastRankNanos >= RANK_REBUILD_NANOS) {
+            rebuildRanked();
+            lastRankNanos = now;
+        }
+    }
+
+    /** Rebuild the nearest-first capture order (and its membership mirror) from this frame's set. */
+    private void rebuildRanked() {
+        rankedEntities.clear();
+        rankedEntities.addAll(frameEntities);
+        Vec3 cam = cameraState.pos;
+        double cx = cam.x;
+        double cy = cam.y;
+        double cz = cam.z;
+        rankedEntities.sort(Comparator.comparingDouble(e -> {
+            Vec3 p = e.position();
+            double dx = p.x - cx;
+            double dy = p.y - cy;
+            double dz = p.z - cz;
+            return dx * dx + dy * dy + dz * dz;
+        }));
+        rankedSet.clear();
+        rankedSet.addAll(frameEntities);
+    }
+
+    /**
+     * Observability for the capture budget — the complement of the texture-slot summary. A cap hit used
+     * to be completely silent: the loop just broke, and the symptom was "entities are invisible near the
+     * map's spawn" with nothing anywhere in the log. Count the miss and surface it, rate-limited, with
+     * enough numbers to size the config fix without attaching a debugger.
+     */
+    private void reportCaptureBudget(FrameBuild build, int cap, int renderableCount, int capturedThisFrame,
+            boolean exhausted) {
+        if (!exhausted) {
+            return;
+        }
+        capHitFrames++;
+        entitiesDroppedTotal += renderableCount - capturedThisFrame;
+        long now = System.nanoTime();
+        if (now - lastCapWarnNanos < CAP_WARN_INTERVAL_NANOS) {
+            return;
+        }
+        lastCapWarnNanos = now;
+        CausticaMod.LOGGER.warn("RT entity capture budget exhausted: captured {}/{} renderable entities "
+                        + "this frame (cap {}{}); {} cap-hit frames, {} entity-frames left uncaptured since "
+                        + "session start. Nearby entities are prioritized; raise [entities] "
+                        + "max-ordinary-entities (restart required) to trace them all.",
+                capturedThisFrame, renderableCount, cap, build.full() ? " reached; frame full" : "",
+                capHitFrames, entitiesDroppedTotal);
     }
 
     private static void resetPoseStack(PoseStack poseStack) {
@@ -1029,7 +1192,7 @@ public final class RtEntities {
                     capture.currentEmission = selfLuminous(sq)
                             ? RtMaterialRegistry.defaultEmissionLuminanceCdM2() : 0f;
                     for (SingleQuadParticle.Layer layer : particleScratch.layers()) {
-                        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(layer.textureAtlasLocation());
+                        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlasSafe(layer.textureAtlasLocation());
                         particleScratch.buildLayer(layer, particleCapture);
                         particleCapture.flush();
                     }
@@ -2041,6 +2204,12 @@ public final class RtEntities {
         particleDisp.clear();
         glowBatches.clear();
         nameTagBatches.clear();
+        frameEntities.clear();
+        frameEntitySet.clear();
+        rankedEntities.clear();
+        rankedSet.clear();
+        capHitFrames = 0;
+        entitiesDroppedTotal = 0;
         resetPoseStack(blockEntityPoseStack);
         beCandidates.clear();
         beCandidatePool.clear();

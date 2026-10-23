@@ -620,22 +620,30 @@ public SkyState skyState(WorldPush push) {
  * purpose (SKY_LIGHT_COLOR + AMBIENT_LIGHT_COLOR), taken raw so the authored illuminance stays
  * photometric. The box texture from {@code end_sky.png} is layered on top by the miss shader only: it is
  * presentation, and the SH bake below intentionally integrates the smooth dome.
+ *
+ * <p>The Nether has no sky box at all and a black SKY_COLOR, yet vanilla still fills its view with the
+ * fog colour's haze and keeps the same ambient_light floor in its lightmap. So a black sky colour falls
+ * back to the fog colour as the dome, and the ambient floor joins every branch: this function also feeds
+ * skyDiffuseRadiance (the SH irradiance bake), so the floor is what carries DimensionType.ambientLight
+ * to unlit surfaces — without it a dimension with no sky light and no nearby emitter renders pure black.
+ * Diffuse vertices read the sky only through that bake and specular ones only through the traced dome,
+ * so the floor can never reach a shading point twice.
  */
 public float3 dimensionSkyRadiance(SkyState s, float3 dir) {
     float3 sky = max(s.dimensionSkyColor, float3(0.0));
+    float3 fog = max(s.fogColor, float3(0.0));
+    float3 ambientChroma = max(s.skyLightColor, float3(0.0))
+            + max(s.ambientLightColor, float3(0.0));
+    float3 ambient = ambientChroma * (s.ambientLight * s.ambientIlluminanceLux / SKY_PI);
     if (s.skybox == SKYBOX_END) {
-        float3 fog = max(s.fogColor, float3(0.0));
         float3 gradient = lerp(fog, sky, smoothstep(0.0, 0.5, dir.y)) * s.skyGradientGain;
-        float3 ambientChroma = max(s.skyLightColor, float3(0.0))
-                + max(s.ambientLightColor, float3(0.0));
-        float3 ambient = ambientChroma * (s.ambientLight * s.ambientIlluminanceLux / SKY_PI);
         return gradient + ambient;
     }
     float luma = dot(sky, float3(0.2126, 0.7152, 0.0722));
     if (luma <= 0.0) {
-        return float3(0.0);
+        return fog + ambient;
     }
-    return sky * (s.airglowLuminance / luma);
+    return sky * (s.airglowLuminance / luma) + ambient;
 }
 
 public struct CelestialLight {

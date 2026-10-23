@@ -6,6 +6,7 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.RenderSetupAccessor;
 import dev.comfyfluffy.caustica.mixin.RenderTypeAccessor;
+import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import com.mojang.blaze3d.platform.NativeImage;
@@ -18,10 +19,12 @@ import net.minecraft.resources.Identifier;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
+import java.util.function.Supplier;
 
 /**
  * Resolves the texture backing an entity {@link RenderType} to a Vulkan image-view handle, for the
@@ -37,6 +40,14 @@ import java.util.WeakHashMap;
  * primary sampler is {@code "Sampler0"} ({@code "Sampler1"}/{@code "Sampler2"} are the overlay/lightmap
  * the prepared list prepends). Resolution is cached per {@code RenderType} (they are stable singletons),
  * so the prepare() cost is paid once per distinct texture.
+ *
+ * <p>Slot use is bounded twice. When the array is full, {@link #recycleColdestSlot} steals the
+ * least-recently-used slot that was <em>not</em> touched in the current frame: a texture that has scrolled
+ * out of the scene must not keep its slot forever, or a world with a few hundred distinct one-shot
+ * textures (maps in item frames, paintings, banners) starves every mob. When even that fails — every slot
+ * drawn in the same frame — the surface degrades to the reserved white texture and not to slot 0, because
+ * slot 0 is the block atlas: sampling it with a mob's 0..1 texture UVs is exactly what turns an entity into
+ * coloured atlas blocks, or (where the atlas is empty) into a transparent shell the hit shader discards.
  */
 public final class RtEntityTextures {
     /** Bindless array capacity (slot 0 reserved as a fallback texture). {@code -Dcaustica.rt.maxEntityTextures}. */
@@ -76,11 +87,50 @@ public final class RtEntityTextures {
     // reset/recreate; a lower value stops allocating new slots immediately without invalidating old ones.
     private int capacity = maxTextures();
     private int nextSlot = 1;
+    // LRU bookkeeping for slot recycling: slot → the image view that owns it, and the frame that slot was
+    // last asked for. Both are sized to the slot limit on reset and indexed 1..slotLimit()-1.
+    private long[] slotView = new long[0];
+    private long[] slotLastUsedFrame = new long[0];
+    // Slot of the white fallback texture, reserved while the array is still empty so it is guaranteed to
+    // exist when an allocation later fails. Never recycled: stealing it would re-texture the one slot that
+    // the exhausted-array path depends on. 0 until the reservation succeeds.
+    private int reservedWhiteSlot;
+    // The 1x1 white DynamicTexture behind reservedWhiteSlot; kept so a resource reload that released its
+    // pixels can be detected and re-registered without leaking the previous instance.
+    private DynamicTexture whiteTexture;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
-    // 1x1 solid-white DynamicTexture for untextured geometry (leash/line ribbons); see whiteSlot().
-    private static final Identifier WHITE_LOCATION = Identifier.fromNamespaceAndPath("bettercaustica", "rt_white");
-    private boolean whiteRegistered;
+
+    // Observability. Every failure mode here — an unresolved view, a full array — silently falls back to
+    // slot 0 (the block atlas), and a stale cached handle silently keeps pointing at a destroyed image
+    // view. All three render an entity that is either covered in atlas texels or fully transparent, with
+    // nothing in the log to tell them apart, so each is counted and reported rather than swallowed.
+    // Counters are cumulative across pipeline rebuilds on purpose: a session-wide total is what shows
+    // whether slots are being burned by texture churn or simply running out.
+    private long slotsAllocated;
+    private long evictions;
+    private long fullFallbacks;
+    private long unresolvedFallbacks;
+    private long descriptorWrites;
+    private long staleViewDetections;
+    private long probeFrame = -1L;
+    private int probesThisFrame;
+    private long lastSummaryFrame = -1L;
+    private boolean loggedFull;
+    private boolean loggedUnresolved;
+
+    /** Frames between spot-checks of cached handles against a fresh resolve. */
+    private static final long PROBE_INTERVAL_FRAMES = 240L;
+    /** Cached handles re-resolved per probe frame. Entity layers use distinct render types, so a handful
+     *  covers several surfaces without paying a prepare() for every submission. */
+    private static final int PROBES_PER_TICK = 4;
+    /** Frames between one-line slot/fallback summaries. */
+    private static final long SUMMARY_INTERVAL_FRAMES = 600L;
+    /** First N slot allocations are traced with their source, to name whatever eats the array. */
+    private static final long ALLOCATION_TRACE_LIMIT = 64L;
+    // 1x1 solid-white DynamicTexture: the tint-only albedo for untextured geometry (leash/line ribbons) and
+    // the last-resort fallback when no real texture can be bound. See whiteSlot().
+    private static final Identifier WHITE_LOCATION = Identifier.fromNamespaceAndPath("caustica", "rt_white");
 
     // Cached RenderSetup.TextureBinding#location() (the class is package-private, the method public).
     private Method locationMethod;
@@ -100,7 +150,51 @@ public final class RtEntityTextures {
         if (renderType == null) {
             return 0;
         }
-        return slotForView(resolveView(renderType));
+        Long cached = viewCache.get(renderType);
+        if (cached != null) {
+            probeCachedView(renderType, cached);
+            return slotForView(cached, () -> "render " + renderType);
+        }
+        return slotForView(resolveView(renderType), () -> "render " + renderType);
+    }
+
+    /**
+     * {@link #slotFor} for a per-type entity texture (a mob's own sheet, a glyph layer), which must never
+     * degrade to slot 0. Slot 0 is the block atlas, and a full-texture UV set sampled against it lands on
+     * whatever sprites are stitched there — the coloured-block / transparent-shell failure this was written
+     * for. An unresolvable or unallocatable texture degrades to the reserved white slot instead, i.e. to a
+     * visibly plain entity rather than a silently wrong one.
+     */
+    public int slotForEntity(RenderType renderType) {
+        int slot = slotFor(renderType);
+        return slot != 0 ? slot : whiteSlot();
+    }
+
+    /**
+     * Spot-check a few cached handles per {@link #PROBE_INTERVAL_FRAMES} against a fresh resolve. A texture
+     * rebuild (resource reload, or any path that re-registers the texture without the world pipeline being
+     * recreated) hands the render type a new image view while this cache keeps returning the old one; the
+     * descriptor written for it then points at a destroyed view. Comparing the two turns that from an
+     * unexplained mis-texture into a counted, named event.
+     */
+    private void probeCachedView(RenderType renderType, long cached) {
+        long frame = RtComposite.frameCounter();
+        if (frame != probeFrame) {
+            probeFrame = frame;
+            probesThisFrame = 0;
+        }
+        if (frame % PROBE_INTERVAL_FRAMES != 0L || probesThisFrame >= PROBES_PER_TICK) {
+            return;
+        }
+        probesThisFrame++;
+        long fresh = prepareViewHandle(renderType);
+        if (fresh != 0L && fresh != cached) {
+            staleViewDetections++;
+            if (staleViewDetections <= 8L) {
+                CausticaMod.LOGGER.warn("RT entity texture view changed under a cached handle: {} cached=0x{} now=0x{}",
+                        renderType, Long.toHexString(cached), Long.toHexString(fresh));
+            }
+        }
     }
 
     /**
@@ -118,7 +212,11 @@ public final class RtEntityTextures {
         if (cached == null) {
             layerViewCache.put(renderType, view);
         }
-        return view == 0L ? 0 : slotForView(view);
+        if (view == 0L) {
+            return 0; // this render type binds no second sampler: 0 means "no layer", not a failure
+        }
+        int slot = slotForView(view, () -> "layer " + renderType);
+        return slot != 0 ? slot : whiteSlot();
     }
 
     /** Canonical material ID for a full entity texture, or the neutral runtime-texture fallback. */
@@ -138,6 +236,7 @@ public final class RtEntityTextures {
         }
         Integer cached = atlasSlotCache.get(atlasLocation);
         if (cached != null) {
+            touchSlot(cached, RtComposite.frameCounter());
             return cached;
         }
         long view = 0L;
@@ -150,71 +249,250 @@ public final class RtEntityTextures {
                 CausticaMod.LOGGER.warn("RT atlas texture resolution failed for {}", atlasLocation, t);
             }
         }
-        int slot = slotForView(view);
-        atlasSlotCache.put(atlasLocation, slot);
+        int slot = slotForView(view, () -> "atlas " + atlasLocation);
+        if (slot != 0) {
+            // Only a resolved slot is worth caching. Caching the 0 fallback would pin this atlas to the
+            // block atlas for the rest of the pipeline's life even after it resolves — and every quad that
+            // samples it would keep reading atlas texels.
+            atlasSlotCache.put(atlasLocation, slot);
+        }
         return slot;
     }
 
     /**
-     * Bindless slot of a solid-white 1x1 texture, for untextured geometry (leashes, custom line
-     * ribbons) whose colour comes entirely from the per-prim tint. Slot 0 (the block atlas) is NOT a
-     * substitute: the hit shader multiplies albedo by the sampled texel, and UV (0,0) lands on
-     * whatever sprite is stitched at the atlas origin. The texture is registered with the
-     * TextureManager on first use and then resolved/cached by the ordinary atlas-slot path, so it
-     * survives {@link #reset} like any other atlas. Falls back to slot 0 if registration fails.
+     * {@link #slotForAtlas} for an atlas that is <em>not</em> necessarily the block atlas. Slot 0 is the
+     * right answer for the block atlas itself — the terrain <i>s</i>/<i>n</i> atlases and the block-entity
+     * sprites are all stitched there — but for a dedicated atlas (items, particles, a block entity's own
+     * sheet) a 0 means "unresolved or no room", and its sprite UVs sampled against the block atlas come back
+     * as arbitrary block texels. Those degrade to the reserved white slot instead: wrong, but plainly and
+     * identifiably wrong.
+     */
+    public int slotForAtlasSafe(Identifier atlasLocation) {
+        if (atlasLocation == null || TextureAtlas.LOCATION_BLOCKS.equals(atlasLocation)) {
+            return slotForAtlas(atlasLocation); // slot 0 IS the block atlas
+        }
+        int slot = slotForAtlas(atlasLocation);
+        return slot != 0 ? slot : whiteSlot();
+    }
+
+    /**
+     * Bindless slot of a solid-white 1x1 texture: the tint-only albedo for untextured geometry (leashes,
+     * custom line ribbons) and the fallback for any texture that cannot be bound. Slot 0 (the block atlas)
+     * is NOT a substitute for either use: the hit shader multiplies albedo by the sampled texel, and UV
+     * (0,0) lands on whatever sprite is stitched at the atlas origin.
+     *
+     * <p>The texture is registered with the TextureManager on first use, resolved through the ordinary
+     * atlas-slot path (so it survives {@link #reset} like any other atlas), and — importantly — its slot is
+     * <b>reserved at {@link #reset}</b> while the array is still empty, not lazily on the first allocation
+     * that needs it. The old lazy reservation made the fallback unavailable in precisely the case it exists
+     * for: an exhausted array has no room left for the white texture either, so the fallback silently became
+     * slot 0 again. Returns 0 only if registration and resolution both fail.
      */
     public int whiteSlot() {
-        if (!whiteRegistered) {
-            whiteRegistered = true; // one attempt; on failure slotForAtlas caches the slot-0 fallback
+        Integer cached = atlasSlotCache.get(WHITE_LOCATION);
+        if (cached != null && cached != 0) {
+            touchSlot(cached, RtComposite.frameCounter());
+            return cached;
+        }
+        ensureWhiteTexture();
+        int slot = slotForAtlas(WHITE_LOCATION);
+        if (slot != 0) {
+            reservedWhiteSlot = slot;
+        }
+        return slot;
+    }
+
+    /** Register (or re-register, after a reload released its pixels) the 1x1 white DynamicTexture. */
+    private void ensureWhiteTexture() {
+        if (whiteTexture != null) {
+            long view = 0L;
+            try {
+                view = vkImageView(whiteTexture.getTextureView());
+            } catch (Throwable ignored) {
+                // the texture was released (a resource reload closed it) → fall through and re-register
+            }
+            if (view != 0L) {
+                return;
+            }
+            closeWhiteTexture();
+        }
+        try {
             NativeImage image = new NativeImage(1, 1, false);
             image.setPixel(0, 0, 0xFFFFFFFF);
-            Minecraft.getInstance().getTextureManager()
-                    .register(WHITE_LOCATION, new DynamicTexture(() -> "caustica RT white", image));
+            whiteTexture = new DynamicTexture(() -> "caustica RT white", image);
+            Minecraft.getInstance().getTextureManager().register(WHITE_LOCATION, whiteTexture);
+        } catch (Throwable t) {
+            closeWhiteTexture();
+            if (!loggedFailure) {
+                loggedFailure = true;
+                CausticaMod.LOGGER.warn("RT white fallback texture registration failed", t);
+            }
         }
-        return slotForAtlas(WHITE_LOCATION);
+    }
+
+    private void closeWhiteTexture() {
+        if (whiteTexture != null) {
+            try {
+                whiteTexture.close();
+            } catch (Throwable ignored) {
+                // already closed / device gone
+            }
+            whiteTexture = null;
+        }
     }
 
     /**
      * Map a resolved image-view handle to a stable bindless slot, allocating one on first sight (queued
-     * for upload via {@link #uploadPending}). Returns 0 (fallback) when the view is unresolved or the
-     * array is full. Deduping by handle is what bounds slot use: distinct render types backed by the same
-     * texture share a slot instead of each consuming one.
+     * for upload via {@link #uploadPending}). Returns 0 (fallback) when the view is unresolved or the array
+     * is full and nothing can be recycled. Deduping by handle is what bounds slot use: distinct render types
+     * backed by the same texture share a slot instead of each consuming one.
      */
-    private int slotForView(long view) {
+    private int slotForView(long view, Supplier<String> source) {
         if (view == 0L) {
             return 0;
         }
+        long frame = RtComposite.frameCounter();
         Integer cached = viewSlotCache.get(view);
         if (cached != null) {
+            touchSlot(cached, frame);
             return cached;
         }
-        if (nextSlot >= slotLimit()) {
-            return 0;
+        int slot;
+        boolean recycled = false;
+        if (nextSlot < slotLimit()) {
+            slot = nextSlot++;
+        } else {
+            slot = recycleColdestSlot(frame);
+            if (slot == 0) {
+                fullFallbacks++;
+                if (!loggedFull) {
+                    loggedFull = true;
+                    CausticaMod.LOGGER.warn("RT entity texture array full at {} slots (configured {}): every slot is "
+                                    + "in use in the same frame, so none can be recycled; further textures fall back "
+                                    + "to the white slot",
+                            slotLimit(), maxTextures());
+                }
+                return 0;
+            }
+            recycled = true;
+            evictions++;
         }
-        int slot = nextSlot++;
+        slotsAllocated++;
+        if (slotsAllocated <= ALLOCATION_TRACE_LIMIT || (recycled && evictions <= 8L)) {
+            // Naming the source of the first allocations is what identifies the textures that exhaust the
+            // array: a fixed set of entity files cannot reach the configured capacity, so whatever does
+            // shows up here by name.
+            CausticaMod.LOGGER.info("RT entity texture slot {} <- {} (view=0x{}){}",
+                    slot, source.get(), Long.toHexString(view), recycled ? " [recycled]" : "");
+        }
+        slotView[slot] = view;
+        slotLastUsedFrame[slot] = frame;
         viewSlotCache.put(view, slot);
         pending.add(new Pending(slot, view));
         return slot;
     }
 
+    /**
+     * Steal the least-recently-used slot that was not already drawn this frame, returning 0 when there is
+     * none. Excluding slots touched in the current frame is what keeps recycling safe: prims recorded
+     * earlier this frame carry slot numbers, so rewriting a slot they already reference would re-texture
+     * geometry that is about to be traced. The white fallback's reserved slot is never stolen either — it is
+     * the one slot the exhausted-array path has to be able to count on.
+     *
+     * <p>Everything cached against the victim is un-mapped, or the next lookup would hand out a slot that
+     * now samples a different texture.
+     *
+     * <p>This deliberately breaks the old "a slot never changes once assigned" append-only rule. That rule
+     * was what kept update-after-bind writes off in-flight frames, but it is also what let a few hundred
+     * one-shot textures (item-frame maps, paintings) starve every mob permanently. Recycling rewrites the
+     * entity-albedo binding only, which is the one binding created with
+     * {@code VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT}; the cost is that a frame still in flight at the
+     * moment of a rewrite can observe the new texture for the recycled slot for a frame or two — a bounded,
+     * transient artifact in exchange for removing an unbounded permanent one.
+     */
+    private int recycleColdestSlot(long frame) {
+        long oldest = Long.MAX_VALUE;
+        int victim = 0;
+        for (int slot = 1; slot < nextSlot; slot++) {
+            if (slot == reservedWhiteSlot) {
+                continue;
+            }
+            long last = slotLastUsedFrame[slot];
+            if (last == frame) {
+                continue; // drawn this frame → already-submitted prims still point at it
+            }
+            if (last < oldest) {
+                oldest = last;
+                victim = slot;
+            }
+        }
+        if (victim == 0) {
+            return 0;
+        }
+        final int recycledSlot = victim;
+        long oldView = slotView[recycledSlot];
+        slotView[recycledSlot] = 0L;
+        if (oldView != 0L) {
+            viewSlotCache.remove(oldView);
+        }
+        atlasSlotCache.entrySet().removeIf(e -> e.getValue() == recycledSlot);
+        return recycledSlot;
+    }
+
+    /** Mark a slot as used this frame, so recycling cannot steal a slot a live submission depends on. */
+    private void touchSlot(int slot, long frame) {
+        if (slot > 0 && slot < slotLastUsedFrame.length) {
+            slotLastUsedFrame[slot] = frame;
+        }
+    }
+
     /** Write any newly-registered entity textures into the pipeline's bindless set (before the trace). */
     public void uploadPending(RtPipeline pipeline, long sampler) {
+        logPeriodicSummary();
         if (pending.isEmpty()) {
             return;
         }
         for (Pending p : pending) {
             pipeline.setEntityAlbedoTexture(p.slot(), p.view(), sampler);
+            descriptorWrites++;
         }
         pending.clear();
     }
 
-    /** Drop the registry (call when the world pipeline / bindless set is recreated, or textures reload). */
+    /**
+     * One line per {@link #SUMMARY_INTERVAL_FRAMES} naming what the entity-texture array is doing: how many
+     * slots are in use and how often each silent fallback fired since the session started. Without it,
+     * "mis-textured because the array is full" and "mis-textured because a cached handle went stale" are
+     * indistinguishable from the log alone — both just show entities shaded from atlas texels.
+     */
+    private void logPeriodicSummary() {
+        long frame = RtComposite.frameCounter();
+        if (frame == lastSummaryFrame || frame % SUMMARY_INTERVAL_FRAMES != 0L) {
+            return;
+        }
+        lastSummaryFrame = frame;
+        CausticaMod.LOGGER.info("RT entity textures: used={}/{} allocs={} writes={} evictions={} fullFallbacks={} "
+                        + "unresolvedFallbacks={} staleViews={} pending={} white={} renderTypes={} atlases={} layers={}",
+                nextSlot - 1, slotLimit(), slotsAllocated, descriptorWrites, evictions, fullFallbacks,
+                unresolvedFallbacks, staleViewDetections, pending.size(), reservedWhiteSlot,
+                viewCache.size(), atlasSlotCache.size(), layerViewCache.size());
+    }
+
+    /**
+     * Drop the registry (call when the world pipeline / bindless set is recreated, or textures reload).
+     * Deliberately does NOT re-reserve the white fallback: this overload is also the shutdown path, where
+     * touching the TextureManager again is both pointless and unsafe.
+     */
     public void reset() {
-        reset(maxTextures());
+        resetRegistry(maxTextures(), false);
     }
 
     /** Drop the registry for a pipeline whose bindless descriptor arrays have this capacity. */
     public void reset(int descriptorCapacity) {
+        resetRegistry(descriptorCapacity, true);
+    }
+
+    private void resetRegistry(int descriptorCapacity, boolean reserveFallback) {
         capacity = Math.max(1, descriptorCapacity);
         viewCache.clear();
         layerViewCache.clear();
@@ -224,6 +502,32 @@ public final class RtEntityTextures {
         atlasSlotCache.put(TextureAtlas.LOCATION_BLOCKS, 0); // block atlas = the slot-0 fallback
         pending.clear();
         nextSlot = 1;
+        reservedWhiteSlot = 0;
+        int limit = slotLimit();
+        if (slotView.length != limit) {
+            slotView = new long[limit];
+            slotLastUsedFrame = new long[limit];
+        } else {
+            Arrays.fill(slotView, 0L);
+            Arrays.fill(slotLastUsedFrame, 0L);
+        }
+        if (reserveFallback) {
+            reserveWhiteSlot();
+        }
+    }
+
+    /**
+     * Reserve the white fallback's slot now, while the array is still empty. Reserving it lazily — on the
+     * first allocation that needs a fallback — is what made the previous fallback useless in the one case it
+     * exists for: an exhausted array had no room for the white texture either, so the "fallback" quietly
+     * degraded back to slot 0 (the block atlas).
+     */
+    private void reserveWhiteSlot() {
+        reservedWhiteSlot = whiteSlot();
+        if (reservedWhiteSlot == 0) {
+            CausticaMod.LOGGER.warn("RT entity texture white fallback could not be reserved; an exhausted array "
+                    + "keeps degrading to slot 0 (the block atlas)");
+        }
     }
 
     private int slotLimit() {
@@ -274,7 +578,29 @@ public final class RtEntityTextures {
         if (cached != null) {
             return cached;
         }
-        long handle = 0L;
+        long handle = prepareViewHandle(renderType);
+        // A 0 must NOT be cached: caching it pins this render type to the slot-0 fallback (the block atlas)
+        // for the rest of the pipeline's life, even after the texture resolves. Re-resolving costs one
+        // prepare() per frame and lets the surface recover on its own.
+        if (handle != 0L) {
+            viewCache.put(renderType, handle);
+        } else {
+            unresolvedFallbacks++;
+            if (!loggedUnresolved) {
+                loggedUnresolved = true;
+                CausticaMod.LOGGER.warn("RT entity texture view unresolved for {}; sampling the slot-0 fallback "
+                        + "until it resolves", renderType);
+            }
+        }
+        return handle;
+    }
+
+    /**
+     * Uncached resolve: the current primary image-view handle of {@code renderType}, or 0 when the prepared
+     * render type carries no bindable sampler. Stores nothing, so a caller can re-check a surface whose
+     * backing image may have been rebuilt since the cached handle was taken.
+     */
+    private long prepareViewHandle(RenderType renderType) {
         try {
             PreparedRenderType prepared = renderType.prepare();
             GpuTextureView chosen = null;
@@ -292,17 +618,14 @@ public final class RtEntityTextures {
             if (chosen == null) {
                 chosen = firstNonAux;
             }
-            if (chosen != null) {
-                handle = vkImageView(chosen);
-            }
+            return chosen != null ? vkImageView(chosen) : 0L;
         } catch (Throwable t) {
             if (!loggedFailure) {
                 loggedFailure = true;
                 CausticaMod.LOGGER.warn("RT entity texture resolution failed for {}", renderType, t);
             }
+            return 0L;
         }
-        viewCache.put(renderType, handle);
-        return handle;
     }
 
     /** The Vulkan image-view handle of one named sampler of {@code renderType}, or 0 if it binds none. */

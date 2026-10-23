@@ -42,6 +42,9 @@ abstract class GenerateRtBindings extends DefaultTask {
                     OUTPUT: "outputImage", RT_IMAGE: "rtImage", EXPOSURE: "exposureImage", HDR_OUTPUT: "hdrImage",
                     SDR_TONE_LUT: "toneLut", HDR_TONE_LUT: "hdrToneLut", LOOK_LUT: "lookLut", BLOOM: "bloomImage",
                     EXPOSURE_STATE: "exposureState"]],
+            [prefix: "SHARPEN", source: "pipelines/sharpen/main.comp.slang", resources: [
+                    OUTPUT: "outputImage", HDR_OUTPUT: "hdrOutputImage",
+                    SOURCE: "sourceImage", HDR_SOURCE: "hdrSourceImage"]],
             [prefix: "DEBUG_PRESENT", source: "pipelines/debug_present/main.comp.slang", resources: [
                     OUTPUT: "outputImage", G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth",
                     G_MOTION: "gMotion", G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",

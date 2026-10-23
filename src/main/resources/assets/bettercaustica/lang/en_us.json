@@ -31,6 +31,17 @@
 	"caustica.options.rt.agxExposure.tooltip": "Brightness of the AgX grading, which anchors middle grey at a fixed level independent of the exposure above. Raise it with Advanced Color Grading on if the image reads dark at the same Exposure EV.",
 	"caustica.options.rt.agxSaturation": "AgX Saturation",
 	"caustica.options.rt.agxSaturation.tooltip": "Color intensity of the AgX grading, around the image's own brightness. AgX compresses chroma hard as highlights roll off, so values above 1.00 restore the vividness that costs it. 1.00 is neutral.",
+	"caustica.options.rt.agxContrast": "AgX Contrast",
+	"caustica.options.rt.agxContrast.tooltip": "Strength of the AgX contrast curve, applied where AgX works in stops. 100% is the published curve; 0% flattens it into a plain linear render with mid grey untouched; higher values darken shadows and steepen the highlight roll-off for a punchier image. Applies with Advanced Color Grading on.",
+	"caustica.options.rt.agxRange": "AgX Highlight Range",
+	"caustica.options.rt.agxRange.tooltip": "How many stops of scene brightness the AgX grading encodes around mid grey. Wider spends more of the curve on the highlights, so bright skies roll off more gently and the image reads flatter; narrower compresses the same scene into fewer stops for more contrast but harder clipping.",
+	"caustica.options.rt.bloomStrength": "Bloom Strength",
+	"caustica.options.rt.bloomStrength.tooltip": "Runtime multiplier on the look package's bloom: the blurred glow bright lights add to the image before tonemapping. 100% keeps the authored strength, 0% removes it entirely.",
+
+	"caustica.options.rt.sharpen": "Sharpening",
+	"caustica.options.rt.sharpen.tooltip": "Adds back the fine detail the DLSS-RR upscale averages away, applied to the finished image after tonemapping. Turn off to compare against the reconstruction exactly as the upscaler produced it.",
+	"caustica.options.rt.sharpenAmount": "Sharpen Amount",
+	"caustica.options.rt.sharpenAmount.tooltip": "How much of the sharpened detail is added back. 100% is a plain unsharp mask over a 3x3 texel neighbourhood; higher values crisp up texture and thin geometry further but can ring on high-contrast edges.",
 
 	"caustica.options.rt.risCandidates": "Emitter Light Samples",
 	"caustica.options.rt.risCandidates.tooltip": "Candidates each surface tests when picking a glowing block to sample. Higher is less noisy on torch and lava light but costs more. Off falls back to lighting from emitters only when a ray hits one.",
@@ -96,6 +107,8 @@
 	"caustica.options.rt.fog.tooltip": "Analytic height fog integrated inside the path tracer: distant terrain fades into aerial perspective, foggy air picks up sunlight and god rays, and the sky darkens toward the horizon behind it. Off by default.",
 	"caustica.options.rt.fogDensity": "Fog Density",
 	"caustica.options.rt.fogDensity.tooltip": "Fog extinction at the fog base, in 1/block — the same unit as the water medium's absorption. 2% puts the e-folding distance at 50 blocks; higher values close in until only tens of blocks stay visible inside the fog.",
+	"caustica.options.rt.fogDayDecay": "Day/Night Fog Falloff",
+	"caustica.options.rt.fogDayDecay.tooltip": "How much of the sunrise/sunset peak the fog loses at noon and at night. 80% keeps noon at a fifth of the peak and night at a quarter, which is the default look; 0% holds the density constant around the clock; 100% leaves fog only around sunrise and sunset.",
 	"caustica.options.rt.fogHeight": "Fog Height Scale",
 	"caustica.options.rt.fogHeight.tooltip": "How many blocks of altitude the fog takes to fall to 1/e of its base density. Small values hug the ground; large ones fill valleys and climb hillsides.",
 	"caustica.options.rt.fogBaseY": "Fog Base Height",
@@ -159,8 +172,21 @@
 	"caustica.options.rt.fogRainBoost": "Fog Rain Thickening",
 	"caustica.options.rt.fogRainBoost.tooltip": "How strongly rain thickens the fog: density scales by 100% + boost × rain level, on top of the day curve rather than replacing it. 0% keeps the fog weather-blind.",
 
-	"caustica.options.rt.waterTurbidity": "Water Scattering",
-	"caustica.options.rt.waterTurbidity.tooltip": "The fraction of the light water extinguishes that it re-scatters instead of absorbing. This is what underwater sun beams are made of: 0% keeps the previous pure-absorption look, higher values brighten the water body and let shafts read inside it. The scattering keeps the water's tint, so a blue ocean scatters blue.",
+	"caustica.options.rt.shafts": "Sun Shafts",
+	"caustica.options.rt.shafts.tooltip": "Tyndall rays: sunlight scattering in whatever medium the view passes through, independent of volumetric fog. Eight ray-traced sun-visibility probes per pixel trace where the shadow volumes are, and the light is only drawn where the view crosses one — a path that stays in the sun carries no beam, which is what keeps the effect from reading as a haze over the whole frame. In air this is the beams through windows, leaves and cave mouths, with the fog off and the scene still crisp. Underwater the same integrator runs on the water body's own scattering, so the shafts follow the water's extinction and pick up the wave focus where the sunlight crosses the surface; water with no scattering setting has nothing to light.",
+	"caustica.options.rt.shaftIntensity": "Shaft Intensity",
+	"caustica.options.rt.shaftIntensity.tooltip": "Overall strength of the beams, 100% being the physical single scatter of the medium below. This is the cheap knob: it changes no sample count, so raise it instead of the density when the beams are too faint.",
+	"caustica.options.rt.shaftDensity": "Shaft Density",
+	"caustica.options.rt.shaftDensity.tooltip": "Extinction of the air the shafts scatter in, in 1/block. It sets how quickly a beam fades with distance: at the default 1% a 30-block beam carries about a quarter of the medium and a 200-block one nearly all of it, while 3% spends a beam inside 35 blocks. Raising it shortens the beams rather than brightening them — use intensity for brightness.",
+	"caustica.options.rt.shaftAnisotropy": "Shaft Forward Scatter",
+	"caustica.options.rt.shaftAnisotropy.tooltip": "How strongly the airborne light favours the direction of the sun. This is what turns lit haze into a beam: 0% is a flat glow in every direction, 70% gives the long visible rays, and past 90% the beams collapse into a halo around the sun and disappear from the shade they should cross.",
+	"caustica.options.rt.shaftDistance": "Shaft Reach",
+	"caustica.options.rt.shaftDistance.tooltip": "How far from the camera the beams are integrated, in blocks. Shorter keeps the shafts local to the trees and walls in front of you; longer carries them across a valley. Costs the same per pixel either way — this is a look control, not a quality one.",
+	"caustica.options.rt.waterShaftDensity": "Underwater Shaft Density",
+	"caustica.options.rt.waterShaftDensity.tooltip": "Extinction of the water the underwater beams scatter in, in 1/block; 0% removes them. This is a medium of its own, not the water body's scattering: Water Scattering also lights up the water column itself, and this lets you have the beams without that. 3% puts the e-folding at 33 blocks, which is roughly the visibility a murky column has anyway.",
+	"caustica.options.rt.waterShaftCeiling": "Underwater Scatter Ceiling",
+	"caustica.options.rt.waterShaftCeiling.tooltip": "How much brighter the sun's own direction may make the water than the rest of the column. It is the control that keeps the surface you look up at from turning white: the forward lobe peaks far above its surroundings and the path to the surface is long, so without a ceiling the beams arrive an order of magnitude over the water they sit in. Lower gives more directional beams; higher gives a brighter, softer body of water.",
+
 	"caustica.options.rt.waterSpray": "Surface Spray",
 	"caustica.options.rt.waterSpray.tooltip": "A thin band of mist hugging the water surface, densest over agitated wave crests. Rides the marched fog integrator, so volumetric fog with its march tier must be on; 0% keeps it off. Rain thickens it on top of this base.",
 	"caustica.options.rt.waterOpacity": "Water Opacity",
@@ -219,9 +245,11 @@
 	"caustica.sodium.group.overlay": "Overlay",
 	"caustica.sodium.group.exposure": "Exposure",
 	"caustica.sodium.group.tonemap": "Tone mapping",
+	"caustica.sodium.group.sharpen": "Sharpening",
 	"caustica.sodium.group.sky": "Sun and moon",
 	"caustica.sodium.group.water": "Water surface",
 	"caustica.sodium.group.volumetrics": "Volumetrics",
+	"caustica.sodium.group.shafts": "Sun shafts",
 	"caustica.sodium.group.upscaling": "Upscaling",
 	"caustica.sodium.group.frame-generation": "Frame generation",
 	"caustica.sodium.group.reflex": "NVIDIA Reflex",
@@ -230,7 +258,7 @@
 	"caustica.sodium.group.logging": "Logging & diagnostics",
 
 	"caustica.setting.enabled": "Enable Ray Tracing",
-	"caustica.setting.enabled.tooltip": "Trace the scene with hardware ray tracing instead of the built-in rasterizer.",
+	"caustica.setting.enabled.tooltip": "Trace the scene with hardware ray tracing instead of the built-in rasterizer. The Ray Tracing key binding (Controls, Caustica category) flips the same switch in-game.",
 
 	"caustica.setting.worker-threads": "Tracing Worker Threads",
 	"caustica.setting.worker-threads.tooltip": "Background threads that build and upload terrain acceleration structures. More loads terrain faster but takes more CPU time. Applied at startup, so it needs a game restart.",
@@ -348,5 +376,12 @@
 	"caustica.options.rt.screenshot.exrFailed": "Couldn't save Caustica EXR: %s",
 	"caustica.options.rt.screenshot.exrUnavailable": "No ray-traced frame available for a residual-exposure EXR",
 	"caustica.setting.heavyDiagnostics": "Heavy Crash Diagnostics",
-	"caustica.setting.heavyDiagnostics.tooltip": "Enable vendor Vulkan diagnostics and a full crash dump on device loss. Roughly ten times slower acceleration structure builds and a measurable framerate cost, so turn on only while chasing a live crash."
+	"caustica.setting.heavyDiagnostics.tooltip": "Enable vendor Vulkan diagnostics and a full crash dump on device loss. Roughly ten times slower acceleration structure builds and a measurable framerate cost, so turn on only while chasing a live crash.",
+
+	"caustica.hotkey.rt.on": "Ray tracing: on",
+	"caustica.hotkey.rt.off": "Ray tracing: off",
+	"caustica.hotkey.rt.restart": "Ray tracing: on (restart the game to apply)",
+
+	"key.category.caustica.caustica": "Caustica",
+	"key.caustica.toggle-rt": "Toggle Ray Tracing"
 }

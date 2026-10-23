@@ -87,6 +87,14 @@ public struct DisplayPush {
     // Chroma scale about BT.709 luminance, applied to AgX's linear output. AgX spends its range on the
     // highlight shoulder, so it lands well below the authored look's saturation on a photometric scene.
     public float agxSaturation;
+    // Contrast blend on AgX's log-encoded value: 0 replaces the published contrast curve with the
+    // identity (a flat, low-contrast render), 1 is AgX's own curve, and above 1 extrapolates the
+    // deviation for a punchier render. Read per frame.
+    public float agxContrast;
+    // Width in stops of AgX's log2 encoding window around mid grey; the published transform uses 14.
+    // A wider window spends more of the curve on the highlight shoulder, softening the rolloff and
+    // lowering contrast; a narrower one compresses the same scene into fewer stops. Read per frame.
+    public float agxRange;
     // 0 = leave the image alone; 1 = apply the Purkinje (dark-adaptation) brightness shift to the
     // exposed scene-linear image, before either display transform. Read per frame, so it is a live
     // toggle and rebuilds nothing.
@@ -108,4 +116,11 @@ public struct DebugPresentPush {
     public uint debugView;     // 1..9; this pass is only dispatched for debugView != 0
     public float centerWeightSigma;
     public float centerWeightFloor;
+};
+
+public struct SharpenPush {
+    public int hdrEnabled;     // 0 = sharpen the SDR image only, 1 = also the PQ HDR image
+    // Detail gain on the 3x3 high pass: 0 reproduces the input, 1 adds the whole high-pass term back.
+    // One gain serves both images because sRGB and PQ both encode into the same [0,1] code-value range.
+    public float amount;
 };

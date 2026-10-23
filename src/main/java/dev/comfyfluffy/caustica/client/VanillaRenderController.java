@@ -33,9 +33,22 @@ public final class VanillaRenderController {
 		this.inactiveReason = null;
 		this.rtActive = RtComposite.enabled();
 
-		if (!Boolean.valueOf(this.rtActive).equals(this.lastLoggedRtActive)) {
-			this.lastLoggedRtActive = this.rtActive;
-			CausticaMod.LOGGER.info("RT output mode: {}", this.rtActive ? "rt" : "vanilla");
+		// Report the mode the frame will actually be, not the switch that asks for it. The composite is
+		// what produces the image, and it needs a live RT context on the Vulkan backend; with the OpenGL
+		// backend, or before the context exists, the frame is vanilla however the switch is set. Logging
+		// "rt" from the switch alone reads as "the ray tracer is running" and hides exactly that case.
+		boolean rtLive = this.rtActive && RtContext.currentOrNull() != null;
+		if (!Boolean.valueOf(rtLive).equals(this.lastLoggedRtActive)) {
+			this.lastLoggedRtActive = rtLive;
+			if (rtLive) {
+				CausticaMod.LOGGER.info(
+						"RT output mode: rt (the ray tracer produces the frame on the Vulkan backend)");
+			} else if (!this.rtActive) {
+				CausticaMod.LOGGER.info("RT output mode: vanilla (caustica.rt is false)");
+			} else {
+				CausticaMod.LOGGER.info("RT output mode: vanilla (no RT context yet — expected while the"
+						+ " world loads, and permanent on an OpenGL backend)");
+			}
 		}
 
 		if (!this.rtActive) {
@@ -108,6 +121,32 @@ public final class VanillaRenderController {
 		if (this.worldSkipped && !success) {
 			latchFailure("RT composite did not produce a replacement frame");
 		}
+	}
+
+	/**
+	 * Drop the fallback latch so the next frame attempts the RT composite again. The latch records a
+	 * frame that could not be replaced, which is a per-frame condition rather than a permanent one; an
+	 * explicit re-enable (the hot switch or F3+A) is the player asking for that retry.
+	 */
+	public void resetFailureLatch() {
+		if (!this.failureLatched) {
+			return;
+		}
+		this.failureLatched = false;
+		this.inactiveReason = null;
+		this.lastLoggedInactiveReason = null;
+		CausticaMod.LOGGER.info("Vanilla world cancellation failure latch cleared");
+	}
+
+	/**
+	 * Clear every per-frame fallback latch, for the paths that ask RT to try again: enabling the master
+	 * switch and vanilla's render-state invalidation (F3+A). Both the composite's own latch and this
+	 * controller's decide independently whether the RT frame replaces the vanilla one, so clearing only
+	 * one of them leaves the renderer on vanilla for the rest of the session.
+	 */
+	public static void requestRtRetry() {
+		RtComposite.INSTANCE.resetFailureLatch();
+		INSTANCE.resetFailureLatch();
 	}
 
 	public void markMissedBeforeHandSeam() {

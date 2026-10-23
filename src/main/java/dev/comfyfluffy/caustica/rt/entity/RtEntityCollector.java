@@ -188,6 +188,10 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         long materialStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         boolean stochasticAlpha = isTranslucent(renderType);
         capture.currentAlphaBucket = alphaBucket(renderType);
+        // The hurt / spawn-flash overlay is the submission's, not the pipeline's, so the flag word is
+        // assigned rather than OR-ed: bits a previous submission left behind (a custom geometry's
+        // ENTITY_PRIM_UNLIT) must not reach this one. See RtEntityOverlay.
+        capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
         // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim.
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
@@ -203,7 +207,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                     // Dedicated block-entity atlas: albedo remains atlas-bound, while the immutable
                     // canonical texels were pack-compiled. Appending the first-seen sprite header only
                     // records this atlas's UV rectangle; it never mutates an existing material ID.
-                    capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
+                    capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlasSafe(sprite.atlasLocation());
                     capture.currentMaterialId = RtEntityTextures.entityPbr()
                             ? RtMaterialRegistry.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha)
                             : RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
@@ -211,7 +215,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             } else {
                 // Mobs use full per-type textures. Their authored _s/_n maps were decoded into canonical
                 // pages during resource-pack load, so capture stores only the stable material ID.
-                capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
+                // slotForEntity (not slotFor): a mob's 0..1 UVs sampled against slot 0's block atlas are
+                // what turn an entity into coloured atlas blocks or a transparent shell.
+                capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForEntity(renderType);
                 capture.currentMaterialId = RtEntityTextures.INSTANCE.materialIdFor(renderType, stochasticAlpha);
                 capture.clearUvRemap();
             }
@@ -334,7 +340,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private void addQuad(Matrix4f pose, BakedQuad q, int[] tintLayers) {
         TextureAtlasSprite sprite = q.materialInfo().sprite();
         capture.currentTexSlot = sprite != null
-                ? RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation())
+                ? RtEntityTextures.INSTANCE.slotForAtlasSafe(sprite.atlasLocation())
                 : 0;
         // Baked item quads retain the block model's material layer. Mirror terrain's classification so
         // dropped and held translucent block items (glass, ice, etc.) use the thin-dielectric variant
@@ -521,6 +527,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        // Vanilla submits text with no overlay, so the sign/map text a block entity draws must not inherit
+        // the hurt bits its model submission may have left in the flag word.
+        capture.currentPrimFlags = 0;
         Matrix4f pose = poseStack.last().pose();
         Font font = Minecraft.getInstance().font;
         textGlyphVisitor.pose = pose;
@@ -552,7 +561,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             RenderType renderType = renderable.renderType(displayMode);
             boolean stochasticAlpha = isTranslucent(renderType);
             capture.currentAlphaBucket = alphaBucket(renderType);
-            capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
+            capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForEntity(renderType);
             capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
             capture.currentOrder = 0;
             capture.clearUvRemap(); // glyph U/V are already atlas-space
@@ -705,6 +714,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentTexSlot = RtEntityTextures.INSTANCE.whiteSlot();
         capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(false);
         capture.currentAlphaBucket = RtAccel.ENTITY_BUCKET_OPAQUE;
+        // Vanilla's leash vertex format carries no overlay: a hurt entity's leash must not tint with it.
+        capture.currentPrimFlags = 0;
         Matrix4f pose = poseStack.last().pose();
         // Same derivation as LeashFeatureRenderer.prepare: the ribbon's horizontal half-extent is the
         // curve's ground-plane perpendicular, and the attachment offset shifts the whole curve in the
@@ -781,6 +792,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (model == null) {
             return;
         }
+        // Vanilla's moving-block submission takes no overlay at all, so the falling block keeps its own
+        // colour instead of whatever hurt bits the entity's model left in the flag word.
+        capture.currentPrimFlags = 0;
         // No local catch: failures propagate through the entity-capture handler like other entities.
         emitBlockModel(poseStack.last().pose(), model, state, state.blockPos, bs,
                 bs.getSeed(state.randomSeedPos), true);
@@ -841,6 +855,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
         Matrix4f pose = poseStack.last().pose();
         for (BlockStateModelPart part : parts) {
             addQuads(pose, part.getQuads(null), tintLayers);
@@ -865,6 +880,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        // The delegated overload assigns the same value again; doing it here too covers the mesh-only case.
+        capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
         if (!parts.isEmpty()) {
             submitBlockModel(poseStack, renderTypeByLayer.apply(ChunkSectionLayer.SOLID), parts, tintLayers,
                     lightCoords, overlayCoords, outlineColor);
@@ -881,6 +898,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
         addQuads(poseStack.last().pose(), quads, tintLayers);
         addMeshQuads(poseStack, mesh, tintLayers, true);
     }
@@ -908,7 +926,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                              float offsetX, float offsetY, float offsetZ) {
         TextureAtlasSprite sprite = Minecraft.getInstance().getAtlasManager()
                 .getAtlasOrThrow(quad.atlas().getId()).spriteFinder().find(quad);
-        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(quad.atlas().getTextureLocation());
+        capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlasSafe(quad.atlas().getTextureLocation());
         // Chunk-layer translucency denotes a block-derived dielectric; a blended item render type denotes
         // ordinary stochastic alpha when the quad did not come from such a layer.
         boolean transmissive = quad.chunkLayer() == ChunkSectionLayer.TRANSLUCENT;
@@ -973,6 +991,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
         addQuads(poseStack.last().pose(), quads, tintLayers);
     }
 
@@ -997,7 +1016,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // lightning bolt) — binds the white slot so its albedo is exactly the vertex colour. Slot 0 is not
         // a substitute: it is the block atlas, and UV (0,0) lands on whatever sprite is stitched at the
         // atlas origin, which would tint the submission arbitrarily.
-        int textureSlot = lines ? 0 : RtEntityTextures.INSTANCE.slotFor(renderType);
+        int textureSlot = lines ? 0 : RtEntityTextures.INSTANCE.slotForEntity(renderType);
         capture.currentTexSlot = textureSlot != 0 ? textureSlot : RtEntityTextures.INSTANCE.whiteSlot();
         capture.currentMaterialId = lines
                 ? RtMaterialRegistry.INSTANCE.entityFallbackId(false)

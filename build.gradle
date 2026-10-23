@@ -119,6 +119,11 @@ abstract class CompileShaders extends DefaultTask {
 	@OutputDirectory abstract DirectoryProperty getOutDir()
 	@Input abstract Property<String> getSpirvVal()
 	@Input abstract Property<String> getSlangc()
+	// Extra preprocessor defines, space separated (-PshaderDefines=FOO,BAR). Empty for every ordinary
+	// build. This exists so an A/B jar can be produced by this same task with the same compiler and
+	// flags, differing only in the defines — otherwise a "shader is too big" experiment measures the
+	// toolchain as much as the shader.
+	@Input abstract Property<String> getShaderDefines()
 
 	@Inject abstract ExecOperations getExecOps()
 
@@ -142,6 +147,9 @@ abstract class CompileShaders extends DefaultTask {
 		}
 		def includeDirs = srcDir.get().asFileTree.matching { include "**/*.slang" }.files
 				.collect { it.parentFile }.unique().sort { it.absolutePath }
+		def defines = (shaderDefines.getOrElse("") ?: "")
+				.split(",").collect { it.trim() }.findAll { !it.isEmpty() }
+				.collectMany { ["-D", it] }
 		def compileOneSlang = { File src, File spv, List<String> extra ->
 			spv.parentFile.mkdirs()
 			def includes = [src.parentFile] + includeDirs.findAll { it != src.parentFile }
@@ -150,6 +158,7 @@ abstract class CompileShaders extends DefaultTask {
 				commandLine([slangc.get(), src.absolutePath, "-target", "spirv",
 						"-profile", "spirv_1_5", "-matrix-layout-column-major",
 						"-warnings-as-errors", "all", "-warnings-disable", "41012", "-g"]
+						+ defines
 						+ includes.collectMany { ["-I", it.absolutePath] } + extra
 						+ ["-o", spv.absolutePath])
 			}
@@ -176,12 +185,26 @@ abstract class CompileShaders extends DefaultTask {
 			def base = outBase(srcDir.get().asFile, src)
 			def spv = new File(scratchDir, "${base}.spv")
 			def worldIndirectRaygen = base == "pipelines/world/indirect.rgen"
+			def worldPrimaryRaygen = base == "pipelines/world/primary.rgen"
 			if (worldIndirectRaygen) {
 				// Keep a capability-free TraceRay fallback for devices without EXT SER, and
 				// publish the reordered variant separately when the extension is available.
 				compileOneSlang(src, spv, [])
 				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_ser.rgen.spv"),
 						["-DCAUSTICA_ENABLE_EXT_SER", "-capability", "spvShaderInvocationReorderEXT"])
+				// Volume-free twin of this pass: the volumetric scatter calls compile out entirely, so the
+				// raygen carries no fog/water code. It is selected at trace time when every volumetric
+				// switch is off, which is what makes "off" free instead of merely not executing — the
+				// unused code still costs registers, and that cost was 5 ms of the frame.
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean.rgen.spv"),
+						["-DCAUSTICA_NO_VOLUME_PATH"])
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean_ser.rgen.spv"),
+						["-DCAUSTICA_NO_VOLUME_PATH", "-DCAUSTICA_ENABLE_EXT_SER",
+						 "-capability", "spvShaderInvocationReorderEXT"])
+			} else if (worldPrimaryRaygen) {
+				compileOneSlang(src, spv, [])
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_lean.rgen.spv"),
+						["-DCAUSTICA_NO_VOLUME_PATH"])
 			} else {
 				// Pass A intentionally uses ordinary TraceRay.
 				compileOneSlang(src, spv, [])
@@ -208,6 +231,7 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 	outDir = layout.buildDirectory.dir("generated/shaders/bettercaustica/shaders")
 	spirvVal = resolveVulkanTool("spirv-val")
 	slangc = resolveVulkanTool("slangc")
+	shaderDefines = (findProperty("shaderDefines") ?: "").toString()
 }
 
 def generateShaderRecords = tasks.register("generateShaderRecords", GenerateShaderRecords) {

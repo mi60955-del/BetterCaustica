@@ -74,6 +74,7 @@ public final class RtFrameStats {
                     "frame.upscale",
                     "frame.bloom",
                     "frame.displayMap",
+                    "frame.sharpen",
                     "frame.debugPresent",
                     "frame.copyOutput"
             },

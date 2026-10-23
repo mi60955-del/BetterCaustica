@@ -265,6 +265,8 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Volume.FOG_ENABLED);
         scaled(out, Page.VOLUME, "volumetrics", "volume.fog-density", RT + "fogDensity",
                 CausticaConfig.Rt.Volume.FOG_DENSITY, 0, 250, 5, 1000.0, Unit.PERCENT, Impact.MEDIUM);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.fog-day-decay", RT + "fogDayDecay",
+                CausticaConfig.Rt.Volume.FOG_DAY_DECAY, 0, 100, 5, 100.0, Unit.PERCENT, Impact.LOW);
         scaled(out, Page.VOLUME, "volumetrics", "volume.fog-height", RT + "fogHeight",
                 CausticaConfig.Rt.Volume.FOG_HEIGHT, 2, 128, 2, 1.0, Unit.COUNT, Impact.MEDIUM);
         scaled(out, Page.VOLUME, "volumetrics", "volume.fog-base-y", RT + "fogBaseY",
@@ -293,6 +295,26 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Volume.FOG_JITTER, 0, 100, 5, 100.0, Unit.PERCENT, Impact.LOW);
         scaled(out, Page.VOLUME, "volumetrics", "volume.fog-rain-boost", RT + "fogRainBoost",
                 CausticaConfig.Rt.Volume.FOG_RAIN_BOOST, 0, 100, 5, 100.0, Unit.PERCENT, Impact.LOW);
+
+        // ---- Clear-air sun shafts: the god-ray layer that does not need the fog ----------------------
+        // Its own group because it is its own medium: every control here works with the fog off, and the
+        // fog's own controls have no effect on it.
+        toggle(out, Page.VOLUME, "shafts", "volume.shafts", RT + "shafts",
+                CausticaConfig.Rt.Volume.SHAFT_ENABLED);
+        scaled(out, Page.VOLUME, "shafts", "volume.shaft-intensity", RT + "shaftIntensity",
+                CausticaConfig.Rt.Volume.SHAFT_INTENSITY, 0, 400, 5, 100.0, Unit.PERCENT, Impact.MEDIUM);
+        scaled(out, Page.VOLUME, "shafts", "volume.shaft-density", RT + "shaftDensity",
+                CausticaConfig.Rt.Volume.SHAFT_DENSITY, 0, 2000, 10, 100000.0, Unit.PERCENT, Impact.LOW);
+        scaled(out, Page.VOLUME, "shafts", "volume.shaft-anisotropy", RT + "shaftAnisotropy",
+                CausticaConfig.Rt.Volume.SHAFT_ANISOTROPY, 0, 95, 5, 100.0, Unit.PERCENT, Impact.LOW);
+        scaled(out, Page.VOLUME, "shafts", "volume.shaft-distance", RT + "shaftDistance",
+                CausticaConfig.Rt.Volume.SHAFT_DISTANCE, 16, 512, 8, 1.0, Unit.COUNT, Impact.LOW);
+        scaled(out, Page.VOLUME, "shafts", "volume.water-shaft-density", RT + "waterShaftDensity",
+                CausticaConfig.Rt.Volume.WATER_SHAFT_DENSITY, 0, 500, 5, 1000.0, Unit.PERCENT,
+                Impact.LOW);
+        scaled(out, Page.VOLUME, "shafts", "volume.water-shaft-ceiling", RT + "waterShaftCeiling",
+                CausticaConfig.Rt.Volume.WATER_SHAFT_CEILING, 0, 60, 1, 100.0, Unit.PERCENT,
+                Impact.LOW);
 
         // ---- Clouds: the planar sheet and its shadow field ------------------------------------------
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-coverage", RT + "cloudCoverage",
@@ -426,8 +448,18 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Tonemap.AGX_GAIN, 2, 800, 1, 100.0, Unit.MULTIPLE, Impact.LOW);
         scaled(out, Page.IMAGE, "tonemap", "tonemap.agx-saturation", RT + "agxSaturation",
                 CausticaConfig.Rt.Tonemap.AGX_SATURATION, 0, 300, 1, 100.0, Unit.MULTIPLE, Impact.LOW);
+        scaled(out, Page.IMAGE, "tonemap", "tonemap.agx-contrast", RT + "agxContrast",
+                CausticaConfig.Rt.Tonemap.AGX_CONTRAST, 0, 200, 5, 100.0, Unit.PERCENT, Impact.LOW);
+        scaled(out, Page.IMAGE, "tonemap", "tonemap.agx-range", RT + "agxRange",
+                CausticaConfig.Rt.Tonemap.AGX_RANGE, 10, 20, 1, 1.0, Unit.EV, Impact.LOW);
+        scaled(out, Page.IMAGE, "tonemap", "tonemap.bloom-strength", RT + "bloomStrength",
+                CausticaConfig.Rt.Tonemap.BLOOM_STRENGTH, 0, 300, 5, 100.0, Unit.PERCENT, Impact.LOW);
         toggle(out, Page.IMAGE, "tonemap", "tonemap.look-enabled", RT + "look",
                 CausticaConfig.Rt.Tonemap.LOOK_ENABLED);
+        toggle(out, Page.IMAGE, "sharpen", "sharpen.enabled", RT + "sharpen",
+                CausticaConfig.Rt.Sharpen.ENABLED);
+        scaled(out, Page.IMAGE, "sharpen", "sharpen.amount", RT + "sharpenAmount",
+                CausticaConfig.Rt.Sharpen.AMOUNT, 0, 200, 5, 100.0, Unit.PERCENT, Impact.LOW);
         toggle(out, Page.IMAGE, "sky", "sky.vanilla-sun", RT + "vanillaSun",
                 CausticaConfig.Rt.Sky.VANILLA_SUN);
         toggle(out, Page.IMAGE, "sky", "sky.vanilla-moon", RT + "vanillaMoon",
@@ -438,9 +470,6 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Composite.WATER_WAVES);
         scaled(out, Page.WATER, "water", "composite.water-opacity", RT + "waterOpacity",
                 CausticaConfig.Rt.Composite.WATER_OPACITY, 0, 400, 5, 100.0, Unit.PERCENT, Impact.MEDIUM);
-        scaled(out, Page.WATER, "water", "composite.water-turbidity", RT + "waterTurbidity",
-                CausticaConfig.Rt.Composite.WATER_TURBIDITY, 0, 100, 5, 100.0, Unit.PERCENT,
-                Impact.MEDIUM);
         scaled(out, Page.WATER, "water", "composite.water-spray", RT + "waterSpray",
                 CausticaConfig.Rt.Composite.WATER_SPRAY, 0, 100, 5, 100.0, Unit.PERCENT, Impact.MEDIUM);
         scaled(out, Page.WATER, "water", "composite.water-wave-height", RT + "waterWaveHeight",
@@ -542,6 +571,11 @@ public final class CausticaSettings {
         // rebuild below follows.
         if (CausticaConfig.Rt.Volume.QUALITY.tomlPath().equals(option.path())) {
             CausticaConfig.Rt.Volume.applyQuality(option.integer().get());
+        }
+        if (CausticaConfig.Rt.ENABLED.tomlPath().equals(option.path()) && option.bool().value()) {
+            // Switching ray tracing back on is the player asking for a retry, so the fallback latches
+            // recorded by earlier frames must not keep the renderer on vanilla.
+            VanillaRenderController.requestRtRetry();
         }
         if (SURFACE_RECREATE_PATHS.contains(option.path())) {
             // GpuSurface refuses configure() while an image is acquired, so this asks for the rebuild at

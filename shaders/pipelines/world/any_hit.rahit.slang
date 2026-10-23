@@ -74,7 +74,16 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[epr.materialId];
             stochasticAlpha = (materialHeader.features & MATERIAL_FEATURE_STOCHASTIC_ALPHA) != 0u;
         }
-        if (stochasticAlpha) {
+        // Fully-transparent texels are holes in BOTH the radiance and the guide passes, whatever the
+        // stochastic classification says. The cutoff therefore runs before the guide-stable skip: a
+        // stochastic material's guide used to keep every texel of the quad — including alpha≈0 ones the
+        // radiance always cuts — and DLSS-RR reconciled that disagreement by reconstructing a sharp-edged
+        // ghost plane over the hole whenever the radiance SNR dropped (dark scenes; with RR off the
+        // radiance alone is shown and the artifact disappears). Mid-alpha texels keep the guide-stable
+        // mean-composite behavior unchanged.
+        if (entityAlpha < ENTITY_ALPHA_CUTOFF) {
+            IgnoreHit();
+        } else if (stochasticAlpha) {
             uint salt = pid * 1664525u
                     ^ (InstanceID() & IDX_MASK) * 1013904223u
                     ^ asuint(RayTCurrent());
@@ -87,8 +96,6 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                     && alphaDitherThreshold(salt) >= entityAlpha) {
                 IgnoreHit();
             }
-        } else if (entityAlpha < ENTITY_ALPHA_CUTOFF) {
-            IgnoreHit();
         }
 
         // Radiance rays accept the surface and continue to closest-hit. Shadow rays use the same material

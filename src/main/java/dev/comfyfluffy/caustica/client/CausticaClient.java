@@ -25,6 +25,7 @@ public final class CausticaClient implements ClientModInitializer {
 	@Override
 	public void onInitializeClient() {
 		CausticaMod.LOGGER.info("Caustica client initialized");
+		CausticaHotkeys.register();
 
 		// Class-init runs DebugScreenEntries.register(...) via its ID field; touching the class here
 		// makes the entry discoverable in F3's entry list. Off by default -- the player opts in the
@@ -36,9 +37,9 @@ public final class CausticaClient implements ClientModInitializer {
 		// runs on the render thread with the device idle between frames.
 		ClientTickEvents.START_CLIENT_TICK.register(client -> {
 			if (!VanillaRenderController.rtRuntimeWorkRequested()) {
-				if (rtInitDone) {
-					shutdownRt();
-				}
+				// The hot switch only turns per-tick RT work off. The context, worker pool and terrain
+				// residency stay alive: discarding them drops queued worker jobs whose tokens the terrain
+				// barrier still counts, and makes the next enable rebuild the world instead of resuming it.
 				return;
 			}
 
@@ -88,7 +89,9 @@ public final class CausticaClient implements ClientModInitializer {
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
 			RtComposite.INSTANCE.resetExposureHistory();
-			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
+			// F3+A doubles as manual RT recovery after a latched failure: clear the composite's latch and
+			// the controller's, since either one alone still leaves the world on the vanilla path.
+			VanillaRenderController.requestRtRetry();
 		});
 
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {

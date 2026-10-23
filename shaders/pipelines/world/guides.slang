@@ -15,6 +15,13 @@ import trace;
 
 public static float3 gv_normal = float3(0.0, 0.0, 0.0);
 public static float3 gv_albedo = float3(0.0, 0.0, 0.0);
+// Fraction of the camera ray the air volume covers before the guide endpoint. The guides describe ONE
+// layer per pixel, so a fog-dominated pixel has to describe the fog: its radiance is not the surface's
+// shaded colour, and handing RR the surface's normal, roughness, albedo and mirror motion tells the
+// reconstruct that a smooth medium is material — it keeps the medium's own estimator grain as if it were
+// texture detail, and it reprojects that grain with the wrong motion. `writeGuides` blends the whole tuple
+// toward the medium by this factor instead.
+public static float gv_fogOpacity = 0.0;
 // The diffuse-albedo guide's alpha lane is not consumed by DLSS-RR. Preserve whether the visible
 // guide endpoint emits so downstream exposure metering can cap large lava/glowstone populations
 // without another material-ID image.
@@ -38,6 +45,12 @@ public struct SpecSurface {
     public float3 albedo;         // specular albedo fed to DLSS-RR for demodulation (0 = pure diffuse)
 };
 public static SpecSurface gv_spec = {};
+// Set when the foreground specular surface is a wave-perturbed water face. Its normal can aim the
+// mirror below the plane, and the radiance path lifts such a direction to the grazing floor
+// (water.slang's waterReflectedDir); the probe below has to lift it identically, or the reflected
+// image and the motion vector it is reprojected with describe two different scenes on exactly the
+// pixels where the lift fires.
+public static bool gv_specWaveMirror = false;
 
 // Static surfaces reuse one normal for all three roles. Water overrides them (wave-displaced shading
 // normal now and last frame, flat geometric normal for the bias) via the six-argument form.
@@ -103,7 +116,8 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
 
     float3 surfacePos = surface.camRel + worldPush.camOffset;
     float3 n = normalize(surface.normal);
-    float3 specDir = reflect(primaryDir, n);
+    float3 specDir = gv_specWaveMirror ? waterReflectedDir(primaryDir, n, surface.biasNormal)
+            : reflect(primaryDir, n);
 
     // Pass A stops radiance traversal at the first split, so reflection motion keeps one dedicated,
     // deterministic guide probe. CULL_SPECULAR must match the mask the reflected radiance ray will take
@@ -277,11 +291,29 @@ public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, f
         motion = float2(0.0, 0.0);
     }
 
+    // The medium owns this pixel to the extent the camera ray crosses it. Every guide RR uses to
+    // classify the signal moves with that fraction: a camera-facing normal and full roughness (a
+    // volume has no lobe), the fog's own albedo (the term RR demodulates against), and a specular
+    // channel that fades out with the fog — including its motion, which is the MIRROR image's motion
+    // and describes nothing about a volume sitting in front of the mirror. Leaving those guides on the
+    // surface is what made the reconstruct treat the fog's dither as material detail and reproject it
+    // along the reflection.
+    float op = clamp(gv_fogOpacity, 0.0, 1.0);
+    float3 endNormal = length(gv_normal) > 0.5 ? normalize(gv_normal) : -primaryDir;
+    float3 blendedNormal = lerp(endNormal, -primaryDir, op);
+    float3 guideNormal = length(blendedNormal) > 1.0e-4 ? normalize(blendedNormal) : -primaryDir;
+    float guideRough = lerp(gv_rough, 1.0, op);
+    float3 guideAlbedo = lerp(gv_albedo, max(worldPush.fogColor.rgb, float3(0.0)), op);
+    float specWeight = 1.0 - op;
+
     // Guide buffers: first-hit or coherently replaced attributes consumed by the denoiser/DLSS-RR.
-    gNormal[pix] = float4(gv_normal, gv_rough);
-    gAlbedo[pix] = float4(gv_albedo, gv_emissive ? 1.0 : 0.0);
+    // Depth deliberately stays the endpoint's: DLSS-RR is not its only reader — frame generation
+    // reprojects with it and the exposure histogram weights its populations by it, so moving a
+    // fog-dominated pixel's depth off the surface would trade this artifact for two others.
+    gNormal[pix] = float4(guideNormal, guideRough);
+    gAlbedo[pix] = float4(guideAlbedo, gv_emissive ? 1.0 : 0.0);
     gDepth[pix] = depth;
     gMotion[pix] = motion;
-    gSpecAlbedo[pix] = float4(specAlbedo, 1.0);
-    gSpecMotion[pix] = specMotion;
+    gSpecAlbedo[pix] = float4(specAlbedo * specWeight, 1.0);
+    gSpecMotion[pix] = specMotion * specWeight;
 }

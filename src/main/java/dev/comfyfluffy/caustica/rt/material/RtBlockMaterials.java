@@ -32,10 +32,16 @@ public final class RtBlockMaterials {
 
     // Entry.features uses the shared MaterialHeader feature bits (RtMaterialRegistry.FEATURE_*).
 
-    private static final int DEFAULT_PAGE_SIZE = 2048;
+    // Floor for the adaptive page size. Below this the gutter replication dominates the page and the
+    // page count grows without shrinking the total texel footprint, so the smallest useful atlas cell
+    // is what bounds the search.
+    private static final int MIN_PAGE_SIZE = 256;
     private static final int MAX_PAGE_SIZE = 8192;
     private static final int GUTTER = 8;
+    // Highest mip the hit shader can address (MaterialHeader packs this as the LOD clamp), and
+    // therefore the only levels worth building and uploading.
     private static final int MAX_VALID_LOD = 3;
+    private static final int MIP_LEVELS = MAX_VALID_LOD + 1;
     private static final int PACK_ALIGNMENT = 1 << MAX_VALID_LOD;
 
     private final Map<TextureAtlasSprite, Entry> entries = new IdentityHashMap<>();
@@ -44,6 +50,10 @@ public final class RtBlockMaterials {
     // the material-table registry: full textures use [0,1], atlas sprites append their actual atlas rect.
     private final Map<Identifier, Entry> resourceEntries = new HashMap<>();
     private final List<Page> pages = new ArrayList<>();
+    // Bound in place of a channel page nothing samples. One opaque texel carrying that channel's
+    // neutral fill, so even a stray fetch returns the fallback material instead of a missing binding.
+    private RtMaterialPageTexture normalAoPlaceholder;
+    private RtMaterialPageTexture surface1Placeholder;
     private Entry fallback;
     private boolean loggedFailure;
 
@@ -57,12 +67,18 @@ public final class RtBlockMaterials {
                         RtMaterialDesc.EmissionSummary emissionSummary, RtEmissionGrid emissionGrid) {
     }
 
+    /**
+     * One canonical page set. Only the channel pages some compiled material can sample are allocated:
+     * the F0/porosity page is read exclusively under {@code FEATURE_SPEC} and the normal/AO/height page
+     * exclusively under {@code FEATURE_NORMAL}, so a pack that ships one map without the other would
+     * otherwise pay for a full page of texels no fetch reaches.
+     */
     private record Page(RtMaterialPageTexture surface0, RtMaterialPageTexture normalAo,
                         RtMaterialPageTexture surface1, int index) {
         void destroy() {
             surface0.destroy();
-            normalAo.destroy();
-            surface1.destroy();
+            if (normalAo != null) normalAo.destroy();
+            if (surface1 != null) surface1.destroy();
         }
     }
 
@@ -79,7 +95,7 @@ public final class RtBlockMaterials {
         final Identifier normalLocation;
         final int width;
         final int height;
-        int page;
+        int page = -1;
         int x;
         int y;
         RtMaterialDesc.EmissionSummary emissionSummary = RtMaterialDesc.EmissionSummary.NONE;
@@ -113,7 +129,11 @@ public final class RtBlockMaterials {
             if (reserveFallback) y = align(1 + 2 * GUTTER, PACK_ALIGNMENT);
         }
 
-        boolean place(Candidate candidate) {
+        /**
+         * Shelf-place {@code candidate} in this page. {@code assign} writes the resulting cell origin
+         * back to the candidate; a sizing pass runs the same sequence without touching it.
+         */
+        boolean place(Candidate candidate, boolean assign) {
             int cellWidth = align(candidate.width + 2 * GUTTER, PACK_ALIGNMENT);
             int cellHeight = align(candidate.height + 2 * GUTTER, PACK_ALIGNMENT);
             if (cellWidth > size || cellHeight > size) return false;
@@ -123,8 +143,10 @@ public final class RtBlockMaterials {
                 rowHeight = 0;
             }
             if (y + cellHeight > size) return false;
-            candidate.x = x + GUTTER;
-            candidate.y = y + GUTTER;
+            if (assign) {
+                candidate.x = x + GUTTER;
+                candidate.y = y + GUTTER;
+            }
             x += cellWidth;
             rowHeight = Math.max(rowHeight, cellHeight);
             return true;
@@ -137,6 +159,14 @@ public final class RtBlockMaterials {
         resourceEntries.clear();
         fallback = null;
         loggedFailure = false;
+        if (normalAoPlaceholder != null) {
+            normalAoPlaceholder.destroy();
+            normalAoPlaceholder = null;
+        }
+        if (surface1Placeholder != null) {
+            surface1Placeholder.destroy();
+            surface1Placeholder = null;
+        }
         for (Page page : pages) page.destroy();
         pages.clear();
     }
@@ -149,7 +179,6 @@ public final class RtBlockMaterials {
         int specCount = 0;
         int normalCount = 0;
         int heuristicCount = 0;
-        int largest = 1 + 2 * GUTTER;
         for (TextureAtlasSprite sprite : sprites) {
             if (sprite == null) continue;
             Identifier name = sprite.contents().name();
@@ -175,7 +204,6 @@ public final class RtBlockMaterials {
             if (features != 0) {
                 int width = sprite.contents().width();
                 int height = sprite.contents().height();
-                largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
                 authored.add(new Candidate(sprite, name, null, features, spec, normal, width, height));
             }
         }
@@ -190,7 +218,6 @@ public final class RtBlockMaterials {
                 int height = image.getHeight();
                 Identifier spec = siblingTexture(albedo, "_s");
                 Identifier normal = siblingTexture(albedo, "_n");
-                largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
                 authored.add(new Candidate(null, name, albedo, features, spec, normal, width, height));
                 if ((features & RtMaterialRegistry.FEATURE_SPEC) != 0) specCount++;
                 if ((features & RtMaterialRegistry.FEATURE_NORMAL) != 0) normalCount++;
@@ -199,55 +226,82 @@ public final class RtBlockMaterials {
             }
         }
 
-        int pageSize = authored.isEmpty() ? 32 : Math.max(DEFAULT_PAGE_SIZE, nextPowerOfTwo(largest));
-        if (pageSize > MAX_PAGE_SIZE) {
-            CausticaMod.LOGGER.warn("RT material sprite exceeds canonical page limit ({} > {}); oversized maps use neutral fallback",
-                    pageSize, MAX_PAGE_SIZE);
-            pageSize = MAX_PAGE_SIZE;
-            authored.removeIf(candidate -> candidate.width + 2 * GUTTER > MAX_PAGE_SIZE
-                    || candidate.height + 2 * GUTTER > MAX_PAGE_SIZE);
-            if (authored.isEmpty()) pageSize = 32;
+        // A sprite larger than the page limit cannot be packed at any size; those maps keep the neutral
+        // fallback rather than failing the reload.
+        if (authored.removeIf(candidate -> candidate.width + 2 * GUTTER > MAX_PAGE_SIZE
+                || candidate.height + 2 * GUTTER > MAX_PAGE_SIZE)) {
+            CausticaMod.LOGGER.warn("RT material sprite exceeds canonical page limit ({}); oversized maps "
+                    + "use the neutral fallback", MAX_PAGE_SIZE);
         }
-        authored.sort(Comparator.<Candidate>comparingInt(candidate -> candidate.height).reversed()
-                .thenComparing(Comparator.comparingInt((Candidate candidate) -> candidate.width).reversed())
-                .thenComparing(candidate -> candidate.name.toString()));
+        authored.sort(PACK_ORDER);
 
-        List<LayoutPage> layouts = layoutPages(authored, pageSize);
+        // The canonical pages are the renderer's largest texture allocation, and their footprint is
+        // page size times page count, not the sprite area alone: a vanilla-sized atlas packs into a few
+        // 256 pages where one 2048 page is >90% neutral filler, while a high-resolution pack only tiles
+        // efficiently at a wider page because its cells barely divide a small one. The size is therefore
+        // taken from the layout the candidates actually produce.
+        int pageSize = choosePageSize(authored, materialPageCapacity);
+        List<LayoutPage> layouts = layoutPages(authored, pageSize, true);
         if (layouts.size() > materialPageCapacity && authored.removeIf(candidate ->
                 candidate.sprite == null && candidate.features == 0)) {
             // Entity textures with no features and no rule behind them cost page space but render
             // nothing special; drop them and re-pack before failing the reload over descriptor slots.
             CausticaMod.LOGGER.warn("RT material pages exceeded capacity ({} > {}); dropping feature-less "
                     + "entity textures and re-packing", layouts.size(), materialPageCapacity);
-            for (Candidate candidate : authored) candidate.page = -1;
-            layouts = layoutPages(authored, pageSize);
+            pageSize = choosePageSize(authored, materialPageCapacity);
+            layouts = layoutPages(authored, pageSize, true);
         }
         if (layouts.size() > materialPageCapacity) {
             throw new IllegalStateException("RT material pages require " + layouts.size()
                     + " descriptor slots but capacity is " + materialPageCapacity);
         }
 
-        int mipCount = Integer.numberOfTrailingZeros(pageSize) + 1;
-        PagePixels[] pagePixels = new PagePixels[layouts.size()];
-        for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
-            pagePixels[pageIndex] = new PagePixels(pageSize, mipCount);
+        // The header's LOD clamp stops at MAX_VALID_LOD, so the chain below it is built and uploaded
+        // for nothing. The tail is small (the levels past 3 are ~0.4% of the page), but it also removes
+        // eight levels' worth of fill and staging copies per page.
+        int mipCount = Math.min(MIP_LEVELS, Integer.numberOfTrailingZeros(pageSize) + 1);
+        // Feature bits are derived from which sibling maps exist, and an override rule carries the base
+        // description's bits through unchanged, so this scan is exact: a channel page no compiled
+        // material carries a bit for is never sampled (see evaluateMaterial in closest_hit.rchit).
+        boolean needNormalAo = false;
+        boolean needSurface1 = false;
+        for (Candidate candidate : authored) {
+            if (candidate.page < 0) continue;
+            needNormalAo |= (candidate.features & RtMaterialRegistry.FEATURE_NORMAL) != 0;
+            needSurface1 |= (candidate.features & RtMaterialRegistry.FEATURE_SPEC) != 0;
         }
-        pagePixels[0].writeFallback();
-        // Decode + blit in parallel: each candidate owns a disjoint (aligned, gutter-inclusive) cell of
-        // its page, so writes never overlap; failures only touch the candidate's own fields.
-        authored.parallelStream().forEach(candidate -> {
-            try {
-                Decoded decoded = decode(candidate);
-                candidate.emissionSummary = decoded.emissionSummary();
-                candidate.emissionGrid = decoded.emissionGrid();
-                pagePixels[candidate.page].write(candidate, decoded.levels());
-            } catch (Throwable t) {
-                warnOnce("RT canonical material decode failed for " + candidate.name, t);
-                candidate.page = -1;
-            }
-        });
+        if (!needNormalAo) {
+            normalAoPlaceholder = placeholder(ctx, new byte[]{(byte) 0x80, (byte) 0x80, (byte) 0xFF, (byte) 0xFF},
+                    "material normalAo placeholder");
+        }
+        if (!needSurface1) {
+            surface1Placeholder = placeholder(ctx, new byte[]{10, 10, 10, 0}, "material surface1 placeholder");
+        }
+        List<List<Candidate>> perPage = new ArrayList<>(layouts.size());
         for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
-            PagePixels pixels = pagePixels[pageIndex];
+            perPage.add(new ArrayList<>());
+        }
+        for (Candidate candidate : authored) {
+            if (candidate.page >= 0) perPage.get(candidate.page).add(candidate);
+        }
+        for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
+            // One page's texels at a time: a single 2048 page already holds 3 x 16 MiB of level-0
+            // channels, and holding every page of a multi-page pack simultaneously is what made the
+            // canonical build a multi-GiB allocation spike.
+            PagePixels pixels = new PagePixels(pageSize, mipCount, needNormalAo, needSurface1);
+            // Decode + blit in parallel: each candidate owns a disjoint (aligned, gutter-inclusive) cell
+            // of its page, so writes never overlap; failures only touch the candidate's own fields.
+            perPage.get(pageIndex).parallelStream().forEach(candidate -> {
+                try {
+                    Decoded decoded = decode(candidate);
+                    candidate.emissionSummary = decoded.emissionSummary();
+                    candidate.emissionGrid = decoded.emissionGrid();
+                    pixels.write(candidate, decoded.levels());
+                } catch (Throwable t) {
+                    warnOnce("RT canonical material decode failed for " + candidate.name, t);
+                    candidate.page = -1;
+                }
+            });
             // Created one at a time and registered only as a complete Page: if a later texture throws,
             // the already-created ones are destroyed instead of leaking outside the page list.
             RtMaterialPageTexture surface0 = null;
@@ -256,10 +310,14 @@ public final class RtBlockMaterials {
             try {
                 surface0 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface0,
                         "material surface0 page " + pageIndex);
-                normalAo = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.normalAo,
-                        "material normalAo page " + pageIndex);
-                surface1 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
-                        "material surface1 page " + pageIndex);
+                if (pixels.normalAo != null) {
+                    normalAo = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.normalAo,
+                            "material normalAo page " + pageIndex);
+                }
+                if (pixels.surface1 != null) {
+                    surface1 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
+                            "material surface1 page " + pageIndex);
+                }
                 pages.add(new Page(surface0, normalAo, surface1, pageIndex));
             } catch (Throwable t) {
                 if (surface0 != null) surface0.destroy();
@@ -297,21 +355,31 @@ public final class RtBlockMaterials {
             bytesPerBundle += (long) w * w * 4L;
             w = Math.max(1, w / 2);
         }
-        CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
+        int channelPages = 1 + (needNormalAo ? 1 : 0) + (needSurface1 ? 1 : 0);
+        CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, pages={}, size={}x{}, levels={}, channels={}, validLod<={}, gpuMiB={}",
                 sprites.size(), resourceEntries.size(), specCount, normalCount, heuristicCount,
-                pages.size(), pageSize, pageSize, MAX_VALID_LOD,
-                String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * 3.0 / (1024.0 * 1024.0)));
+                pages.size(), pageSize, pageSize, mipCount, channelPages, MAX_VALID_LOD,
+                String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * channelPages
+                        / (1024.0 * 1024.0)));
     }
 
     public void bindPages(RtPipeline pipeline, long sampler) {
+        long normalAoView = normalAoPlaceholder != null ? normalAoPlaceholder.view() : 0L;
+        long surface1View = surface1Placeholder != null ? surface1Placeholder.view() : 0L;
         for (Page page : pages) {
-            pipeline.setMaterialPage(page.index(), page.surface0().view(), page.normalAo().view(),
-                    page.surface1().view(), sampler);
+            pipeline.setMaterialPage(page.index(), page.surface0().view(),
+                    page.normalAo() != null ? page.normalAo().view() : normalAoView,
+                    page.surface1() != null ? page.surface1().view() : surface1View, sampler);
         }
     }
 
     public Entry entry(TextureAtlasSprite sprite) {
         return entries.getOrDefault(sprite, fallback);
+    }
+
+    /** A 1x1 page-format texture carrying {@code texel}, for a channel page nothing samples. */
+    private static RtMaterialPageTexture placeholder(RtContext ctx, byte[] texel, String label) {
+        return new RtMaterialPageTexture(ctx, 1, 1, List.of(texel), label);
     }
 
     public Map<TextureAtlasSprite, Entry> preparedEntries() {
@@ -467,22 +535,20 @@ public final class RtBlockMaterials {
 
     private static final class PagePixels {
         final List<byte[]> surface0;
+        /** Null when no compiled material samples the normal/AO/height channel page. */
         final List<byte[]> normalAo;
+        /** Null when no compiled material samples the F0/porosity channel page. */
         final List<byte[]> surface1;
         final int pageSize;
 
-        PagePixels(int pageSize, int mipCount) {
+        PagePixels(int pageSize, int mipCount, boolean needNormalAo, boolean needSurface1) {
             this.pageSize = pageSize;
             surface0 = allocate(pageSize, mipCount, 255, 0, 0, 0);
             // Flat normal, full AO, and height 255 (0% depth) outside every candidate cell. The alpha
             // matters as much as the others: the unclaimed page area is what a feature-less material
             // samples as its fallback, and a 0 there would parallax it a quarter block inward.
-            normalAo = allocate(pageSize, mipCount, 128, 128, 255, 255);
-            surface1 = allocate(pageSize, mipCount, 10, 10, 10, 0);
-        }
-
-        void writeFallback() {
-            // Neutral arrays already contain the fallback texel and its replicated surroundings.
+            normalAo = needNormalAo ? allocate(pageSize, mipCount, 128, 128, 255, 255) : null;
+            surface1 = needSurface1 ? allocate(pageSize, mipCount, 10, 10, 10, 0) : null;
         }
 
         void write(Candidate candidate, List<RtMaterialTextureData.Level> levels) {
@@ -493,8 +559,12 @@ public final class RtBlockMaterials {
                 int cy = candidate.y >> mip;
                 int gutter = Math.max(1, GUTTER >> mip);
                 blit(surface0.get(mip), width, cx, cy, gutter, level.width(), level.height(), level.surface0());
-                blit(normalAo.get(mip), width, cx, cy, gutter, level.width(), level.height(), level.normalAo());
-                blit(surface1.get(mip), width, cx, cy, gutter, level.width(), level.height(), level.surface1());
+                if (normalAo != null) {
+                    blit(normalAo.get(mip), width, cx, cy, gutter, level.width(), level.height(), level.normalAo());
+                }
+                if (surface1 != null) {
+                    blit(surface1.get(mip), width, cx, cy, gutter, level.width(), level.height(), level.surface1());
+                }
             }
         }
 
@@ -543,23 +613,78 @@ public final class RtBlockMaterials {
         return sprites != null ? sprites : List.of();
     }
 
-    /** Shelf-pack every candidate into as few canonical pages as fit, setting each candidate's page. */
-    private static List<LayoutPage> layoutPages(List<Candidate> authored, int pageSize) {
+    /**
+     * Choose the page size whose total texel area is smallest once the candidates are actually laid
+     * out. Gutter replication and shelf rounding make the footprint non-monotonic in page size — a
+     * larger page can pack worse than a smaller one — so every power of two from the largest cell up is
+     * laid out (without publishing positions) and the cheapest page count times area wins. Sizes that
+     * would need more pages than the bindless descriptor budget allows are skipped; the largest page is
+     * the fallback when nothing fits, which lets the caller report the capacity failure it already has.
+     */
+    private static int choosePageSize(List<Candidate> authored, int pageCapacity) {
+        if (authored.isEmpty()) return 32;
+        int largestCell = 1 + 2 * GUTTER;
+        for (Candidate candidate : authored) {
+            largestCell = Math.max(largestCell, Math.max(candidate.width, candidate.height) + 2 * GUTTER);
+        }
+        int minSize = Math.max(MIN_PAGE_SIZE, nextPowerOfTwo(largestCell));
+        int best = MAX_PAGE_SIZE;
+        long bestArea = Long.MAX_VALUE;
+        for (int size = minSize; size <= MAX_PAGE_SIZE; size <<= 1) {
+            int pageCount = layoutPages(authored, size, false).size();
+            if (pageCount > pageCapacity) continue;
+            long area = (long) pageCount * size * size;
+            if (area < bestArea) {
+                bestArea = area;
+                best = size;
+            }
+        }
+        return best;
+    }
+
+    /** Tallest cells first, then widest, so the shelf packer loses the least area to row rounding. */
+    private static final Comparator<Candidate> PACK_ORDER =
+            Comparator.<Candidate>comparingInt(candidate -> candidate.height).reversed()
+                    .thenComparing(Comparator.comparingInt((Candidate candidate) -> candidate.width).reversed())
+                    .thenComparing(candidate -> candidate.name.toString());
+
+    /**
+     * The page size and page count {@link #prepareAll} would choose for sprites of these extents,
+     * without a GPU, resource manager or atlas. Keep the layout invariants — the smallest total
+     * footprint wins rather than the largest page — covered without a device.
+     */
+    static int[] planPages(int[][] extents, int pageCapacity) {
+        List<Candidate> authored = new ArrayList<>(extents.length);
+        for (int[] extent : extents) {
+            authored.add(new Candidate(null, Identifier.withDefaultNamespace("test/sprite_" + authored.size()),
+                    null, 0, null, null, extent[0], extent[1]));
+        }
+        authored.sort(PACK_ORDER);
+        int pageSize = choosePageSize(authored, pageCapacity);
+        return new int[]{pageSize, layoutPages(authored, pageSize, false).size()};
+    }
+
+    /**
+     * Shelf-pack every candidate into canonical pages of {@code pageSize}. {@code assign} publishes each
+     * candidate's page and cell origin; a sizing pass leaves them untouched so a trial layout cannot be
+     * observed by anything that reads the candidates.
+     */
+    private static List<LayoutPage> layoutPages(List<Candidate> authored, int pageSize, boolean assign) {
         List<LayoutPage> layouts = new ArrayList<>();
         layouts.add(new LayoutPage(pageSize, true));
         for (Candidate candidate : authored) {
             boolean placed = false;
             for (int i = 0; i < layouts.size(); i++) {
-                if (layouts.get(i).place(candidate)) {
-                    candidate.page = i;
+                if (layouts.get(i).place(candidate, assign)) {
+                    if (assign) candidate.page = i;
                     placed = true;
                     break;
                 }
             }
             if (!placed) {
                 LayoutPage page = new LayoutPage(pageSize, false);
-                if (!page.place(candidate)) continue;
-                candidate.page = layouts.size();
+                if (!page.place(candidate, assign)) continue;
+                if (assign) candidate.page = layouts.size();
                 layouts.add(page);
             }
         }

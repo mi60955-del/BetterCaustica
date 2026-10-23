@@ -156,11 +156,12 @@ public final class RtDisplayPipeline {
 
     /**
      * Run the display mapping. {@code advancedGrading} selects the SDR chain: false applies the look LMT
-     * ({@code lookEnabled}) and samples the baked ACES 2.0 LUT, true runs AgX with {@code agxGain} and
-     * {@code agxSaturation}. The PQ HDR image always comes from the HDR LUT, which is baked for a fixed
-     * mastering-nits peak (see {@code CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS}) and selected host-side by
-     * which LUT resource is bound. SDR (binding 0) always writes; the HDR image (binding 3) also writes
-     * when {@code hdrEnabled}.
+     * ({@code lookEnabled}) and samples the baked ACES 2.0 LUT, true runs AgX with {@code agxGain},
+     * {@code agxSaturation}, the contrast blend {@code agxContrast} (1 is AgX's published curve) and the
+     * encoding-window width {@code agxRange} in stops (14 is the published default). The PQ HDR image
+     * always comes from the HDR LUT, which is baked for a fixed mastering-nits peak (see
+     * {@code CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS}) and selected host-side by which LUT resource is
+     * bound. SDR (binding 0) always writes; the HDR image (binding 3) also writes when {@code hdrEnabled}.
      *
      * <p>{@code purkinjeEnabled} re-weights the exposed scene-linear image by the CIE mesopic response
      * before either display path, and {@code purkinjeStrength} scales that deviation (1 is the CIE
@@ -171,14 +172,15 @@ public final class RtDisplayPipeline {
     public void dispatch(VkCommandBuffer cmd, int width, int height, boolean hdrEnabled, int lutSize,
                          float gamma, float hdrPeakNits, boolean lookEnabled, int lookLutSize,
                          float bloomStrength, boolean advancedGrading, float agxGain, float agxSaturation,
-                         boolean purkinjeEnabled, float purkinjeStrength) {
+                         float agxContrast, float agxRange, boolean purkinjeEnabled,
+                         float purkinjeStrength) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display compute")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipeline());
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipelineLayout(), 0, stack.longs(gpu.descriptorSet()), null);
             ByteBuffer push = stack.malloc(DisplayPushData.BYTE_SIZE);
             new DisplayPushData(hdrEnabled ? 1 : 0, (float) lutSize, gamma, hdrPeakNits,
                     lookEnabled ? 1 : 0, (float) lookLutSize, bloomStrength,
-                    advancedGrading ? 1 : 0, agxGain, agxSaturation,
+                    advancedGrading ? 1 : 0, agxGain, agxSaturation, agxContrast, agxRange,
                     purkinjeEnabled ? 1 : 0, purkinjeStrength).write(push);
             VK10.vkCmdPushConstants(cmd, gpu.pipelineLayout(), VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);

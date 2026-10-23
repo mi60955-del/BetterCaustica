@@ -34,11 +34,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 
 // Each display-chain push-constant struct (shaders/common/display_common.slang) gets its own tiny
-// entry point below: SPIR-V permits only one push-constant block reachable per entry point, so
-// probing four distinct push-constant structs in one module needs four distinct entry points, each
-// touching exactly one. All four are still reported in the same reflection-json pass because
-// reflection parameters are enumerated module-wide, not per-entry-point -- see the main() probe
-// above for the equivalent structured-buffer case.
+// entry point below: SPIR-V permits only one push-constant block reachable per entry point, so probing
+// several distinct push-constant structs in one module needs one entry point per struct, each touching
+// exactly one. All of them are still reported in the same reflection-json pass because reflection
+// parameters are enumerated module-wide, not per-entry-point -- see the main() probe above for the
+// equivalent structured-buffer case.
 
 [[vk::push_constant]] ExposureHistPush exposureHistPushProbe;
 [shader("compute")]
@@ -92,5 +92,14 @@ void probePushAddr(uint3 id : SV_DispatchThreadID) {
 void probeBloomPush(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0xFFFFFFFFu) {
         float sink = float(bloomPushProbe.mode) + bloomPushProbe.radius;
+    }
+}
+
+[[vk::push_constant]] SharpenPush sharpenPushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeSharpenPush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(sharpenPushProbe.hdrEnabled) + sharpenPushProbe.amount;
     }
 }

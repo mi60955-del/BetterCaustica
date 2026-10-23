@@ -452,10 +452,14 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (hdrImage == 0L) {
 			return;
 		}
+		// The interpolation source and its output are described with the HDR backbuffer's own extent, not the
+		// swapchain's: the two can differ by a pixel in either axis, and a description that disagrees with the
+		// image actually read and written puts the generated frame on another vertical scale. The swapchain
+		// extent still drives the blit's clip in the presenter.
 		int generatedCount = RtFramePresenter.generatedFramesPerRendered();
 		RtFramePresenter.INSTANCE.prepareExtraFrames(enc, this.device, this.swapchain, this.swapchainImages,
 				this.presentSemaphores, this.swapchainWidth, this.swapchainHeight,
-				hdrView, hdrImage, this.swapchainWidth, this.swapchainHeight, generatedCount, true);
+				hdrView, hdrImage, rt.hdrBackbufferWidth(), rt.hdrBackbufferHeight(), generatedCount, true);
 	}
 
 	// Present the FG-generated frame(s) acquired/recorded at blitFromTexture TAIL — at present() HEAD, after

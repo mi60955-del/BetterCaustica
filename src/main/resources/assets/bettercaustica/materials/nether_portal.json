@@ -1,0 +1,9 @@
+{
+  "format": 2,
+  "match": {
+    "sprite": "minecraft:block/nether_portal"
+  },
+  "emission": {
+    "strength_cd_m2": 250.0
+  }
+}

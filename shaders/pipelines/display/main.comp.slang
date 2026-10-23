@@ -154,7 +154,6 @@ float3 tonemapHdr(float3 lookedAcesCg) {
 // with the Abney correction folded in, and APM -> linear BT.709 on the way out. They are stored as rows
 // and applied with dot() so the build's column-major matrix layout can't transpose them.
 static const float AGX_MID_GREY = 0.18;
-static const float AGX_EV_RANGE = 14.0;
 
 static const float3 AGX_FROM_ACESCG_R = float3( 1.42335736, -0.44430356,  0.02108223);
 static const float3 AGX_FROM_ACESCG_G = float3(-0.04514778,  0.96591471,  0.07919589);
@@ -191,9 +190,18 @@ float3 agxDisplayLinear(float3 exposedAcesCg) {
             dot(scaled, AGX_FROM_ACESCG_G),
             dot(scaled, AGX_FROM_ACESCG_B)));
 
-    float halfRange = AGX_EV_RANGE * 0.5;
+    // The encoding window is a control, not a constant: the published 14 stops is only the default
+    // width of the log2 domain the contrast curve then works on. Clamped here rather than trusting
+    // the config layer alone, because a degenerate range (<= 0 stops) would divide by zero below.
+    float range = clamp(pc.agxRange, 4.0, 24.0);
+    float halfRange = range * 0.5;
     float3 stops = clamp(log2(max(apm, float3(1.0e-7)) / AGX_MID_GREY), -halfRange, halfRange);
-    float3 bt709 = agxContrast((stops + halfRange) / AGX_EV_RANGE);
+    float3 encoded = (stops + halfRange) / range;
+    // Blend the published curve against the identity on the log-encoded value. The blend is
+    // extrapolated above 1, so the S-curve's deviation doubles at 2; clamped because that
+    // extrapolation can leave the [0,1] domain the rest of the transform assumes.
+    float blend = clamp(pc.agxContrast, 0.0, 2.0);
+    float3 bt709 = clamp(lerp(encoded, agxContrast(encoded), blend), 0.0, 1.0);
 
     return fitToPositiveGamut(float3(
             dot(bt709, AGX_TO_BT709_R),

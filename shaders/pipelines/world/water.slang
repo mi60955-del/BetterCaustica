@@ -225,6 +225,34 @@ public static float2 waterWaveRelief(float2 worldXZ, float surfaceY, float3 rayD
     return worldXZ + rayDir.xz * travel;
 }
 
+// A perturbed normal can aim the mirror below its own plane, and the steeper the field is driven, the
+// more of the sea does it: at the top of the height control more than a third of a low grazing
+// reflection aims down instead of at the sky. Such a reflection would have to leave through the body,
+// and the water there absorbs it — the same facet shadowing waterReflectance stands in for — so it is
+// lifted to a grazing floor rather than launched.
+//
+// Launching it is not merely a wasted reflection. offsetSurfaceOrigin biases along the geometric
+// normal, which on a water top face points up, so a downward direction puts the origin 0.005 blocks
+// under the surface while the medium stack still says air: the ray then crosses the seafloor
+// unattenuated and uncausticed, and pays for a full opaque vertex (NEE, RIS, continuation) where a sky
+// miss would have cost one traversal. The floor keeps the azimuth, so the reflection slides along the
+// horizon band instead of jumping.
+//
+// The floor sits on the side the ray arrived from, because that is the half-space the mirror has to
+// leave into: raised for a surface seen from the air, mirrored down when the eye is inside the body and
+// the reflection has to stay submerged. A flowing side sheet (|faceNormal.y| small) has no such floor —
+// the field never owns its normal in the first place.
+public static const float WATER_REFLECT_MIN_Y = 0.02;  // sine of the lowest reflected elevation kept
+
+public float3 waterReflectedDir(float3 rd, float3 n, float3 faceNormal) {
+    float3 r = reflect(rd, n);
+    float side = faceNormal.y >= 0.0 ? 1.0 : -1.0;
+    if (abs(faceNormal.y) < 0.5 || r.y * side >= WATER_REFLECT_MIN_Y) return r;
+    float2 h = r.xz / max(length(r.xz), 1.0e-4);
+    float c = sqrt(max(1.0 - WATER_REFLECT_MIN_Y * WATER_REFLECT_MIN_Y, 0.0));
+    return float3(h.x * c, WATER_REFLECT_MIN_Y * side, h.y * c);
+}
+
 /**
  * Perturb a (near-)horizontal water surface normal by the field. Flowing side faces (|n.y| small) keep
  * their flat geometric normal: the field is defined over the horizontal plane, and a vertical sheet of

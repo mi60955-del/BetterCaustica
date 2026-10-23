@@ -65,7 +65,7 @@ public final class RtToneLut {
         return sampler;
     }
 
-    /** Loads a display-transform resource from {@code /bettercaustica/color/luts/}. */
+    /** Loads a display-transform resource from {@code /caustica/color/luts/}. */
     public static RtToneLut load(RtContext ctx, String resourceName) {
         return loadResource(ctx, "/bettercaustica/color/luts/" + resourceName);
     }

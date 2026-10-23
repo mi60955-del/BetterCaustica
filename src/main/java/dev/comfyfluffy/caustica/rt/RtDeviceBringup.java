@@ -198,21 +198,29 @@ public final class RtDeviceBringup {
             RAY_QUERY_FEATURE);
 
     private enum SerBackend {
-        NONE("none", null, "primary.rgen.spv", "indirect.rgen.spv"),
+        NONE("none", null, "primary.rgen.spv", "indirect.rgen.spv",
+                "primary_lean.rgen.spv", "indirect_lean.rgen.spv"),
         EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
-                "primary.rgen.spv", "indirect_ser.rgen.spv");
+                "primary.rgen.spv", "indirect_ser.rgen.spv",
+                "primary_lean.rgen.spv", "indirect_lean_ser.rgen.spv");
 
         final String label;
         final String extensionName;
         final String worldPrimaryRaygenShader;
         final String worldRaygenShader;
+        /** The same two passes with the volumetric scatter compiled out. */
+        final String worldPrimaryLeanRaygenShader;
+        final String worldLeanRaygenShader;
 
         SerBackend(String label, String extensionName, String worldPrimaryRaygenShader,
-                   String worldRaygenShader) {
+                   String worldRaygenShader, String worldPrimaryLeanRaygenShader,
+                   String worldLeanRaygenShader) {
             this.label = label;
             this.extensionName = extensionName;
             this.worldPrimaryRaygenShader = worldPrimaryRaygenShader;
             this.worldRaygenShader = worldRaygenShader;
+            this.worldPrimaryLeanRaygenShader = worldPrimaryLeanRaygenShader;
+            this.worldLeanRaygenShader = worldLeanRaygenShader;
         }
     }
 
@@ -237,6 +245,16 @@ public final class RtDeviceBringup {
 
     public static String worldPrimaryRaygenShader() {
         return serBackend.worldPrimaryRaygenShader;
+    }
+
+    /** Pass A raygen with the volumetric paths compiled out, for frames with every volume switch off. */
+    public static String worldPrimaryLeanRaygenShader() {
+        return serBackend.worldPrimaryLeanRaygenShader;
+    }
+
+    /** Pass B raygen with the volumetric paths compiled out, matching the pass A twin. */
+    public static String worldLeanRaygenShader() {
+        return serBackend.worldLeanRaygenShader;
     }
 
     /** True if {@code VK_EXT_opacity_micromap} was enabled on the device (gate on + device support). */

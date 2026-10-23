@@ -841,7 +841,21 @@ public final class RtAccel {
         return build;
     }
 
-    /** One triangle geometry per bucket, in {@link #TERRAIN_BUCKETS} order; only solid is flagged opaque. */
+    /**
+     * Ceiling probe for the terrain cutout any-hit cost. With {@code -Dcaustica.rt.probe.cutoutOpaque} the
+     * cutout bucket is built as opaque geometry, so {@code world.rahit} is never invoked on it and leaf
+     * holes stop discarding rays. The frame-time delta against a probe-free run therefore bounds what an
+     * exactly-classified opacity micromap could ever save. Read once per process so the BLAS size query and
+     * the build that follows always agree on the geometry flags.
+     */
+    private static final boolean CUTOUT_OPAQUE_PROBE = Boolean.getBoolean("caustica.rt.probe.cutoutOpaque");
+
+    /** True when the cutout bucket is being built opaque for the any-hit ceiling measurement. */
+    public static boolean cutoutOpaqueProbeActive() {
+        return CUTOUT_OPAQUE_PROBE;
+    }
+
+    /** One triangle geometry per bucket, in {@link #TERRAIN_BUCKETS} order. */
     private static VkAccelerationStructureGeometryKHR.Buffer terrainGeometries(MemoryStack stack, long vertexAddr,
                                                                                long indexAddr, int vertexCount, int[] bucketTris,
                                                                                OpacityMicromap opacityMicromap) {
@@ -860,8 +874,11 @@ public final class RtAccel {
         }
         for (int b = 0; b < bucketTris.length; b++) {
             VkAccelerationStructureGeometryKHR out = geom.get(b);
-            fillTriangleGeometry(out, vertexAddr, indexAddr, vertexCount, b == BUCKET_SOLID);
-            if (b == BUCKET_CUTOUT && ommAttachment != null) {
+            fillTriangleGeometry(out, vertexAddr, indexAddr, vertexCount,
+                    b == BUCKET_SOLID || (CUTOUT_OPAQUE_PROBE && b == BUCKET_CUTOUT));
+            // The probe already removes every cutout any-hit invocation, so a micromap attached here would
+            // describe geometry the traversal never tests.
+            if (b == BUCKET_CUTOUT && ommAttachment != null && !CUTOUT_OPAQUE_PROBE) {
                 out.geometry().triangles().pNext(ommAttachment.address());
             }
         }

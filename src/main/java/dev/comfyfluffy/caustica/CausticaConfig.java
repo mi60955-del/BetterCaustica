@@ -613,16 +613,6 @@ public final class CausticaConfig {
             public static final FloatSetting WATER_OPACITY =
                     clampedFloat("caustica.rt.waterOpacity", "composite.water-opacity", 4.0f, 0.0f, 4.0f);
             /**
-             * The water's own single-scatter fraction sigmaS/sigmaT: how much of the light the water
-             * extinguishes it re-scatters instead of absorbing. Drives the underwater light shafts —
-             * 0 is the previous behaviour (pure absorption, no in-scatter), higher values brighten
-             * the water body and let sun beams read inside it. The scattering inherits the water's
-             * tint by construction, so tinted bodies scatter tinted light.
-             */
-            public static final FloatSetting WATER_TURBIDITY =
-                    clampedFloat("caustica.rt.waterTurbidity", "composite.water-turbidity",
-                            0.35f, 0.0f, 1.0f);
-            /**
              * Strength of the spray band hugging the water surface: mist whose density follows the
              * wave crests' steepness. Rides the marched fog integrator, so it needs volumetric fog
              * with the march tier on; 0 keeps it off entirely. Rain pushes it up on top of this base.
@@ -715,6 +705,35 @@ public final class CausticaConfig {
             public static final FloatSetting FOG_DENSITY =
                     clampedFloat("caustica.rt.volume.fogDensity", "volume.fog-density",
                             0.02f, 0.0f, 0.25f);
+            /**
+             * How much of the dawn/dusk peak the fog loses at noon and at night, 0..1. The day factor
+             * multiplies {@link #FOG_DENSITY}: 1 across the horizon where the low-sun mist lives,
+             * 1 - decay at noon, and a quarter again as much at midnight so night fog stays slightly
+             * thicker than noon fog. 0 holds the density flat through the whole day; 1 leaves fog only
+             * around sunrise and sunset.
+             */
+            public static final FloatSetting FOG_DAY_DECAY =
+                    clampedFloat("caustica.rt.volume.fogDayDecay", "volume.fog-day-decay",
+                            0.80f, 0.0f, 1.0f);
+
+            /**
+             * Fog density multiplier for a sun elevation in -1..1: +1 at noon, 0 at 06:00/18:00, -1 at
+             * midnight. A gaussian in elevation (sigma ~14 degrees) is the twilight peak; smoothstep
+             * plateaus hold the noon and night floors so the fog never fully leaves away from the
+             * horizon. Both plateaus ramp in past +/-0.10 elevation so the twilight peak owns the
+             * horizon stretch unopposed.
+             */
+            public static float fogDayFactor(float sunElevation, float decay) {
+                float twilight = (float) Math.exp(-(sunElevation * sunElevation) / (0.25f * 0.25f));
+                float dayPlateau = Math.clamp((sunElevation - 0.10f) / 0.30f, 0.0f, 1.0f);
+                dayPlateau = dayPlateau * dayPlateau * (3.0f - 2.0f * dayPlateau);
+                float nightPlateau = Math.clamp((-sunElevation - 0.10f) / 0.30f, 0.0f, 1.0f);
+                nightPlateau = nightPlateau * nightPlateau * (3.0f - 2.0f * nightPlateau);
+                float noon = 1.0f - decay;
+                float night = Math.min(1.0f, 1.25f * noon);
+                return Math.max(twilight, Math.max(dayPlateau * noon, nightPlateau * night));
+            }
+
             /**
              * Height scale H of the exponential falloff, in blocks: density at the base divided by e
              * every H blocks of altitude. Small values hug the ground, large ones fill valleys.
@@ -822,6 +841,85 @@ public final class CausticaConfig {
             public static final FloatSetting FOG_SHADOW_FLOOR =
                     clampedFloat("caustica.rt.volume.fogShadowFloor", "volume.fog-shadow-floor",
                             0.10f, 0.0f, 0.95f);
+
+            /**
+             * Clear-air sun shafts: airlight that makes the sun's beams visible with the height fog
+             * off. The two are separate media on purpose — the fog's transmittance is what makes a
+             * scene hazy, so god rays that ride the fog always arrive with a veil. This one adds light
+             * and attenuates nothing, and it is what a player wants when the air should stay clear but
+             * the beams should not.
+             *
+             * <p>The same switch runs the underwater shafts: there the medium is the water body's own
+             * scattering ({@code composite.water-turbidity}), so the beams follow the water's
+             * extinction and the wave focus at the surface, and water with no scattering has nothing
+             * to light.
+             */
+            public static final BooleanSetting SHAFT_ENABLED =
+                    bool("caustica.rt.volume.shafts", "volume.shafts", true);
+            /**
+             * Extinction of the shaft medium, in 1/block. It is what sets how fast the beams fade with
+             * distance — the reciprocal is the e-folding length. The shipped value puts a beam 30 blocks
+             * long at ~26% of the medium's total scatter weight and still carries 85% at 192, so both
+             * near foliage and a beam across a valley read; at 0.0025 a canopy a few blocks overhead
+             * scattered almost nothing.
+             */
+            public static final FloatSetting SHAFT_DENSITY =
+                    clampedFloat("caustica.rt.volume.shaftDensity", "volume.shaft-density",
+                            0.010f, 0.0f, 0.05f);
+            /**
+             * Henyey–Greenstein anisotropy of the shaft phase. This is the knob that turns "lit air"
+             * into a beam: a forward lobe puts the light where the view and the sun line up, which is
+             * where a god ray lives. 0 is isotropic and reads as a flat glow; above ~0.8 the beams
+             * collapse into a halo around the sun and the shades lose them entirely.
+             */
+            public static final FloatSetting SHAFT_ANISOTROPY =
+                    clampedFloat("caustica.rt.volume.shaftAnisotropy", "volume.shaft-anisotropy",
+                            0.70f, 0.0f, 0.95f);
+            /**
+             * How far the beams are integrated, in blocks. Only the air within this distance of the
+             * camera scatters: a shorter reach keeps the effect local to the geometry that casts the
+             * shadows in front of the player, a longer one carries beams across a whole valley. The
+             * shader's cost is per-pixel constant — the reach is not a sample count.
+             */
+            public static final FloatSetting SHAFT_DISTANCE =
+                    clampedFloat("caustica.rt.volume.shaftDistance", "volume.shaft-distance",
+                            192.0f, 16.0f, 512.0f);
+            /**
+             * Strength of the finished in-scatter, 1 = the physical single scatter of the medium at
+             * {@link #SHAFT_DENSITY}. The default sits below 1 because the medium is deliberately far
+             * denser than real air; this is the slider to reach for when the beams are too strong or
+             * too subtle, and raising it is cheaper than raising the density.
+             */
+            public static final FloatSetting SHAFT_INTENSITY =
+                    clampedFloat("caustica.rt.volume.shaftIntensity", "volume.shaft-intensity",
+                            0.6f, 0.0f, 2.0f);
+
+            /**
+             * Extinction of the underwater shaft medium, in 1/block, 0 = no underwater beams.
+             *
+             * <p>Deliberately its own medium rather than the water body's scattering
+             * ({@code composite.water-turbidity}): that fraction also drives the body's ambient glow,
+             * so a player who wants beams but not a milky water column would have no way to ask for
+             * one without the other. At the shipped 0.03 the e-folding is 33 blocks — long enough for a
+             * beam to read, short enough that the column never saturates into a flat glow.
+             */
+            public static final FloatSetting WATER_SHAFT_DENSITY =
+                    clampedFloat("caustica.rt.volume.waterShaftDensity", "volume.water-shaft-density",
+                            0.03f, 0.0f, 0.5f);
+            /**
+             * Ceiling on the underwater forward lobe: how much the sun's own direction may brighten the
+             * water over the rest of it, as a phase value.
+             *
+             * <p>This is the knob that keeps the surface you look up at from turning white. The lobe
+             * peaks about 80x over its back-scatter value, and a grazing path to the surface is long,
+             * so the physical peak arrives an order of magnitude over the water it sits in front of.
+             * Lower values give the beams more directionality (and more risk at the surface); higher
+             * values flatten the column into a brighter, softer body of water. 0 leaves the water with
+             * no sun direction at all.
+             */
+            public static final FloatSetting WATER_SHAFT_CEILING =
+                    clampedFloat("caustica.rt.volume.waterShaftCeiling", "volume.water-shaft-ceiling",
+                            0.10f, 0.0f, 0.6f);
 
             /**
              * The planar cloud sheet and its shadow field (Phase 4). Off keeps every consumer inert:
@@ -966,14 +1064,13 @@ public final class CausticaConfig {
              *
              * <p>The thresholds climb one effect at a time. Above Off the clouds come back, above Low the
              * deck becomes volumetric rather than a sheet, above Medium the fog layer returns, and Ultra
-             * additionally marches it. Water scattering follows the clouds rather than the fog because it
-             * is what the underwater in-scatter is gated on, and Off zeroes it for the same reason it
-             * zeroes everything else: a frame that still carried a volumetric term would not be the
-             * pre-volumetric frame the tier promises.
+             * additionally marches it. The water column's shafts are NOT in this table: they are the
+             * column's only volumetric term now, and a player reaching for the tier preset is choosing
+             * fog and cloud cost, not giving up the water.
              */
             public record QualityTier(boolean cloud, boolean cloudVolumetric, int cloudSteps,
                                       boolean fog, boolean fogShadow, boolean fogMarch, int fogMarchSteps,
-                                      float waterTurbidity, float waterSpray) {
+                                      float waterSpray) {
             }
 
             public static QualityTier qualityTier(int tier) {
@@ -990,12 +1087,8 @@ public final class CausticaConfig {
                         t >= 2,                       // fogShadow
                         t >= 4,                       // fogMarch
                         32,                           // fogMarchSteps (only read when marching)
-                        t >= 1 ? WATER_TURBIDITY_STOCK : 0.0f,
                         t >= 4 ? 0.5f : 0.0f);        // waterSpray (rides the marched fog tier)
             }
-
-            /** The turbidity a tier above Off restores: the value the water page ships with. */
-            private static final float WATER_TURBIDITY_STOCK = 0.35f;
 
             /**
              * The one option whose value means "write these other ones". It is a write rather than a
@@ -1011,7 +1104,6 @@ public final class CausticaConfig {
                 FOG_SHADOW.set(q.fogShadow());
                 FOG_MARCH.set(q.fogMarch());
                 FOG_MARCH_STEPS.set(q.fogMarchSteps());
-                CausticaConfig.Rt.Composite.WATER_TURBIDITY.set(q.waterTurbidity());
                 CausticaConfig.Rt.Composite.WATER_SPRAY.set(q.waterSpray());
             }
 
@@ -1212,7 +1304,12 @@ public final class CausticaConfig {
 
         public static final class EntityTextures {
             public static final IntSetting MAX_TEXTURES =
-                    intAtLeast("caustica.rt.maxEntityTextures", "entities.textures.max-textures", 256, 1);
+                    // 1024, not 256: a world full of item-frame maps, paintings and banners allocates one
+                    // bindless slot per distinct texture (one map = one DynamicTexture), and 256 was
+                    // exhaustible within seconds in a showcase world — after which every mob degraded.
+                    // The recycleColdestSlot LRU bounds the damage, but a capacity that already covers the
+                    // live working set keeps it from churning descriptor writes at all.
+                    intAtLeast("caustica.rt.maxEntityTextures", "entities.textures.max-textures", 1024, 1);
             public static final BooleanSetting PBR = bool("caustica.rt.entityPbr", "entities.textures.pbr", true);
 
             private EntityTextures() {
@@ -1486,6 +1583,31 @@ public final class CausticaConfig {
                     clampedFloat("caustica.rt.tonemap.agxSaturation", "tonemap.agx-saturation", 1.15f, 0.0f, 3.0f);
 
             /**
+             * Contrast blend on AgX's log-encoded value: 0 replaces the published contrast curve with the
+             * identity, 1 is AgX's own curve, and above 1 extrapolates the S-curve's deviation for a
+             * punchier render. Only read while {@link #ADVANCED_GRADING} is on.
+             */
+            public static final FloatSetting AGX_CONTRAST =
+                    clampedFloat("caustica.rt.tonemap.agxContrast", "tonemap.agx-contrast", 1.0f, 0.0f, 2.0f);
+
+            /**
+             * Width in stops of AgX's log2 encoding window around mid grey. The published transform uses
+             * 14: wider spends more of the curve on the highlight shoulder (softer rolloff, lower
+             * contrast), narrower compresses the same scene into fewer stops. Only read while
+             * {@link #ADVANCED_GRADING} is on.
+             */
+            public static final FloatSetting AGX_RANGE =
+                    clampedFloat("caustica.rt.tonemap.agxRange", "tonemap.agx-range", 14.0f, 10.0f, 20.0f);
+
+            /**
+             * Runtime multiplier on the look package's authored bloom strength. 1 keeps the authored
+             * value; 0 removes the scene-referred highlight bloom from the exposed image before either
+             * display transform. Read per frame, so it is live and rebuilds nothing.
+             */
+            public static final FloatSetting BLOOM_STRENGTH =
+                    clampedFloat("caustica.rt.tonemap.bloomStrength", "tonemap.bloom-strength", 1.0f, 0.0f, 3.0f);
+
+            /**
              * Scene-referred look transform (LMT), part of the authored grading. False skips the
              * {@code applyLook} sample entirely, so the exposed ACEScg image goes straight to the ACES
              * 2.0 display transform. This is the quickest way to tell whether a given look is what is
@@ -1529,6 +1651,40 @@ public final class CausticaConfig {
                     return "";
                 }
                 return trimmed.endsWith(".bin") ? trimmed : trimmed + ".bin";
+            }
+        }
+
+        /**
+         * Display-referred sharpening of the finished display image.
+         *
+         * <p>What is being restored is the softness DLSS-RR's upscale leaves behind, and that softness exists
+         * at display resolution, in display code values. Sharpening there costs a 3x3 high pass over the
+         * finished image; sharpening before the display transform would need a full ACES/AgX evaluation per
+         * tap, because the edge being restored only exists in the graded image. With DLSS-RR off the traced
+         * frame already arrives at display resolution, so the same pass reads as an ordinary unsharp mask.
+         *
+         * <p>Both settings are read per frame, so they are live and rebuild nothing: the pass stays in the
+         * frame graph either way and reproduces its input exactly when it is off or set to 0.00.
+         */
+        public static final class Sharpen {
+            /**
+             * Adds the high-passed detail back at {@link #AMOUNT}. Off leaves the image exactly as DLSS-RR
+             * reconstructed it, which is the reference to compare against.
+             */
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.sharpen.enabled", "sharpen.enabled", true);
+
+            /**
+             * How much of the high-pass term is added back. 0.00 is a straight copy, 1.00 is a plain unsharp
+             * mask over a 3x3 texel neighbourhood, and above that the difference keeps growing until the
+             * clamps at the ends of the code-value range flatten it. The default is one full mask: it
+             * restores texel-scale detail without ringing on the high-contrast edges that the temporal
+             * accumulator already reproduces cleanly.
+             */
+            public static final FloatSetting AMOUNT =
+                    clampedFloat("caustica.rt.sharpen.amount", "sharpen.amount", 1.0f, 0.0f, 2.0f);
+
+            private Sharpen() {
             }
         }
 

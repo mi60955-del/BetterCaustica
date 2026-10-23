@@ -233,6 +233,7 @@ abstract class GenerateShaderRecords extends DefaultTask {
             ["exposureHistPushProbe", "ExposureHistPush", "ExposureHistPushData"],
             ["exposureResolvePushProbe", "ExposureResolvePush", "ExposureResolvePushData"],
             ["displayPushProbe", "DisplayPush", "DisplayPushData"],
+            ["sharpenPushProbe", "SharpenPush", "SharpenPushData"],
             ["debugPresentPushProbe", "DebugPresentPush", "DebugPresentPushData"],
             ["bloomPushProbe", "BloomPush", "BloomPushData"],
             ["pushAddrLayoutProbe", "PushAddr", "PushAddrData"],
