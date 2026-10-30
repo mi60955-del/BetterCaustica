@@ -38,6 +38,8 @@ public final class RtDisplayPipeline {
     private long boundLookLutSampler;
     private long boundBloomView;
     private long boundBloomSampler;
+    private long boundFlareView;
+    private long boundFlareSampler;
     private long boundExposureStateBuffer;
     private boolean destroyed;
 
@@ -71,10 +73,13 @@ public final class RtDisplayPipeline {
             binds.get(DISPLAY_EXPOSURE_STATE).binding(DISPLAY_EXPOSURE_STATE)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
+            // The lens flare chain's output; see RtLensPipeline.
+            binds.get(DISPLAY_FLARE).binding(DISPLAY_FLARE).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(3, stack);
             poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(4);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(4);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(5);
             poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1);
 
             return new RtDisplayPipeline(ctx, RtComputePipelineSupport.createSingleSetPipeline(
@@ -85,13 +90,14 @@ public final class RtDisplayPipeline {
     public void setImages(long outputImageView, long rtImageView, long exposureImageView, long hdrImageView,
                            long lutView, long lutSampler, long hdrLutView, long hdrLutSampler,
                            long lookLutView, long lookLutSampler, long bloomView, long bloomSampler,
-                           RtBuffer exposureState) {
+                           long flareView, long flareSampler, RtBuffer exposureState) {
         if (boundOutputView == outputImageView && boundRtView == rtImageView
                 && boundExposureView == exposureImageView && boundHdrView == hdrImageView
                 && boundLutView == lutView && boundLutSampler == lutSampler
                 && boundHdrLutView == hdrLutView && boundHdrLutSampler == hdrLutSampler
                 && boundLookLutView == lookLutView && boundLookLutSampler == lookLutSampler
                 && boundBloomView == bloomView && boundBloomSampler == bloomSampler
+                && boundFlareView == flareView && boundFlareSampler == flareSampler
                 && boundExposureStateBuffer == exposureState.handle) {
             return;
         }
@@ -112,6 +118,9 @@ public final class RtDisplayPipeline {
             lookLutInfo.get(0).imageView(lookLutView).sampler(lookLutSampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkDescriptorImageInfo.Buffer bloomInfo = VkDescriptorImageInfo.calloc(1, stack);
             bloomInfo.get(0).imageView(bloomView).sampler(bloomSampler)
+                    .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
+            VkDescriptorImageInfo.Buffer flareInfo = VkDescriptorImageInfo.calloc(1, stack);
+            flareInfo.get(0).imageView(flareView).sampler(flareSampler)
                     .imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkDescriptorBufferInfo.Buffer stateInfo = VkDescriptorBufferInfo.calloc(1, stack);
             stateInfo.get(0).buffer(exposureState.handle).offset(0).range(exposureState.size);
@@ -137,6 +146,9 @@ public final class RtDisplayPipeline {
             writes.get(DISPLAY_EXPOSURE_STATE).sType$Default().dstSet(gpu.descriptorSet())
                     .dstBinding(DISPLAY_EXPOSURE_STATE)
                     .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).pBufferInfo(stateInfo);
+            writes.get(DISPLAY_FLARE).sType$Default().dstSet(gpu.descriptorSet()).dstBinding(DISPLAY_FLARE)
+                    .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .pImageInfo(flareInfo);
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
         boundOutputView = outputImageView;
@@ -151,6 +163,8 @@ public final class RtDisplayPipeline {
         boundLookLutSampler = lookLutSampler;
         boundBloomView = bloomView;
         boundBloomSampler = bloomSampler;
+        boundFlareView = flareView;
+        boundFlareSampler = flareSampler;
         boundExposureStateBuffer = exposureState.handle;
     }
 
@@ -168,11 +182,14 @@ public final class RtDisplayPipeline {
      * response itself, 0 leaves the image untouched). It reads the metered absolute scene luminance
      * from the bound exposure state, so it keys on adaptation rather than on how bright the frame was
      * exposed to look.
+     *
+     * <p>{@code lensStrength} scales the flare image added after bloom; 0 skips the fetch, which is
+     * what the pass does when the lens chain is off and that image holds no valid contents.
      */
     public void dispatch(VkCommandBuffer cmd, int width, int height, boolean hdrEnabled, int lutSize,
                          float gamma, float hdrPeakNits, boolean lookEnabled, int lookLutSize,
-                         float bloomStrength, boolean advancedGrading, float agxGain, float agxSaturation,
-                         float agxContrast, float agxRange, boolean purkinjeEnabled,
+                         float bloomStrength, float lensStrength, boolean advancedGrading, float agxGain,
+                         float agxSaturation, float agxContrast, float agxRange, boolean purkinjeEnabled,
                          float purkinjeStrength) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display compute")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipeline());
@@ -181,7 +198,7 @@ public final class RtDisplayPipeline {
             new DisplayPushData(hdrEnabled ? 1 : 0, (float) lutSize, gamma, hdrPeakNits,
                     lookEnabled ? 1 : 0, (float) lookLutSize, bloomStrength,
                     advancedGrading ? 1 : 0, agxGain, agxSaturation, agxContrast, agxRange,
-                    purkinjeEnabled ? 1 : 0, purkinjeStrength).write(push);
+                    purkinjeEnabled ? 1 : 0, purkinjeStrength, lensStrength).write(push);
             VK10.vkCmdPushConstants(cmd, gpu.pipelineLayout(), VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

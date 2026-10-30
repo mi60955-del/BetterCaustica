@@ -123,7 +123,7 @@ public final class CausticaSettings {
     }
 
     public enum Cycle {
-        EXPOSURE_MODE, DLSS_QUALITY, HDR_PEAK
+        EXPOSURE_MODE, DLSS_QUALITY, HDR_PEAK, FRAME_GENERATION_BACKEND
     }
 
     /**
@@ -176,11 +176,11 @@ public final class CausticaSettings {
     }
 
     /**
-     * The options whose value is captured while a device, buffer pool or acceleration structure is built,
-     * so changing them only takes effect on the next launch. Named here rather than at each entry because
-     * the set is a property of the renderer's lifecycle, not of the control: Sodium shows these with its
-     * own restart badge and the vanilla screen appends {@code caustica.options.rt.restartNeeded} to the
-     * value, since it has no badge.
+     * The options whose value is captured while a device, buffer pool, acceleration structure or vendor
+     * frame-generation feature is built, so changing them only takes effect on the next launch. Named here
+     * rather than at each entry because the set is a property of the renderer's lifecycle, not of the
+     * control: Sodium shows these with its own restart badge and the vanilla screen appends
+     * {@code caustica.options.rt.restartNeeded} to the value, since it has no badge.
      */
     private static final Set<String> RESTART_PATHS = Set.of(
             "worker-threads",
@@ -189,7 +189,11 @@ public final class CausticaSettings {
             "entities.block-entities.max-entities",
             "entities.textures.max-textures",
             "entities.textures.pbr",
-            "particles.max-particles");
+            "particles.max-particles",
+            // NGX and FidelityFX build their frame-generation object against the live swapchain and the
+            // in-flight submits; releasing it because the player picked the other generator loses the
+            // Vulkan device.
+            "frame-generation.backend");
 
     private static final String RT = "caustica.options.rt.";
     private static final String SETTING = "caustica.setting.";
@@ -199,6 +203,15 @@ public final class CausticaSettings {
     private static final Supplier<Boolean> AUTO_EXPOSURE =
             () -> "auto".equalsIgnoreCase(CausticaConfig.Rt.Exposure.MODE.get());
     private static final Supplier<Boolean> HDR_CAPABLE = CausticaConfig.Rt.Hdr::swapchainPqAvailable;
+    // The three lens artifacts share one chain and one set of textures, so the shape and gain
+    // entries only do anything while the chain itself runs.
+    private static final Supplier<Boolean> LENS_ENABLED = () -> CausticaConfig.Rt.Lens.ENABLED.value();
+    private static final Supplier<Boolean> LENS_STARBURST = () -> LENS_ENABLED.get()
+            && CausticaConfig.Rt.Lens.STARBURST_ENABLED.value();
+    private static final Supplier<Boolean> LENS_HALO = () -> LENS_ENABLED.get()
+            && CausticaConfig.Rt.Lens.HALO_ENABLED.value();
+    private static final Supplier<Boolean> LENS_DIRT = () -> LENS_ENABLED.get()
+            && CausticaConfig.Rt.Lens.DIRT_ENABLED.value();
 
     public static final List<Option> ALL = build();
 
@@ -324,7 +337,9 @@ public final class CausticaSettings {
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-altitude", RT + "cloudAltitude",
                 CausticaConfig.Rt.Volume.CLOUD_ALTITUDE, 0, 512, 8, 1.0, Unit.COUNT, Impact.LOW);
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-thickness", RT + "cloudThickness",
-                CausticaConfig.Rt.Volume.CLOUD_THICKNESS, 1, 256, 1, 1.0, Unit.COUNT, Impact.LOW);
+                CausticaConfig.Rt.Volume.CLOUD_THICKNESS, 8, 1024, 8, 1.0, Unit.COUNT, Impact.LOW);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-size", RT + "cloudSize",
+                CausticaConfig.Rt.Volume.CLOUD_SIZE, 32, 2048, 16, 1.0, Unit.COUNT, Impact.LOW);
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-density", RT + "cloudDensity",
                 CausticaConfig.Rt.Volume.CLOUD_DENSITY, 0, 300, 10, 100.0, Unit.PERCENT, Impact.MEDIUM);
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-wind-speed", RT + "cloudWindSpeed",
@@ -352,6 +367,10 @@ public final class CausticaSettings {
         // isolate any single one against the rest.
         scaled(out, Page.MATERIALS, "parallax", "composite.parallax-depth", RT + "parallaxDepth",
                 CausticaConfig.Rt.Composite.PARALLAX_DEPTH, 0, 50, 1, 100.0, Unit.PERCENT, Impact.MEDIUM);
+        count(out, Page.MATERIALS, "parallax", "materials.parallax-style", RT + "parallaxStyle",
+                CausticaConfig.Rt.Materials.PARALLAX_STYLE, 0, 1, 1, Impact.LOW, RT + "parallaxStyle.");
+        toggle(out, Page.MATERIALS, "parallax", "materials.parallax-shadow", RT + "parallaxShadow",
+                CausticaConfig.Rt.Materials.PARALLAX_SHADOW);
         count(out, Page.MATERIALS, "parallax", "materials.parallax-layers", RT + "parallaxLayers",
                 CausticaConfig.Rt.Materials.PARALLAX_LAYERS, 8, 64, 4, Impact.MEDIUM);
         toggle(out, Page.MATERIALS, "parallax", "materials.entity-parallax", RT + "entityParallax",
@@ -454,6 +473,44 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Tonemap.AGX_RANGE, 10, 20, 1, 1.0, Unit.EV, Impact.LOW);
         scaled(out, Page.IMAGE, "tonemap", "tonemap.bloom-strength", RT + "bloomStrength",
                 CausticaConfig.Rt.Tonemap.BLOOM_STRENGTH, 0, 300, 5, 100.0, Unit.PERCENT, Impact.LOW);
+        toggle(out, Page.IMAGE, "lens", "lens.enabled", RT + "lens", CausticaConfig.Rt.Lens.ENABLED);
+        count(out, Page.IMAGE, "lens", "lens.resolution", RT + "lensResolution",
+                CausticaConfig.Rt.Lens.RESOLUTION, 4, 16, 2, Impact.MEDIUM, LENS_ENABLED,
+                "caustica.options.rt.lensResolution.");
+        scaled(out, Page.IMAGE, "lens", "lens.sample-rate", RT + "lensSampleRate",
+                CausticaConfig.Rt.Lens.SAMPLE_RATE, 25, 200, 5, 100.0, Unit.PERCENT, Impact.MEDIUM,
+                LENS_ENABLED);
+        toggle(out, Page.IMAGE, "lens", "lens.starburst-enabled", RT + "lensStarburstEnabled",
+                CausticaConfig.Rt.Lens.STARBURST_ENABLED, LENS_ENABLED);
+        scaled(out, Page.IMAGE, "lens", "lens.starburst", RT + "lensStarburst",
+                CausticaConfig.Rt.Lens.STARBURST, 0, 300, 5, 100.0, Unit.PERCENT, Impact.LOW,
+                LENS_STARBURST);
+        count(out, Page.IMAGE, "lens", "lens.spikes", RT + "lensSpikes",
+                CausticaConfig.Rt.Lens.SPIKES, 3, 12, 1, Impact.LOW, LENS_STARBURST);
+        scaled(out, Page.IMAGE, "lens", "lens.spike-length", RT + "lensSpikeLength",
+                CausticaConfig.Rt.Lens.SPIKE_LENGTH, 2, 80, 1, 100.0, Unit.PERCENT, Impact.LOW,
+                LENS_STARBURST);
+        count(out, Page.IMAGE, "lens", "lens.samples", RT + "lensSamples",
+                CausticaConfig.Rt.Lens.SAMPLES, 8, 32, 4, Impact.MEDIUM, LENS_STARBURST);
+        toggle(out, Page.IMAGE, "lens", "lens.halo-enabled", RT + "lensHaloEnabled",
+                CausticaConfig.Rt.Lens.HALO_ENABLED, LENS_ENABLED);
+        scaled(out, Page.IMAGE, "lens", "lens.halo", RT + "lensHalo", CausticaConfig.Rt.Lens.HALO,
+                0, 300, 5, 100.0, Unit.PERCENT, Impact.LOW, LENS_HALO);
+        scaled(out, Page.IMAGE, "lens", "lens.halo-radius", RT + "lensHaloRadius",
+                CausticaConfig.Rt.Lens.HALO_RADIUS, 1, 60, 1, 100.0, Unit.PERCENT, Impact.LOW,
+                LENS_HALO);
+        scaled(out, Page.IMAGE, "lens", "lens.dispersion", RT + "lensDispersion",
+                CausticaConfig.Rt.Lens.DISPERSION, 0, 100, 1, 100.0, Unit.PERCENT, Impact.LOW,
+                LENS_HALO);
+        count(out, Page.IMAGE, "lens", "lens.halo-taps", RT + "lensHaloTaps",
+                CausticaConfig.Rt.Lens.HALO_TAPS, 8, 48, 8, Impact.MEDIUM, LENS_HALO);
+        toggle(out, Page.IMAGE, "lens", "lens.dirt-enabled", RT + "lensDirtEnabled",
+                CausticaConfig.Rt.Lens.DIRT_ENABLED, LENS_ENABLED);
+        scaled(out, Page.IMAGE, "lens", "lens.dirt", RT + "lensDirt", CausticaConfig.Rt.Lens.DIRT,
+                0, 300, 5, 100.0, Unit.PERCENT, Impact.LOW, LENS_DIRT);
+        scaled(out, Page.IMAGE, "lens", "lens.dirt-scale", RT + "lensDirtScale",
+                CausticaConfig.Rt.Lens.DIRT_SCALE, 25, 400, 5, 100.0, Unit.PERCENT, Impact.LOW,
+                LENS_DIRT);
         toggle(out, Page.IMAGE, "tonemap", "tonemap.look-enabled", RT + "look",
                 CausticaConfig.Rt.Tonemap.LOOK_ENABLED);
         toggle(out, Page.IMAGE, "sharpen", "sharpen.enabled", RT + "sharpen",
@@ -492,6 +549,9 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.DlssRr.PRESET, 0, 8, 1, Impact.LOW);
         toggle(out, Page.DISPLAY, "frame-generation", "frame-generation.enabled",
                 SETTING + "frameGeneration", CausticaConfig.Rt.Fg.ENABLED);
+        cycled(out, Page.DISPLAY, "frame-generation", "frame-generation.backend",
+                SETTING + "frameGenerationBackend", Cycle.FRAME_GENERATION_BACKEND,
+                CausticaConfig.Rt.Fg.BACKEND, Impact.MEDIUM);
         count(out, Page.DISPLAY, "frame-generation", "frame-generation.multi-frame-count",
                 SETTING + "multiFrameCount", CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT, 1, 3, 1,
                 Impact.MEDIUM);
@@ -602,12 +662,27 @@ public final class CausticaSettings {
                 setting, impact, ALWAYS);
     }
 
+    private static Option count(List<Option> out, Page page, String group, String path, String nameKey,
+                                IntSetting setting, int min, int max, int step, Impact impact,
+                                Supplier<Boolean> available) {
+        return add(out, page, group, path, nameKey, new Control.Count(min, max, step, Unit.COUNT),
+                setting, impact, available);
+    }
+
     /** As above, for an integer setting whose values have names worth showing instead of numbers. */
     private static Option count(List<Option> out, Page page, String group, String path, String nameKey,
                                 IntSetting setting, int min, int max, int step, Impact impact,
                                 String valueKeys) {
         return add(out, page, group, path, nameKey,
                 new Control.Count(min, max, step, Unit.COUNT, valueKeys), setting, impact, ALWAYS);
+    }
+
+    /** The named-value form, gated like any other option that depends on a switch above it. */
+    private static Option count(List<Option> out, Page page, String group, String path, String nameKey,
+                                IntSetting setting, int min, int max, int step, Impact impact,
+                                Supplier<Boolean> available, String valueKeys) {
+        return add(out, page, group, path, nameKey,
+                new Control.Count(min, max, step, Unit.COUNT, valueKeys), setting, impact, available);
     }
 
     private static Option scaled(List<Option> out, Page page, String group, String path, String nameKey,

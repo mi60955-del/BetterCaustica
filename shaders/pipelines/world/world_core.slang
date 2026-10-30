@@ -34,6 +34,10 @@ public uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
 public bool payloadDielectricEntering() { return (payload.flags & PAYLOAD_DIELECTRIC_ENTERING) != 0u; }
 public bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
 public bool payloadUnlit() { return (payload.flags & PAYLOAD_UNLIT) != 0u; }
+// Set on a surface that carries vanilla's additive enchantment overlay (see ENTITY_PRIM_GLINT). The
+// overlay radiance rides its own lane because the surface's own f0 is its specular F0.
+public bool payloadGlintOverlay() { return (payload.flags & PAYLOAD_GLINT_OVERLAY) != 0u; }
+public float3 payloadOverlay() { return float3(payload.overlay); }
 // LINEAR roughness, i.e. GGX alpha directly — NOT perceptual roughness. This is the one convention used
 // end to end: LabPBR defines roughness = (1 - perceptualSmoothness)^2 and RtLabPbr.decode stores exactly
 // that, RtMaterials.Profile carries the same units, and DLSS-RR wants linear roughness in its guide. So

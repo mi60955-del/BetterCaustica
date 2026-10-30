@@ -82,6 +82,22 @@ the environment variable, so export it or `bundleFfxNatives` skips silently.
 into the jar. A jar built without it still works and offers only the DLSS
 frame-generation backends.
 
+## Per-pass GPU timing
+
+The CPU-side stages in `rt-frame-stats/frame.csv` say nothing about a GPU-bound
+pass. Start the client with `-Dcaustica.rt.gpuTiming=true` (`RtGpuTiming`) and it
+writes per-pass GPU timestamps to `rt-frame-stats/gpu.csv`:
+
+```bash
+python tools/mcbox.py start --wait --world "<world>" --jvm=-Dcaustica.rt.gpuTiming=true
+```
+
+Each row carries one column per interval, in frame order: `skyLutMs`,
+`tracePrimaryMs`, `traceIndirectMs`, `dlssMs`, `exposureMs`, `bloomMs`, `lensMs`,
+`displayMs` (display mapper plus sharpen) and `copyMs`. The columns are defined by
+`RtGpuTiming.NAMES`, which is also the maximum mark count, so adding a pass means
+adding its name there and a `RtGpuTiming.mark` boundary in `RtComposite.recordFrame`.
+
 ## Native Bundling
 
 Gradle bundles NGX natives for the current host platform by default:

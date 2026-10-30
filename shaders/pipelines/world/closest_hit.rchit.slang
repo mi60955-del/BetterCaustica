@@ -5,7 +5,8 @@
 // tableAddr/entityTableAddr are read from the inline push-constant lanes (pc), not through the
 // WorldPush BDA struct: they're read on every single hit (the hottest chain in the frame), and going
 // through worldPushAddr first would cost an extra global-memory load just to find the address of the
-// load we actually want. The cold WorldPush struct is dereferenced only for the breaking overlay.
+// load we actually want. The cold WorldPush struct is dereferenced only for the breaking overlay and for
+// the sun direction a height-field self-shadow marches along.
 import world_common;
 import math;
 import bindings;
@@ -50,44 +51,6 @@ static const float WET_GRAZING_FLOOR = 0.45;
 static const float RAY_CONE_MIN_WIDTH = 1.0e-5;
 static const float RAY_CONE_MIN_TEXEL_FOOTPRINT = 1.0e-4;
 static const float RAY_CONE_MAX_LOD = 12.0;
-
-// LabPBR stores height in the _n alpha as a depth: 255 is flush with the flat surface and 0 is 25% of
-// a block deep. Steep parallax marches the view ray through that field and bisects the crossing, which
-// is what recesses a face without any displacement geometry. How much of that 25% the march is allowed
-// to reach is pc.parallaxDepth rather than a constant: it is the one knob that makes this whole path
-// visible or invisible, and the only way to tell its artifacts from everything else on a surface.
-//
-// A hit shader has no dFdx/ddy, so the parallax scale cannot come from screen-space derivatives the way
-// a rasterized POM would. It comes from the height field's own units instead: a sprite spans exactly one
-// block face, so the spec's 25% depth is 0.25 of the [0,1] sprite UV the march already works in.
-// Layer count trades banding against fetch count. The bisection removes most of the banding the layer
-// count alone would leave, so a moderate count still resolves the crossing.
-// The walk's layer budget is derived per hit rather than fixed (see parallaxLocalUv); these bound it.
-// The floor keeps a shallow field from resolving its crossing too coarsely. The ceiling is only the
-// compile-time bound the loop needs — the budget a frame actually spends is the Materials page's parallax
-// quality, clamped into this range — so it is set past that control's own maximum.
-static const int PARALLAX_MIN_LAYERS = 8;
-static const int PARALLAX_MAX_LAYERS = 64;
-static const int PARALLAX_REFINE_STEPS = 4;
-// Tangent-space Z floor. Dividing the view's XY by Z projects it onto the surface, and a grazing view
-// would stretch that to infinity without a floor; the offset stays inside the spec's 25% either way.
-static const float PARALLAX_MIN_VZ = 0.2;
-// Past this material LOD the displaced sample is smaller than the texel footprint it came from, so the
-// march would spend its fetches to move the result by less than the error the mip already carries.
-static const float PARALLAX_MAX_LOD = 2.0;
-// The height drop across one texel, measured along the view's lateral direction, at which a displaced
-// band counts as a full vertical wall. A binary height field (255 flush next to 0) reaches this; the
-// shallower fields most packs author land well under it and keep most of their normal map, which is
-// what keeps a smooth material from turning into flat vertical stripes where it happens to displace.
-static const float PARALLAX_WALL_SLOPE = 0.35;
-// The outer band of a sprite over which the reach is ramped to zero. A displaced sample must not be
-// pulled across the sprite's border, where the page holds its neighbour's replicated gutter.
-static const float PARALLAX_EDGE_FADE_MIN = 0.015;
-static const float PARALLAX_EDGE_FADE_MAX = 0.09;
-// Crossing depth, as a fraction of the material's full height range, at which the displacement reaches
-// full strength. Below it the offset is ramped in, which is what keeps a slightly recessed texel from
-// jumping to a full-texel step next to a flush one.
-static const float PARALLAX_DEPTH_SOFTNESS = 0.30;
 
 float2 texSizePx(Sampler2D t) {
     uint w, h;
@@ -158,190 +121,266 @@ float3 perturbNormal(float3 n, float3 T, float3 B, float3 vdir, float4 ntex, out
     return nm;
 }
 
-// Keep a sprite-local UV inside [0,1). The march only ever moves a couple of texels on the material
-// maps this ships against, so this bound is rarely reached — but it must be a clamp and not a wrap:
-// an offset that steps past the edge by a fraction of a texel would otherwise fold to the opposite
-// side of the sprite, turning a sub-texel shift into a jump across the whole face. Clamping just holds
-// the sample on the border texel, which is what the page's replicated gutter would have returned
-// anyway.
-float2 clampSpriteUv(float2 uv) {
-    return clamp(uv, float2(0.0, 0.0), float2(1.0, 1.0));
+// ---- Parallax relief -------------------------------------------------------------------------------
+//
+// LabPBR stores height in the _n alpha: 255 is flush with the face and 0 is as deep as the spec allows,
+// a quarter of a block. No geometry moves for it. What moves is the sample — the shading UV is walked
+// down the view ray until it meets the stored surface — so a groove shows the wall behind it and a face
+// stops reading as wallpaper.
+//
+// Every length here is in the sprite's own [0,1] UV, which is exactly one block face, so the spec's
+// quarter block is the number 0.25 and the user's depth control scales it from there. A hit shader has no
+// screen-space derivatives to derive that scale from, which is the other reason it comes from the field's
+// own units.
+//
+// The walk reads the field as one depth per texel — a staircase — and steps the view ray across texel
+// boundaries (a DDA) until it arrives at the column it actually hits. The shaded sample lands on a
+// texel centre, so relief reads as solid chunks with hard edges instead of a smeared gradient, and the
+// answer is geometric: a pixel shows exactly the column the ray reaches, never a rounded neighbour.
+//
+// The style decides what a crossing turns into (see parallaxStyleOf). The two differ in two numbers:
+//
+//   Sharp  is for authored hard edges — plank grooves, brick bevels, cut stone. A crossed boundary turns
+//          into a wall at full strength, from the height step across it. The relief reads as cut
+//          geometry.
+//   Smooth is for rounded or organic relief. The field is read a mip coarser, so the walk follows the
+//          shape instead of the texels, and a wall claims only a third of the shading.
+//
+// Two bounds keep the walk bounded, neither optional:
+//   * the reach fades out with distance, before a displaced sample is smaller than the texel it came
+//     from;
+//   * the column budget is the quality setting, clamped into the compile-time range — a view so grazing
+//     that the ray outruns the budget lands on the last column it reached.
+// Samples that leave the sprite wrap to the opposite edge instead of fading: a block texture repeats per
+// face, so the wrapped texel is the continuation the neighbouring face shows. Keeping the reach at full
+// strength up to the border is what makes the relief tile across blocks; a reach fade there compresses
+// the border band instead — a deep field at a grazing view sweeps half the sprite's content across that
+// band, and it reads as a flap curling off every block edge.
+
+// Layer bounds. The floor keeps a shallow field from resolving its crossing too coarsely; the ceiling is
+// only the compile-time bound the loop needs, since the budget a frame spends is the quality setting
+// clamped into this range.
+static const int PARALLAX_MIN_LAYERS = 8;
+static const int PARALLAX_MAX_LAYERS = 64;
+// Tangent-space view Z floor. Projecting the view onto the surface divides by it, and a grazing view
+// would stretch that projection to infinity.
+static const float PARALLAX_MIN_VIEW_Z = 0.2;
+// Material LOD past which a displaced sample is smaller than the texel it came from, so the reach has
+// faded to nothing.
+static const float PARALLAX_MAX_LOD = 2.0;
+// Height step across one texel boundary at which a crossed face counts as a full wall; the claim ramps
+// in from a third of this. Sandstone strata (~0.14) and bark plateaus (~0.2) clear it, while stone's
+// noise (≤0.04) and the flat interior of every plateau stay under the ramp-in and keep their normal
+// map.
+static const float PARALLAX_WALL_GRADIENT = 0.15;
+// Extra mip levels the smooth style reads, and how much of a wall it still claims.
+static const float PARALLAX_SMOOTH_MIP_BIAS = 0.75;
+static const float PARALLAX_SMOOTH_WALL = 0.35;
+// Self-shadow walk: steps from the displaced texel up to the surface plane, the sine of the light's
+// elevation below which nothing is worth shadowing, the depth difference that saturates an occlusion, and
+// the bias that keeps a texel from shading itself.
+static const int PARALLAX_SHADOW_STEPS = 10;
+static const float PARALLAX_SHADOW_MIN_ELEVATION = 0.10;
+static const float PARALLAX_SHADOW_SOFTNESS = 0.15;
+static const float PARALLAX_SHADOW_BIAS = 0.02;
+
+struct ParallaxSample {
+    // Sprite-local UV to shade at.
+    float2 uv;
+    // Lateral direction of the band the displacement exposed, in the hit triangle's tangent space.
+    float2 wallDir;
+    // How much of a wall that band is; 0 when nothing was exposed.
+    float wallAmount;
+    // Fraction of the directional light that reaches the displaced texel through its own relief.
+    float shadow;
+};
+
+ParallaxSample untouchedParallax(float2 uv) {
+    ParallaxSample sample;
+    sample.uv = uv;
+    sample.wallDir = float2(0.0, 0.0);
+    sample.wallAmount = 0.0;
+    sample.shadow = 1.0;
+    return sample;
 }
 
-// How many texels this sprite spans at a given LOD — i.e. the grid a displaced sample has to be
-// quantised to. Derived from the page's dimensions and the sprite's share of it, halved per LOD, so
-// the grid follows the resolution the height field is actually being read at rather than the mip-0
-// one. Snapping to mip 0 at distance would quantise finer than the samples themselves and pop.
-float2 materialSpriteGrid(uint page, float2 pageUvScale, float lod) {
+// The style's two dials, resolved once per sample so the body below stays one algorithm rather than two.
+// The offset itself is continuous in both styles: quantising it to the texel grid draws closed one-texel
+// jump contours over any field whose crossing depth varies smoothly — on a steep multi-level pack
+// texture those bands read as several copies of the texture stacked at whole-texel depths.
+struct ParallaxStyle {
+    float mipBias;
+    float wallScale;
+};
+
+ParallaxStyle parallaxStyleOf(int style) {
+    ParallaxStyle resolved;
+    bool sharp = style == PARALLAX_STYLE_SHARP;
+    resolved.mipBias = sharp ? 0.0 : PARALLAX_SMOOTH_MIP_BIAS;
+    resolved.wallScale = sharp ? 1.0 : PARALLAX_SMOOTH_WALL;
+    return resolved;
+}
+
+// Tile a sprite-local sample across its sprite. Block textures repeat per face, so a sample pulled past
+// the border reads the opposite edge — the continuation the neighbouring face shows — rather than the
+// page gutter's replicated border texel, which would smear every tile boundary. The page gutter holds the
+// wrapped continuation too (see the material packer), so bilinear filtering keeps tiling across the seam.
+float2 wrapSpriteUv(float2 uv) {
+    return fract(uv);
+}
+
+// Texels this sprite spans at the LOD the shading is read at — the grid a displacement is quantised to.
+// Following the LOD rather than mip 0 keeps the quantum at the resolution actually sampled; snapping to
+// mip 0 at distance would quantise finer than the samples and pop.
+float2 spriteTexelGrid(uint page, float2 pageUvScale, float lod) {
     float2 pageTexels = texSizePx(materialNormalAoTex[NonUniformResourceIndex(page)]);
     return max(floor(pageUvScale * pageTexels / exp2(floor(lod)) + 0.5), float2(1.0, 1.0));
 }
 
-// Steep parallax plus a bisection over the LabPBR height field: walk the view ray through the height
-// volume a layer at a time until the marched depth passes the stored surface, then bisect that last
-// interval so the answer lands between layers instead of snapping to one. Returns the sprite-local UV
-// to sample at, or the input unchanged when the ray never crosses — which is what a flush (height 255)
-// surface should read as.
+// Directional self-shadow through the same height field. From the displaced texel the ray is walked back
+// up toward the light; any stretch of field it passes over that sits above it blocks what reaches the
+// texel. The walk stops at the surface plane, so only relief the face itself carries can contribute, and
+// the effect reads as contact shading inside the relief rather than as a shadow thrown across the face.
 //
-// `stepNormal` reports the band the displacement exposes, in the tangent space of the hit triangle:
-// x,y is the unit wall direction and z is how much of a wall that band is (0 = none, so a caller that
-// gets the flat mapping back has nothing to apply).
-//
-// Four things keep a displaced surface reading as geometry instead of as a smear. The last two are
-// ports of the shipped 0.3.0 build's parallax, which solved the same problem with a texel-walking DDA
-// behind an explicit envelope; the first two are that envelope.
-//
-//   * The reach is ramped to zero over the sprite's outermost texels. Without it a sample pulled
-//     sideways off the sprite reads its neighbour's replicated gutter, so every tile boundary grows a
-//     hard seam.
-//   * The reach is ramped out as the material LOD approaches PARALLAX_MAX_LOD too, replacing the cliff
-//     that used to switch the whole march off there. Past that LOD a displaced sample is no longer
-//     resolved, so leaving the last stretch of distance on a ramp keeps it from popping.
-//   * The march is budgeted against its own reach. A reach spanning more texels than the walk has
-//     layers lands its crossing between texels and the band it uncovers smears. The budget is derived
-//     per hit — one layer per texel of travel — and beyond its cap the sampling LOD is raised, which
-//     halves the sprite's texel count, so an extreme reach is answered with a coarser reading of the
-//     same height field instead of a smeared one. This is what makes the shipped build hold up at
-//     grazing angles.
-//   * The displacement is quantised to the shading grid — the sprite's texel grid at the LOD the
-//     samples are read at — but quantised as an *offset*, and only once it spans a whole texel, so
-//     that the step stays crisp without either dragging the flat mapping onto the lattice or cutting
-//     the fades above into hard contours. See the block comment at the quantisation itself.
-//
-// And the band is told it is a wall: the march moves the sample away from the viewer, so the band it
-// uncovers is the near wall of the step and that wall faces back along the viewer's lateral direction.
-// How much of a wall it really is comes from the height field's own gradient across one texel along
-// that direction, so a binary field reads full strength while a gently sloped one reads near zero and
-// keeps its normal map — a hard switch would flatten every displaced band on a smooth material into
-// a stripe.
-float2 parallaxLocalUv(MaterialHeader header, uint page, float2 localUv, float lod, float maxLod,
-        float3 n, float3 T, float3 B, float3 vdir, float parallaxDepth, out float3 stepNormal) {
-    stepNormal = float3(0.0, 0.0, 0.0);
+// The light is whichever body is up, sun first, both from the lanes the sky bakes from, so a shadow can
+// never point somewhere the sky is not lit from. This is the one place a hit dereferences WorldPush; it
+// sits behind the material switch and the height-field test, so a surface without relief never pays.
+float parallaxShadow(uint page, float2 pageUvMin, float2 pageUvScale, float2 uv, float hitDepth, float lod,
+        float3 n, float3 T, float3 B, float reach) {
+    if ((pc.materialToggles & MATERIAL_TOGGLE_PARALLAX_SHADOW) == 0u || hitDepth <= 1.0e-4) {
+        return 1.0;
+    }
+    ConstPtr<WorldPush> push = ConstPtr<WorldPush>(pc.worldPushAddr);
+    float noonTilt = push[0].skyLook1.x;
+    float3 sunDir = celestialDirection(push[0].celestial.x, noonTilt);
+    float3 lightDir = sunDir.y > 0.0
+            ? sunDir : celestialDirection(push[0].celestial.y, noonTilt);
+    float3 lightTS = float3(dot(lightDir, T), dot(lightDir, B), dot(lightDir, n));
+    // At or below this elevation the face is already at its terminator and the traced sun shadow owns that
+    // transition; a second one drawn here would put a contour along every face that happens to sit there.
+    if (lightTS.z <= PARALLAX_SHADOW_MIN_ELEVATION) {
+        return 1.0;
+    }
+    float2 lateral = (lightTS.xy / lightTS.z) * reach;
+    float stepDepth = hitDepth / float(PARALLAX_SHADOW_STEPS);
+    float shadow = 1.0;
+    [loop]
+    for (int i = 1; i <= PARALLAX_SHADOW_STEPS; i++) {
+        float climbed = stepDepth * float(i);
+        float2 sampleUv = pageUvMin + wrapSpriteUv(uv + lateral * climbed) * pageUvScale;
+        float field = 1.0 - samplePageNormalAo(page, sampleUv, lod).a;
+        float blocked = (hitDepth - climbed - field - PARALLAX_SHADOW_BIAS) / PARALLAX_SHADOW_SOFTNESS;
+        shadow = min(shadow, 1.0 - saturate(blocked));
+    }
+    return lerp(1.0, shadow,
+            smoothstep(PARALLAX_SHADOW_MIN_ELEVATION, PARALLAX_SHADOW_MIN_ELEVATION * 2.0, lightTS.z));
+}
+
+// One column of the height field: the stored surface depth at a texel's centre, wrapped across the
+// sprite. The walk treats the field as constant per column — a staircase — which is what makes its
+// answer geometric: a pixel shades exactly the column the ray reaches.
+float columnDepth(uint page, float2 pageUvMin, float2 pageUvScale, float lod, float2 grid, float2 texel) {
+    float2 uv = (texel + 0.5) / grid;
+    return 1.0 - samplePageNormalAo(page, pageUvMin + wrapSpriteUv(uv) * pageUvScale, lod).a;
+}
+
+// Where to shade a height-mapped face, and how much light its own relief lets through. A ray that never
+// leaves its starting column returns its input unchanged, which is what "no relief here" has to look
+// like.
+ParallaxSample sampleParallax(MaterialHeader header, uint page, float2 localUv, float lod, float maxLod,
+        float3 n, float3 T, float3 B, float3 vdir, float depthScale) {
+    ParallaxSample result = untouchedParallax(localUv);
+
     float3 vTS = float3(dot(vdir, T), dot(vdir, B), dot(vdir, n));
-    float vz = max(abs(vTS.z), PARALLAX_MIN_VZ);
-    float2 slope = vTS.xy / vz;
+    float2 slope = vTS.xy / max(abs(vTS.z), PARALLAX_MIN_VIEW_Z);
     float2 pageUvMin = header.materialUv.xy;
     float2 pageUvScale = header.materialUv.zw;
 
-    float2 edge = min(localUv, float2(1.0, 1.0) - localUv);
-    float edgeFade = smoothstep(PARALLAX_EDGE_FADE_MIN, PARALLAX_EDGE_FADE_MAX, min(edge.x, edge.y));
     float lodFade = 1.0 - smoothstep(PARALLAX_MAX_LOD - 1.0, PARALLAX_MAX_LOD, lod);
-    float reach = parallaxDepth * edgeFade * lodFade;
+    float reach = depthScale * lodFade;
     if (reach <= 1.0e-5) {
-        return localUv;
+        return result;
     }
 
-    // Budget the walk against the reach: one layer per texel of lateral travel, so a shallow or head-on
-    // surface pays for very few height fetches while a grazing one buys the resolution it needs to land
-    // its crossing on the right texel. The Materials page's parallax quality caps that derived count;
-    // deriving the count outright is what keeps the coarsening below from firing in ordinary play.
-    float2 grid = materialSpriteGrid(page, pageUvScale, lod);
-    float travelTexels = abs(slope.x) * reach * grid.x + abs(slope.y) * reach * grid.y;
-    int budget = clamp(pc.parallaxLayers, PARALLAX_MIN_LAYERS, PARALLAX_MAX_LAYERS);
-    int layers = clamp(int(ceil(travelTexels)) + 1, PARALLAX_MIN_LAYERS, budget);
+    ParallaxStyle style = parallaxStyleOf(pc.parallaxStyle);
+    float2 grid = spriteTexelGrid(page, pageUvScale, lod);
+    float marchLod = min(lod + style.mipBias, maxLod);
+    int layers = clamp(pc.parallaxLayers, PARALLAX_MIN_LAYERS, PARALLAX_MAX_LAYERS);
 
-    // Should the reach still want more texels than the cap allows, coarsen the *march's own* reading
-    // of the height field — which halves the sprite's texel count — until a layer covers at most one
-    // texel. A coarser reading of the same height field, rather than a smeared one across a finer one.
-    //
-    // This deliberately does not touch `grid`. That grid quantises the displacement below, and the
-    // displaced sample is a *shading* sample, so its quantum has to be the resolution the shading is
-    // actually read at. Quantising it on a coarser grid instead moves the sample several texels at a
-    // time and makes the texture repeat at that coarser resolution.
-    float coarsen = max(ceil(log2(max(travelTexels, 1.0) / float(layers))), 0.0);
-    float parallaxLod = min(lod + coarsen, maxLod);
+    // The DDA descends the ray through the staircase field one texel boundary at a time. Depth t is
+    // measured inward from the flat surface as a fraction of the height range; per unit t the sample
+    // moves -slope·reach in UV, which is -slope·reach·grid texels. `boundary` holds the t at which
+    // each axis next crosses a texel boundary, so their minimum is the next step.
+    float2 texelVel = -slope * reach * grid;
+    float2 entryPos = localUv * grid;
+    float2 texel = floor(entryPos);
+    float field = columnDepth(page, pageUvMin, pageUvScale, marchLod, grid, texel);
+    if (field <= 0.0) {
+        return result;                         // flush entry: the ray starts on the surface
+    }
+    float2 sdir = sign(texelVel);
+    float2 ardir = abs(1.0 / max(abs(texelVel), float2(1.0e-9, 1.0e-9)));
+    float2 frac = entryPos - texel;
+    float2 boundary = (sdir * (0.5 - frac) + 0.5) * ardir;
 
-    float2 depthStep = slope * (reach / float(layers));
-    float layerDepth = 1.0 / float(layers);
-    // Depth is measured inward from the flat surface, so a stored height of 1 (flush) is depth 0.
-    float2 uv = localUv;
-    float depth = 0.0;
-    float surface = 1.0
-            - samplePageNormalAo(page, pageUvMin + clampSpriteUv(uv) * pageUvScale, parallaxLod).a;
-    float2 prevUv = localUv;
-    float prevDepth = 0.0;
+    float t = 0.0;                // descended depth at the last crossed boundary
+    float prevField = field;
+    float hitDepth = field;
+    float2 move = float2(0.0, 0.0);
+    bool wallHit = false;
+    bool landed = false;
     [loop]
-    for (int i = 0; i < PARALLAX_MAX_LAYERS; i++) {
-        if (i >= layers || depth >= surface) break;
-        prevUv = uv;
-        prevDepth = depth;
-        uv -= depthStep;
-        depth += layerDepth;
-        surface = 1.0
-                - samplePageNormalAo(page, pageUvMin + clampSpriteUv(uv) * pageUvScale,
-                        parallaxLod).a;
-    }
-    // A flush texel — the ray never descended — is the only case that stays untouched, and it is the
-    // degenerate one rather than a threshold. The threshold this replaces was `depth <= 1/layers`, and
-    // `layers` itself shrinks as the reach shrinks, so lowering POM Depth moved the cutoff and grew the
-    // untouched cells instead of shrinking the relief: a texel just past the cutoff got the full
-    // displacement while its neighbour got none, painting the height field's own lattice onto the
-    // surface as hard cells. The ramp below replaces that with a continuous one.
-    if (depth <= 1.0e-6) {
-        return localUv;
-    }
-    // Bisect the final interval: the crossing is between prevUv (still in front of the surface) and uv
-    // (already behind it). The bracketing pair stays in unwrapped space; only the samples clamp.
-    float2 lo = prevUv;
-    float2 hi = uv;
-    float dLo = prevDepth;
-    float dHi = depth;
-    for (int j = 0; j < PARALLAX_REFINE_STEPS; j++) {
-        float2 mid = (lo + hi) * 0.5;
-        float dMid = (dLo + dHi) * 0.5;
-        float h = 1.0
-                - samplePageNormalAo(page, pageUvMin + clampSpriteUv(mid) * pageUvScale,
-                        parallaxLod).a;
-        if (h < dMid) {
-            hi = mid;
-            dHi = dMid;
-        } else {
-            lo = mid;
-            dLo = dMid;
+    for (int i = 0; i < layers; i++) {
+        if (field <= t) {
+            // The ray entered this column already below its ceiling: it struck the crossed face.
+            // The shadow walk climbs from the ceiling, the top of that face — starting at the
+            // boundary depth would shadow the wall by its own column.
+            wallHit = true;
+            landed = true;
+            break;
         }
+        float b = min(boundary.x, boundary.y);
+        if (field <= b) {
+            // The ceiling arrives while the ray is still over this column: a flat landing on it.
+            hitDepth = field;
+            landed = true;
+            break;
+        }
+        // Step across the nearer boundary and advance that axis's next crossing.
+        t = b;
+        move = float2(0.0, 0.0);
+        if (boundary.x <= boundary.y) {
+            move.x = sdir.x;
+            boundary.x += ardir.x;
+        } else {
+            move.y = sdir.y;
+            boundary.y += ardir.y;
+        }
+        texel += move;
+        prevField = field;
+        field = columnDepth(page, pageUvMin, pageUvScale, marchLod, grid, texel);
     }
-    // Quantise the displacement, not the resulting UV, and only once it is a whole texel.
-    //
-    // Snapping the UV itself drags an *undisplaced* sample onto the texel lattice, so the whole
-    // surface renders as a grid of flat texels — worst exactly where the displacement is smallest,
-    // because there a sub-texel offset rounds the sample onto the nearest centre instead of leaving it
-    // alone. On screen that reads as the surface cut into cells that hide the relief inside them, and
-    // shrinking the POM Depth makes the cells *larger* rather than smaller, which is the giveaway.
-    //
-    // Rounding the offset instead fixes that, but rounding unconditionally puts a cliff at half a
-    // texel: the reach ramps in the edge fade and the distance fade both drive the offset through that
-    // point, so each of them would switch the parallax off along a hard contour — a flat frame around
-    // every sprite, and a ring at the distance where the fade crosses. Rounding only from one texel up
-    // moves the switch to where `round` and the continuous value already agree, so there is nothing to
-    // see at the transition, and a sub-texel offset stays continuous — where it is harmless, being
-    // smaller than the texel it would have been snapped to.
-    // Ramp the displacement in with how deep the crossing is, so a texel that is only slightly
-    // recessed moves only slightly. That is what keeps the height field's flush/recessed boundary from
-    // reading as a hard cell edge.
-    float depthFade = smoothstep(0.0, PARALLAX_DEPTH_SOFTNESS, depth);
-    float2 offset = ((lo + hi) * 0.5 - localUv) * depthFade;
-    float2 offsetTexels = floor(offset * grid + float2(0.5, 0.5));
-    bool stepped = all(abs(offsetTexels) >= float2(1.0, 1.0));
-    if (stepped) {
-        offset = offsetTexels / grid;
-    }
-    float2 result = clampSpriteUv(localUv + offset);
 
-    // Only a real step exposes a wall. Below one texel there is no band to orient, and reporting one
-    // anyway is what used to fan the shading out of the point where the view faces the surface normal:
-    // there the lateral direction collapses and its angle is numerically arbitrary, so neighbouring
-    // pixels picked different neighbours and the normal span a full turn.
-    float lateralLen = length(vTS.xy);
-    if (stepped && lateralLen > 1.0e-5) {
-        float2 lateralDir = vTS.xy / lateralLen;
-        float2 texelStep = lateralDir / grid;
-        float here = 1.0 - samplePageNormalAo(page, pageUvMin + clampSpriteUv(result) * pageUvScale,
-                parallaxLod).a;
-        float ahead = 1.0 - samplePageNormalAo(page,
-                pageUvMin + clampSpriteUv(result - texelStep) * pageUvScale, parallaxLod).a;
-        stepNormal = float3(lateralDir, saturate(abs(ahead - here) / PARALLAX_WALL_SLOPE));
+    if (!landed || (move.x == 0.0 && move.y == 0.0)) {
+        // The budget ran out with the ray still in air, or the ray never left its starting column
+        // (a face-on view): the flat mapping is the answer, not a snapped texel centre.
+        return result;
     }
-    return clampSpriteUv(result);
+
+    // The shaded sample is the reached column's texel centre. A wall is the face the ray crossed to
+    // enter it, facing back along that boundary's own axis; its strength is the height step across
+    // the face, so sandstone strata (~0.14) and bark plateaus (~0.2) read as cut faces while stone's
+    // noise (≤0.04) keeps its normal map.
+    float2 displaced = wrapSpriteUv((texel + 0.5) / grid);
+    result.uv = displaced;
+    result.shadow = parallaxShadow(page, pageUvMin, pageUvScale, displaced, hitDepth, marchLod, n, T, B,
+            reach);
+    if (wallHit) {
+        result.wallDir = -normalize(move);
+        result.wallAmount = smoothstep(PARALLAX_WALL_GRADIENT * 0.33, PARALLAX_WALL_GRADIENT,
+                abs(field - prevField)) * style.wallScale;
+    }
+    return result;
 }
 
 struct Surface {
@@ -361,6 +400,10 @@ struct Surface {
     float emission;
     float sss;
     float ao;
+    // Fraction of the directional light that reaches this texel through the surface's own height field.
+    // Folded into albedo where the material's _n AO already goes: a path tracer has no per-light shader to
+    // multiply, and this is the same kind of quantity — occlusion of the light by the surface itself.
+    float shadow;
 };
 
 // Canonical material pages use a compact page index shared by their three dedicated arrays.
@@ -396,6 +439,7 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     surface.emission = (pc.materialToggles & MATERIAL_TOGGLE_BLOCK_EMISSION) != 0u ? fallbackEmission : 0.0;
     surface.sss = 0.0;
     surface.ao = 1.0;
+    surface.shadow = 1.0;
     // LabPBR porosity, decoded on the CPU from the _s blue byte. It stays 0 for every material that
     // did not author one, which is what keeps the wetness block at the end of this function free.
     float porosity = 0.0;
@@ -415,29 +459,25 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     // One frame serves both the parallax march and the normal-map rotation.
     float3 T, B;
     bool hasTbn = tangentFrame(geometricNormal, p0, p1, p2, uv0, uv1, uv2, T, B);
-    // Tangent-space wall reported by the march, applied after the normal map so it only overrides that
-    // map where a step was actually crossed and only by how much of a wall the height gradient says.
-    float3 stepNormal = float3(0.0, 0.0, 0.0);
-    bool hasStepNormal = false;
+    // Relief comes first: it moves where the surface is shaded, so every channel below — and the caller's
+    // albedo — has to be read from the moved UV.
+    ParallaxSample relief = untouchedParallax(localUv);
     if (hasTbn && !waveOwned && (header.features & MATERIAL_FEATURE_HEIGHT) != 0u
             && materialLod < PARALLAX_MAX_LOD && parallaxDepth > 0.0) {
-        // Parallax comes first: it moves where the surface actually is, so every channel below — and
-        // the caller's albedo — has to be read from the moved UV.
 #ifdef CAUSTICA_LEAN_HIT
-        // Diagnostic build only: the steep parallax march compiled out of the hit shader, so the cost of
-        // carrying it can be measured against a hit shader without it.
-        float2 displaced = localUv;
+        // Diagnostic build only: the march compiled out of the hit shader, so the cost of carrying it can
+        // be measured against a hit shader without it. `relief` already holds the untouched sample.
 #else
-        float2 displaced = parallaxLocalUv(header, page, localUv, materialLod, maxMaterialLod,
-                geometricNormal, T, B, vdir, parallaxDepth, stepNormal);
+        relief = sampleParallax(header, page, localUv, materialLod, maxMaterialLod, geometricNormal,
+                T, B, vdir, parallaxDepth);
 #endif
+        surface.shadow = relief.shadow;
         // A flush texel inside an otherwise displaced material marches nowhere, so it keeps the flat
         // mapping and skips the caller's extra albedo fetch.
-        if (any(abs(displaced - localUv) > 1.0e-5)) {
-            localUv = displaced;
-            surface.localUv = displaced;
+        if (any(abs(relief.uv - localUv) > 1.0e-5)) {
+            localUv = relief.uv;
+            surface.localUv = relief.uv;
             surface.albedoDisplaced = true;
-            hasStepNormal = stepNormal.z > 0.0;
         }
     }
     float2 pageUv = header.materialUv.xy + localUv * header.materialUv.zw;
@@ -484,9 +524,9 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     // whether or not the material carries a _n: the step is geometry the height field produced, not a
     // detail the normal map authored, so a material with height but no normal map still gets its walls
     // oriented — which is what stops the displaced band from reading as a stretched patch of texture.
-    if (hasStepNormal) {
-        float3 wallDir = normalize(stepNormal.x * T + stepNormal.y * B);
-        surface.normal = normalize(lerp(surface.normal, wallDir, saturate(stepNormal.z)));
+    if (relief.wallAmount > 0.0) {
+        float3 wallNormal = normalize(relief.wallDir.x * T + relief.wallDir.y * B);
+        surface.normal = normalize(lerp(surface.normal, wallNormal, relief.wallAmount));
     }
     // A water film does the same thing to every surface it covers — it fills the micro-surface and
     // turns it reflective — so the film term carries no porosity. Only the darkening is porosity's
@@ -623,6 +663,18 @@ float3 endPortalColor(float3 hitPos, float3 n, uint packedLayers, float time) {
     return srgbToLinear(pow(saturate(color * END_PORTAL_STAR_GAIN), END_PORTAL_STAR_CONTRAST));
 }
 
+// Vanilla's enchantment overlay is an ordinary model submission plus a texture matrix
+// (TextureTransform.setupGlintTexturing): the model UV is scaled by the transform's uniform scale,
+// rotated by ten degrees and translated by that frame's scroll. The rotation is a fixed constant in
+// vanilla and only keeps the pattern from reading as an axis-aligned scroll; the translation is the
+// animation itself, so it comes from the push.
+float2 glintPatternUV(float2 uv, float scale, float2 scroll) {
+    const float glintCos = 0.98480775; // cos(10 degrees)
+    const float glintSin = 0.17364818; // sin(10 degrees)
+    float2 rotated = float2(uv.x * glintCos - uv.y * glintSin, uv.x * glintSin + uv.y * glintCos);
+    return rotated * scale + scroll;
+}
+
 [shader("closesthit")]
 void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) {
     float2 attribs = attr.barycentrics;
@@ -708,6 +760,11 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ebary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         float2 euvCoord = ebary.x * euv[e0] + ebary.y * euv[e1] + ebary.z * euv[e2];
         int texSlot = int(pr.tint.w + 0.5);
+        // The capture attaches vanilla's enchantment overlay to the surface it was drawn over, so a flagged
+        // prim's emission lane holds the overlay's UV scale rather than an emission strength.
+        bool glintPrim = (pr.flags & ENTITY_PRIM_GLINT) != 0u;
+        // payloadSetPacked below replaces the flag word, so the trace's own guide marker must be read here.
+        bool guideTrace = (payload.flags & PAYLOAD_GUIDE_STABLE) != 0u;
         float3 ep0 = mul(entityO2w, HitTriangleVertexPosition(0));
         float3 ep1 = mul(entityO2w, HitTriangleVertexPosition(1));
         float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
@@ -736,7 +793,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 albedo = bt709ToAcesCg(opticalColor709);
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
-                header.params.x, header.params.y, pr.normal.w, material == MATERIAL_OPAQUE,
+                header.params.x, header.params.y, glintPrim ? 0.0 : pr.normal.w, material == MATERIAL_OPAQUE,
                 (pc.materialToggles & MATERIAL_TOGGLE_ENTITY_PARALLAX) != 0u ? pc.parallaxDepth : 0.0);
         n = surface.normal;
         // Entity albedo UVs are the texture's own, so the parallax-displaced local UV is already the
@@ -752,7 +809,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             albedo = bt709ToAcesCg(displacedOptical);
         }
 
-        packAlbedo(payload, albedo * surface.ao * surface.albedoScale);
+        packAlbedo(payload, albedo * surface.ao * surface.shadow * surface.albedoScale);
         packNormal(payload, n);
         payload.hitT = RayTCurrent();
         // Per-vertex motion vector: interpolate the captured per-vertex displacement with the same
@@ -780,6 +837,36 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                 emission, sss, header.params.z, header.params.w,
                 materialEmissionSource(header, emission));
         payloadSetDielectric(payload, material, entering);
+        // Vanilla draws the enchantment glint as an extra additive pass (BlendFunction.GLINT, src*src + dst)
+        // over the very model face just shaded, which is why the capture attached it here instead of
+        // capturing it as geometry of its own. Resolve its pattern against this face's own model UV, so it
+        // lands exactly on the pixels this surface owns — vanilla's depth-EQUAL test against the face.
+        if (glintPrim && !guideTrace) {
+            ConstPtr<WorldPush> glintPush = ConstPtr<WorldPush>(pc.worldPushAddr);
+            float4 glint = glintPush[0].glintParams;
+            float2 patternUV = glintPatternUV(euvCoord, abs(pr.normal.w), glint.xy);
+            // The shared entity sampler clamps; the pattern scrolls past the texture's edge every frame,
+            // so the wrap the glint pipeline gets from its own addressing is applied here by hand.
+            float4 glintTexel = entityAlbedoTex[NonUniformResourceIndex(int(pr.aux1))]
+                    .SampleLevel(patternUV - floor(patternUV), 0.0);
+            // glint.fsh multiplies by the submission's colour modulator, then by the option fade, and the
+            // blender squares the result. The square is taken on the framebuffer's own encoding — the
+            // capture keeps the texture bytes as they are, so this is the same quantity vanilla squares,
+            // not the linearised texel. That term is an addition to the display value, and one unit of
+            // display is 1/pre-exposure of radiance here, so the overlay contributes its squared pattern
+            // divided by the frame's pre-exposure.
+            float3 glintDisplay = glintTexel.rgb * pr.tint.rgb * glint.z;
+            glintDisplay *= glintTexel.a < 0.1 ? 0.0 : 1.0; // vanilla discards on the pattern's own alpha
+            payload.overlay = half3(bt709ToAcesCg(glintDisplay * glintDisplay)
+                    * (glint.w / max(glintPush[0].preExposure, 1.0e-9)));
+            payload.flags |= PAYLOAD_GLINT_OVERLAY;
+        }
+        // Model geometry is made of sheets: a translucent model face has the same medium on both sides, so
+        // it cannot bound a volume. Marked here rather than per material because every model dielectric is
+        // one — block items are drawn through this path as their flat layers, never as a closed solid.
+        if (material == MATERIAL_DIELECTRIC) {
+            payload.flags |= PAYLOAD_DIELECTRIC_THIN;
+        }
         if (unlitPrim) {
             payload.flags |= PAYLOAD_UNLIT;
         }
@@ -860,8 +947,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         // Translucent blocks (glass, ice, …) are breakable too — apply the same overlay here, reusing
         // gtex (already sampled above) rather than re-fetching blockAlbedoAtlas.
         packAlbedo(payload, bt709ToAcesCg(applyBreaking(
-                opticalColor709 * glassSurface.ao * glassSurface.albedoScale, rayCone, WorldRayOrigin(),
-                WorldRayDirection(), RayTCurrent(), n)));
+                opticalColor709 * glassSurface.ao * glassSurface.shadow * glassSurface.albedoScale,
+                rayCone, WorldRayOrigin(), WorldRayDirection(), RayTCurrent(), n)));
         packNormal(payload, n);
         payload.hitT = RayTCurrent();
         payload.motionPrev = half3(0.0h, 0.0h, 0.0h);
@@ -878,6 +965,11 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                 materialHeader.params.w,
                 materialEmissionSource(materialHeader, glassSurface.emission));
         payloadSetDielectric(payload, MATERIAL_DIELECTRIC, entering);
+        // Glass, ice and stained glass are cell-filling volumes, so their faces do end a medium. A pane,
+        // slab or stair of the same material does not, and the mesher tags those quads.
+        if ((pr.flags & TERRAIN_PRIM_THIN_DIELECTRIC) != 0u) {
+            payload.flags |= PAYLOAD_DIELECTRIC_THIN;
+        }
         // RIS emitter-NEE membership: the raygen gates this pane's direct-hit emission term because RIS
         // already samples the same rectangle.
         if ((pr.flags & TERRAIN_PRIM_IN_LIGHT_BUFFER) != 0u) {
@@ -915,12 +1007,12 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float2 displacedUv = materialHeader.albedoUv.xy + surface.localUv / materialHeader.albedoUv.zw;
         albedo709 = srgbToLinear(blockAlbedoAtlas.SampleLevel(displacedUv, blockLod).rgb) * tint709;
     }
-    packAlbedo(payload, unpackAlbedo(payload) * surface.ao * surface.albedoScale);
+    packAlbedo(payload, unpackAlbedo(payload) * surface.ao * surface.shadow * surface.albedoScale);
     // Block-breaking overlay: opaque/cutout terrain (water skips — fluids aren't breakable). Evaluate
     // it after normal mapping so decal projection uses the final shading orientation.
     if (material != MATERIAL_WATER) {
         packAlbedo(payload, bt709ToAcesCg(applyBreaking(
-                albedo709 * surface.ao * surface.albedoScale, rayCone, WorldRayOrigin(),
+                albedo709 * surface.ao * surface.shadow * surface.albedoScale, rayCone, WorldRayOrigin(),
                 WorldRayDirection(), RayTCurrent(), n)));
     }
     packNormal(payload, n);

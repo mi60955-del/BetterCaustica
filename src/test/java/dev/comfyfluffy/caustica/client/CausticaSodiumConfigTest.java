@@ -141,6 +141,8 @@ class CausticaSodiumConfigTest {
             case DLSS_QUALITY -> CausticaConfig.Rt.DlssRr.QUALITY_STEPS.stream()
                     .map(step -> option.nameKey() + "." + step).toList();
             case HDR_PEAK -> List.of(option.nameKey() + ".nits");
+            case FRAME_GENERATION_BACKEND -> CausticaConfig.Rt.Fg.BACKENDS.stream()
+                    .map(backend -> option.nameKey() + "." + backend).toList();
         };
     }
 
@@ -163,6 +165,13 @@ class CausticaSodiumConfigTest {
         for (int i = 0; i < peaks.length; i++) {
             assertEquals(CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS.get(i), peaks[i].value(),
                     "HdrPeak ordinal " + i);
+        }
+        CausticaSodiumConfig.FgBackend[] backends = CausticaSodiumConfig.FgBackend.values();
+        assertEquals(CausticaConfig.Rt.Fg.BACKENDS.size(), backends.length,
+                "FgBackend and BACKENDS disagree in length");
+        for (int i = 0; i < backends.length; i++) {
+            assertEquals(CausticaConfig.Rt.Fg.BACKENDS.get(i), backends[i].stored(),
+                    "FgBackend ordinal " + i);
         }
     }
 
@@ -192,7 +201,7 @@ class CausticaSodiumConfigTest {
 
     private static boolean cycles(CausticaSettings.Cycle cycle, Object setting) {
         return switch (cycle) {
-            case EXPOSURE_MODE -> setting instanceof CausticaConfig.StringSetting;
+            case EXPOSURE_MODE, FRAME_GENERATION_BACKEND -> setting instanceof CausticaConfig.StringSetting;
             case DLSS_QUALITY, HDR_PEAK -> setting instanceof CausticaConfig.IntSetting;
         };
     }

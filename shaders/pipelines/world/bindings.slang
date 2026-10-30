@@ -54,4 +54,10 @@ import world_common;
 // Per-pixel volumetric diagnostics (fog transmittance / in-scatter luminance / cloud density / cloud
 // shadow), written by the primary raygen only when WORLD_FLAG_VOLUME_DEBUG is set and shown by the debug
 // present pass. Render resolution, matching the guides.
-[[vk::binding(18, 0)]] [format("rgba16f")] public RWTexture2D<float4> volumeDebug;
+[[vk::binding(18, 0)]][format("rgba16f")] public RWTexture2D<float4> volumeDebug;
+
+// The baked cloud-density volumes, one 2D-array atlas for every shape the cloud layer can place
+// (RtCloudVolumes): RES layers per shape, layer = shape * RES + volume z. The cloud integrators in
+// volume.slang fetch slices through it and lerp between adjacent layers themselves (2D-array filtering
+// is nearest along the layer axis).
+[[vk::binding(19, 0)]] public Sampler2DArray cloudVolumes;

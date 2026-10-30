@@ -103,3 +103,21 @@ void probeSharpenPush(uint3 id : SV_DispatchThreadID) {
         float sink = float(sharpenPushProbe.hdrEnabled) + sharpenPushProbe.amount;
     }
 }
+
+[[vk::push_constant]] LensSourcePush lensSourcePushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeLensSourcePush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = lensSourcePushProbe.displayTexel.x;
+    }
+}
+
+[[vk::push_constant]] LensFlarePush lensFlarePushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeLensFlarePush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = lensFlarePushProbe.starburst + float(lensFlarePushProbe.spikes);
+    }
+}

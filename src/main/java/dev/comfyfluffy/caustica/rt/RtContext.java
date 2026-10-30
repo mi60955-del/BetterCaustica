@@ -69,6 +69,8 @@ public final class RtContext {
     private final int maxShaderGroupStride;
     private final int accelerationStructureScratchAlignment;
     private final long updateAfterBindCombinedImageSamplerLimit;
+    /** Device limit every 2D-array image's layer count has to fit under (see RtCloudVolumes). */
+    private final int maxImageArrayLayers;
     private long commandPool;
     /** Non-null while a batch opened by {@link #beginImageInitBatch()} is collecting init barriers. */
     private List<ImageInit> imageInitBatch;
@@ -78,7 +80,8 @@ public final class RtContext {
     }
 
     private RtContext(VulkanDevice device, long vma, int handleSize, int baseAlign, int handleAlign,
-                      int maxSbtStride, int scratchAlign, long updateAfterBindCombinedImageSamplerLimit) {
+                      int maxSbtStride, int scratchAlign, long updateAfterBindCombinedImageSamplerLimit,
+                      int maxImageArrayLayers) {
         this.device = device;
         this.vk = device.vkDevice();
         this.vma = vma;
@@ -91,6 +94,7 @@ public final class RtContext {
         this.maxShaderGroupStride = maxSbtStride;
         this.accelerationStructureScratchAlignment = scratchAlign;
         this.updateAfterBindCombinedImageSamplerLimit = updateAfterBindCombinedImageSamplerLimit;
+        this.maxImageArrayLayers = maxImageArrayLayers;
         this.gpuExecutor = new RtGpuExecutor(this);
     }
 
@@ -172,8 +176,14 @@ public final class RtContext {
 
             return new RtContext(device, pVma.get(0), rtProps.shaderGroupHandleSize(), rtProps.shaderGroupBaseAlignment(),
                     rtProps.shaderGroupHandleAlignment(), rtProps.maxShaderGroupStride(),
-                    asProps.minAccelerationStructureScratchOffsetAlignment(), combinedImageSamplerLimit);
+                    asProps.minAccelerationStructureScratchOffsetAlignment(), combinedImageSamplerLimit,
+                    limits.maxImageArrayLayers());
         }
+    }
+
+    /** Device limit every 2D-array image's layer count has to fit under (see RtCloudVolumes). */
+    public int maxImageArrayLayers() {
+        return maxImageArrayLayers;
     }
 
     private static long minUnsigned(int... values) {

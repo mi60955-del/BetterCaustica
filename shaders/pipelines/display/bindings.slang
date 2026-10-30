@@ -12,3 +12,6 @@ import display_common;
 // Purkinje shift needs the metered ABSOLUTE scene luminance, which only evScene carries: the applied
 // exposure scalar has already normalised it out of the image.
 [[vk::binding(8, 0)]] public StructuredBuffer<ExposureState, Std430DataLayout> exposureState;
+// Lens flare image (starburst + halos + lens dirt), an eighth of this pass's size. Bilinear upsampling is
+// intended: every artifact in it is low frequency except the spikes, which are several source texels wide.
+[[vk::binding(9, 0)]] public Sampler2D flareImage;

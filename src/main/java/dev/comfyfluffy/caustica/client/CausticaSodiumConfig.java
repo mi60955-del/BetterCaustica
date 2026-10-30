@@ -84,6 +84,25 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
         }
     }
 
+    // Ordered against CausticaConfig.Rt.Fg.BACKENDS; the TOML word is the enum name lower-cased.
+    // Package-private so the test can pin the two together.
+    enum FgBackend {
+        DLSS, FSR, SELF, DUPLICATE;
+
+        static FgBackend of(String stored) {
+            for (FgBackend backend : values()) {
+                if (backend.stored().equals(stored)) {
+                    return backend;
+                }
+            }
+            return DLSS;
+        }
+
+        String stored() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+    }
+
     @Override
     public void registerConfigLate(ConfigBuilder config) {
         ModOptionsBuilder mod = config.registerOwnModOptions();
@@ -125,6 +144,7 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
             case EXPOSURE_MODE -> exposureMode(config, option);
             case DLSS_QUALITY -> dlssQuality(config, option);
             case HDR_PEAK -> hdrPeak(config, option);
+            case FRAME_GENERATION_BACKEND -> frameGenerationBackend(config, option);
         };
     }
 
@@ -241,6 +261,19 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
                 .setDefaultValue(peakOf(option.integer().defaultValue()))
                 .setBinding(peak -> { option.integer().set(peak.value()); CausticaSettings.afterChange(option); },
                         () -> peakOf(option.integer().get()))
+                .setStorageHandler(SAVE)
+                .setImpact(impact(option));
+    }
+
+    private static EnumOptionBuilder<FgBackend> frameGenerationBackend(ConfigBuilder config, Option option) {
+        return config.createEnumOption(id(option.path()), FgBackend.class)
+                .setName(Component.translatable(option.nameKey()))
+                .setTooltip(Component.translatable(option.tooltipKey()))
+                .setElementNameProvider(backend ->
+                        Component.translatable(option.nameKey() + "." + backend.stored()))
+                .setDefaultValue(FgBackend.of(option.text().defaultValue()))
+                .setBinding(backend -> { option.text().set(backend.stored()); CausticaSettings.afterChange(option); },
+                        () -> FgBackend.of(option.text().get()))
                 .setStorageHandler(SAVE)
                 .setImpact(impact(option));
     }

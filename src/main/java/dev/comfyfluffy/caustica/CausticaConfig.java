@@ -103,6 +103,8 @@ public final class CausticaConfig {
                         + " without interpolating anything, which measures the present path alone.\n"
                         + " multi-frame-count sets generated frames per rendered frame (1 = 2x, 2 = 3x).\n"
                         + " FSR generates one per frame, so it caps itself at 1.\n"
+                        + " The backend's feature is built against the live swapchain, so switching it\n"
+                        + " applies on the next launch.\n"
                         + " debug-view selects what the self backend writes: 0 the interpolated frame,\n"
                         + " 1 motion magnitude, 2 whether a pixel had a history sample, 3 history only.");
         FILE.setComment("reflex",
@@ -611,7 +613,7 @@ public final class CausticaConfig {
              * tint-driven term so 0 leaves no residual absorption.
              */
             public static final FloatSetting WATER_OPACITY =
-                    clampedFloat("caustica.rt.waterOpacity", "composite.water-opacity", 4.0f, 0.0f, 4.0f);
+                    clampedFloat("caustica.rt.waterOpacity", "composite.water-opacity", 1.0f, 0.0f, 4.0f);
             /**
              * Strength of the spray band hugging the water surface: mist whose density follows the
              * wave crests' steepness. Rides the marched fog integrator, so it needs volumetric fog
@@ -642,7 +644,7 @@ public final class CausticaConfig {
              */
             public static final FloatSetting WATER_WAVE_SCALE =
                     clampedFloat("caustica.rt.waterWaveScale", "composite.water-wave-scale",
-                            1.5f, 0.25f, 4.0f);
+                            1.3f, 0.25f, 4.0f);
             /**
              * Fraction of the Fresnel reflection a water surface keeps, so it controls how much of the
              * bright sky the sea mirrors back. 1 is a perfect dielectric; lower values hand the removed
@@ -664,12 +666,13 @@ public final class CausticaConfig {
             /**
              * How far a parallax-displaced texel may sit below its flat position, in sprite-local UV.
              * One sprite spans one block face, so 0.25 is LabPBR's authored 25% of a block and is the
-             * value that matches what a pack draws. 0 disables the march entirely, which is also the
-             * quickest way to tell a parallax artifact apart from everything else on a surface.
+             * value that matches what a pack draws. 0, the default, disables the march entirely, which
+             * is also the quickest way to tell a parallax artifact apart from everything else on a
+             * surface.
              */
             public static final FloatSetting PARALLAX_DEPTH =
                     clampedFloat("caustica.rt.parallaxDepth", "composite.parallax-depth",
-                            0.25f, 0.0f, 0.5f);
+                            0.0f, 0.0f, 0.5f);
             // Sun/moon angular radii and the noon south tilt moved into the versioned look package
             // (look.json "sky"): they shape the sky alongside the exposure curve, the LMT and the
             // photometric anchors that were already authored there, and splitting them across two
@@ -849,32 +852,32 @@ public final class CausticaConfig {
              * and attenuates nothing, and it is what a player wants when the air should stay clear but
              * the beams should not.
              *
-             * <p>The same switch runs the underwater shafts: there the medium is the water body's own
-             * scattering ({@code composite.water-turbidity}), so the beams follow the water's
-             * extinction and the wave focus at the surface, and water with no scattering has nothing
-             * to light.
+             * <p>The same switch runs the underwater shafts, whose own medium and extinction
+             * ({@link #WATER_SHAFT_DENSITY}) are configured separately.
+             *
+             * <p>Off by default: the per-pixel sun-visibility probes are one of the more expensive
+             * per-frame additions, so a fresh install keeps the frame budget for the rest.
              */
             public static final BooleanSetting SHAFT_ENABLED =
-                    bool("caustica.rt.volume.shafts", "volume.shafts", true);
+                    bool("caustica.rt.volume.shafts", "volume.shafts", false);
             /**
              * Extinction of the shaft medium, in 1/block. It is what sets how fast the beams fade with
-             * distance — the reciprocal is the e-folding length. The shipped value puts a beam 30 blocks
-             * long at ~26% of the medium's total scatter weight and still carries 85% at 192, so both
-             * near foliage and a beam across a valley read; at 0.0025 a canopy a few blocks overhead
-             * scattered almost nothing.
+             * distance — the reciprocal is the e-folding length. The default puts a beam 30 blocks long
+             * at ~15% of the medium's total scatter weight and still carries ~65% at 192; at 0.0025 a
+             * canopy a few blocks overhead scattered almost nothing.
              */
             public static final FloatSetting SHAFT_DENSITY =
                     clampedFloat("caustica.rt.volume.shaftDensity", "volume.shaft-density",
-                            0.010f, 0.0f, 0.05f);
+                            0.0055f, 0.0f, 0.05f);
             /**
              * Henyey–Greenstein anisotropy of the shaft phase. This is the knob that turns "lit air"
              * into a beam: a forward lobe puts the light where the view and the sun line up, which is
-             * where a god ray lives. 0 is isotropic and reads as a flat glow; above ~0.8 the beams
-             * collapse into a halo around the sun and the shades lose them entirely.
+             * where a god ray lives. 0 is isotropic and reads as a flat glow (the default); above
+             * ~0.8 the beams collapse into a halo around the sun and the shades lose them entirely.
              */
             public static final FloatSetting SHAFT_ANISOTROPY =
                     clampedFloat("caustica.rt.volume.shaftAnisotropy", "volume.shaft-anisotropy",
-                            0.70f, 0.0f, 0.95f);
+                            0.0f, 0.0f, 0.95f);
             /**
              * How far the beams are integrated, in blocks. Only the air within this distance of the
              * camera scatters: a shorter reach keeps the effect local to the geometry that casts the
@@ -883,7 +886,7 @@ public final class CausticaConfig {
              */
             public static final FloatSetting SHAFT_DISTANCE =
                     clampedFloat("caustica.rt.volume.shaftDistance", "volume.shaft-distance",
-                            192.0f, 16.0f, 512.0f);
+                            72.0f, 16.0f, 512.0f);
             /**
              * Strength of the finished in-scatter, 1 = the physical single scatter of the medium at
              * {@link #SHAFT_DENSITY}. The default sits below 1 because the medium is deliberately far
@@ -895,17 +898,17 @@ public final class CausticaConfig {
                             0.6f, 0.0f, 2.0f);
 
             /**
-             * Extinction of the underwater shaft medium, in 1/block, 0 = no underwater beams.
+             * Extinction of the underwater shaft medium, in 1/block; 0 (the default) leaves the
+             * underwater beams off.
              *
-             * <p>Deliberately its own medium rather than the water body's scattering
-             * ({@code composite.water-turbidity}): that fraction also drives the body's ambient glow,
-             * so a player who wants beams but not a milky water column would have no way to ask for
-             * one without the other. At the shipped 0.03 the e-folding is 33 blocks — long enough for a
-             * beam to read, short enough that the column never saturates into a flat glow.
+             * <p>Deliberately its own medium rather than a property of the water body, so the beams
+             * can be lit without changing how opaque the water is. At 0.03 the e-folding is 33 blocks
+             * — long enough for a beam to read, short enough that the column never saturates into a
+             * flat glow.
              */
             public static final FloatSetting WATER_SHAFT_DENSITY =
                     clampedFloat("caustica.rt.volume.waterShaftDensity", "volume.water-shaft-density",
-                            0.03f, 0.0f, 0.5f);
+                            0.0f, 0.0f, 0.5f);
             /**
              * Ceiling on the underwater forward lobe: how much the sun's own direction may brighten the
              * water over the rest of it, as a phase value.
@@ -922,7 +925,7 @@ public final class CausticaConfig {
                             0.10f, 0.0f, 0.6f);
 
             /**
-             * The planar cloud sheet and its shadow field (Phase 4). Off keeps every consumer inert:
+             * The planar cloud sheet and its shadow field. Off keeps every consumer inert:
              * the sheet never renders, the NEE cloud shadow multiplies by exactly 1, and the fog/water
              * sun legs are untouched — the md5 baseline survives.
              */
@@ -934,42 +937,48 @@ public final class CausticaConfig {
              */
             public static final FloatSetting CLOUD_COVERAGE =
                     clampedFloat("caustica.rt.volume.cloudCoverage", "volume.cloud-coverage",
-                            0.5f, 0.0f, 1.0f);
+                            0.4f, 0.0f, 1.0f);
             /**
              * Absolute world height of the cloud plane (the sheet and the shadow field share it).
              * Already-rebased on the way into the shader like the fog base.
              */
             public static final FloatSetting CLOUD_ALTITUDE =
                     clampedFloat("caustica.rt.volume.cloudAltitude", "volume.cloud-altitude",
-                            192.0f, -64.0f, 1024.0f);
+                            312.0f, -64.0f, 1024.0f);
             /**
-             * Slab thickness in blocks. It means two things at once, and the second is why it goes this
-             * high: the planar tier's optical depth scales with it, and the volumetric tier's CLOUD SIZE
-             * is derived from it (both the 3D lobe cell and the cumulus planform cell are fractions of
-             * it). A 48-block ceiling could only ever produce a deck of altocumulus elements, because a
-             * real cumulus is 200..1000 blocks across and its vertical extent is what the slab has to
-             * hold — a thick slab with a proportionally lower density is a sky of towers, a thin one with
-             * a higher density is a sheet of lanes, and the column ends up the same either way.
+             * How deep the deck stands above the cloud base, in blocks: the instance box's height,
+             * and nothing else. Every tier prices the same column optical depth regardless of it, so
+             * this dial changes the cloud's shape — flatter or deeper — without changing how dark the
+             * sky or the shadow is, and without moving a single instance.
              */
             public static final FloatSetting CLOUD_THICKNESS =
                     clampedFloat("caustica.rt.volume.cloudThickness", "volume.cloud-thickness",
-                            12.0f, 0.5f, 256.0f);
+                            208.0f, 8.0f, 1024.0f);
+            /**
+             * Cloud footprint in blocks: the width of one instance's box, and the size the instance
+             * grid spaces them at. This is the dial that makes a sky of small puffs or of large
+             * decks; the box is always {@code CLOUD_BOX_ASPECT} of it tall, so the volume is never
+             * stretched by the other cloud dials.
+             */
+            public static final FloatSetting CLOUD_SIZE =
+                    clampedFloat("caustica.rt.volume.cloudSize", "volume.cloud-size",
+                            400.0f, 32.0f, 2048.0f);
             /**
              * Density multiplier on the optical depths: the shadow strength. 0 makes the sheet a
              * thin bright veil with no shadow; 1 casts full water-cloud-order shadows.
              */
             public static final FloatSetting CLOUD_DENSITY =
                     clampedFloat("caustica.rt.volume.cloudDensity", "volume.cloud-density",
-                            1.0f, 0.0f, 3.0f);
+                            0.6f, 0.0f, 3.0f);
             /**
-             * How strongly the cloud layer gathers into localized systems with clear sky between
-             * them, 0..1. 0 spreads the streaks uniformly over the whole dome (a woven mat); 1
-             * breaks them into distinct cloud fields with real gaps. Fades out near full coverage,
-             * so 100% coverage still delivers a solid overcast.
+             * How strongly the cloud layer gathers into weather systems with clear sky between them,
+             * 0..1. 0 sprinkles instances uniformly across the grid; 1 clusters them into distinct
+             * fields (and breathes their footprint, so sparse skies carry smaller decks). Fades out
+             * near full coverage, so 100% coverage still delivers a solid overcast.
              */
             public static final FloatSetting CLOUD_PATCHINESS =
                     clampedFloat("caustica.rt.volume.cloudPatchiness", "volume.cloud-patchiness",
-                            0.7f, 0.0f, 1.0f);
+                            1.0f, 0.0f, 1.0f);
             /** Cloud field drift speed, blocks per second, on the wave clock like the fog wind. */
             public static final FloatSetting CLOUD_WIND_SPEED =
                     clampedFloat("caustica.rt.volume.cloudWindSpeed", "volume.cloud-wind-speed",
@@ -985,16 +994,16 @@ public final class CausticaConfig {
              */
             public static final FloatSetting CLOUD_FADE_DISTANCE =
                     clampedFloat("caustica.rt.volume.cloudFadeDistance", "volume.cloud-fade-distance",
-                            8000.0f, 512.0f, 16384.0f);
+                            5120.0f, 512.0f, 16384.0f);
             /**
-             * Render the cloud layer as a slab that is walked through instead of crossed once (Phase 5).
-             * Off is the planar sheet and the md5 baseline; on replaces the sheet with the volumetric
-             * tier, which spends a step budget per primary-ray pixel to gain real vertical structure,
-             * parallax and a lit crown over a dark underbelly. Continuation rays keep the tier's mean
-             * extinction either way, so reflections and bounces do not pay the walk.
+             * Render the cloud layer as a slab that is walked through instead of crossed once. Off is
+             * the planar sheet and the md5 baseline; on, the default, replaces the sheet with the
+             * volumetric tier, which spends a step budget per primary-ray pixel to gain real vertical
+             * structure, parallax and a lit crown over a dark underbelly. Continuation rays keep the
+             * tier's mean extinction either way, so reflections and bounces do not pay the walk.
              */
             public static final BooleanSetting CLOUD_VOLUMETRIC =
-                    bool("caustica.rt.volume.cloudVolumetric", "volume.cloud-volumetric", false);
+                    bool("caustica.rt.volume.cloudVolumetric", "volume.cloud-volumetric", true);
             /**
              * Steps the volumetric tier walks across the slab per primary-ray pixel. The cost is linear
              * in this and the quality of the dithering the denoiser has to resolve is inversely so:
@@ -1004,17 +1013,13 @@ public final class CausticaConfig {
             public static final IntSetting CLOUD_STEPS =
                     clampedInt("caustica.rt.volume.cloudSteps", "volume.cloud-steps", 16, 8, 48);
             /**
-             * Character of the volumetric deck, 0..1. It drives two things together, because a cumulus
-             * is not a stratus with a different silhouette — it is a different planform AND a different
-             * vertical profile: 0 is a stratus sheet (the 2D field's own streak lanes, sampled at their
-             * own scale, in a board with softened rims), 1 a field of cumulus (the same lattice sampled
-             * half as fine, so the lanes widen into cloud-sized patches, under the classic heap profile
-             * of a flat base and a rounded crown). Both ends carry the same column depth, so this dial
-             * changes the shape the light falls on and never how much cloud is overhead. Ignored while
-             * {@link #CLOUD_VOLUMETRIC} is off.
+             * Which baked cloud volume the layer's instances render, 0..1 mapped across the shapes
+             * RtCloudVolumes ships (small cumulus through the storm deck). The value itself is never
+             * sent to the shaders: it travels as the selected shape's index in cloud1.x, and the
+             * mapping lives where the atlas lives so the two cannot drift apart.
              */
             public static final FloatSetting CLOUD_TYPE =
-                    clampedFloat("caustica.rt.volume.cloudType", "volume.cloud-type", 0.6f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.volume.cloudType", "volume.cloud-type", 0.2f, 0.0f, 1.0f);
 
             /**
              * How much weather thickens the deck, 0..1. Rain lifts the coverage toward solid overcast and
@@ -1046,8 +1051,8 @@ public final class CausticaConfig {
             /**
              * The volumetric quality preset: 0..4 is Off / Low / Medium / High / Ultra. Reading it does
              * nothing on its own, and it is never applied at load — a hand-tuned configuration must not be
-             * rewritten by an update. Its default is Off because that is what every volumetric switch
-             * already defaults to, so on a fresh install the label states the truth. Selecting a tier WRITES the settings below, because a preset that only
+             * rewritten by an update. It defaults to Off because the fog and the cloud layer are off on a
+             * fresh install, so the label states the truth. Selecting a tier WRITES the settings below, because a preset that only
              * overrode them inside the renderer would leave the switches on screen describing a frame
              * that is not the one being drawn. Tier 0 is the one tier with a hard requirement: it has to
              * render exactly like the renderer did before any of this existed.
@@ -1127,10 +1132,31 @@ public final class CausticaConfig {
              */
             public static final IntSetting PARALLAX_LAYERS =
                     clampedInt("caustica.rt.materials.parallaxLayers", "materials.parallax-layers",
-                            32, 8, 64);
+                            8, 8, 64);
+            /**
+             * How a displaced texel is turned into a position, as PARALLAX_STYLE_* below.
+             *
+             * <p>Sharp snaps the offset onto the shading texel grid once it spans a whole texel and orients
+             * the band a step uncovers as a wall, so authored hard edges — plank grooves, brick bevels, cut
+             * stone — read as cut geometry. Smooth keeps the offset continuous and reads the height field a
+             * mip coarser, so the same relief reads as a rounded bevel carried by the material's own normal
+             * map instead of a stair. Smooth costs the displacement of detail thinner than that mip.
+             */
+            public static final IntSetting PARALLAX_STYLE =
+                    clampedInt("caustica.rt.materials.parallaxStyle", "materials.parallax-style",
+                            Materials.PARALLAX_STYLE_SHARP, Materials.PARALLAX_STYLE_SMOOTH,
+                            Materials.PARALLAX_STYLE_SHARP);
+            /**
+             * Shadow a height-mapped surface with its own relief: the march walks from the displaced texel
+             * toward the sun through the same height field, so a groove the light cannot reach into
+             * darkens. Only surfaces that already carry a height field pay for it, and only on the texels
+             * the base march actually displaced.
+             */
+            public static final BooleanSetting PARALLAX_SHADOW =
+                    bool("caustica.rt.materials.parallaxShadow", "materials.parallax-shadow", false);
             /** Run height-field parallax on entities as well as on terrain. */
             public static final BooleanSetting ENTITY_PARALLAX =
-                    bool("caustica.rt.materials.entityParallax", "materials.entity-parallax", true);
+                    bool("caustica.rt.materials.entityParallax", "materials.entity-parallax", false);
             /** Honour the emissiveness a pack authored in its own specular map (_s alpha). */
             public static final BooleanSetting TEXTURE_EMISSION =
                     bool("caustica.rt.materials.textureEmission", "materials.texture-emission", true);
@@ -1159,6 +1185,11 @@ public final class CausticaConfig {
             public static final int TOGGLE_SUBSURFACE = 4;
             public static final int TOGGLE_POROSITY = 8;
             public static final int TOGGLE_ENTITY_PARALLAX = 16;
+            public static final int TOGGLE_PARALLAX_SHADOW = 32;
+
+            // Values of PARALLAX_STYLE, mirroring PARALLAX_STYLE_* in world_common.slang.
+            public static final int PARALLAX_STYLE_SMOOTH = 0;
+            public static final int PARALLAX_STYLE_SHARP = 1;
 
             private Materials() {
             }
@@ -1342,9 +1373,9 @@ public final class CausticaConfig {
 
         /**
          * Frame generation: the extra-present loop plus whichever backend fills the generated frame.
-         * Default off. A backend that this hardware or driver cannot run falls back to duplicating
-         * the rendered frame rather than disabling the feature, so a bad choice costs smoothness and
-         * not the whole frame.
+         * Default off. A backend this hardware or driver cannot run reports itself unavailable and the
+         * extra-present loop stays off; the rendered frame is still presented normally, and another
+         * backend can be chosen at the next launch.
          */
         public static final class Fg {
             public static final String DLSS = "dlss";
@@ -1550,7 +1581,7 @@ public final class CausticaConfig {
              */
             public static final FloatSetting PURKINJE_STRENGTH =
                     clampedFloat("caustica.rt.tonemap.purkinjeStrength", "tonemap.purkinje-strength",
-                            1.0f, 0.0f, 2.0f);
+                            1.4f, 0.0f, 2.0f);
 
             /**
              * Selects which grading the display pass applies. True — the default — is the advanced
@@ -1588,16 +1619,16 @@ public final class CausticaConfig {
              * punchier render. Only read while {@link #ADVANCED_GRADING} is on.
              */
             public static final FloatSetting AGX_CONTRAST =
-                    clampedFloat("caustica.rt.tonemap.agxContrast", "tonemap.agx-contrast", 1.0f, 0.0f, 2.0f);
+                    clampedFloat("caustica.rt.tonemap.agxContrast", "tonemap.agx-contrast", 1.05f, 0.0f, 2.0f);
 
             /**
              * Width in stops of AgX's log2 encoding window around mid grey. The published transform uses
-             * 14: wider spends more of the curve on the highlight shoulder (softer rolloff, lower
-             * contrast), narrower compresses the same scene into fewer stops. Only read while
-             * {@link #ADVANCED_GRADING} is on.
+             * 14; the default widens it to 16, spending more of the curve on the highlight shoulder
+             * (softer rolloff, lower contrast), while a narrower window compresses the same scene into
+             * fewer stops. Only read while {@link #ADVANCED_GRADING} is on.
              */
             public static final FloatSetting AGX_RANGE =
-                    clampedFloat("caustica.rt.tonemap.agxRange", "tonemap.agx-range", 14.0f, 10.0f, 20.0f);
+                    clampedFloat("caustica.rt.tonemap.agxRange", "tonemap.agx-range", 16.0f, 10.0f, 20.0f);
 
             /**
              * Runtime multiplier on the look package's authored bloom strength. 1 keeps the authored
@@ -1655,6 +1686,170 @@ public final class CausticaConfig {
         }
 
         /**
+         * Lens flare: the artifacts a real lens leaves on the exposed image, added scene-referred right
+         * after bloom so the display transform grades them like light rather than like pixels.
+         *
+         * <p>Three artifacts share one chain. The starburst is the diffraction pattern of the aperture's
+         * blades: rays leaving each bright source along a fixed set of angles. It needs a source image of
+         * its own instead of bloom's glow, because a glow has no edge — a gather from it only smears a
+         * disc, while a compact source with a defined rim resolves into spikes. The halos are the
+         * aperture's own image thrown back onto the sensor at a radius that depends on wavelength;
+         * sampling each colour channel at a slightly different radius is the dispersion, and squashing the
+         * ring vertically is the aperture's shape projected off axis. The dirt is the front element's
+         * dust: out-of-focus specks that light up where the bloom glow reaches them, so it is a masked
+         * multiply of that glow rather than a light source of its own.
+         *
+         * <p>The flare image is {@link #RESOLUTION} times smaller than the display in each axis and the source
+         * field is an eighth, which is what makes a few hundred taps per texel affordable; every artifact is
+         * smooth by nature, so its size never shows as pixels. {@link #SAMPLE_RATE} scales
+         * the number of taps the two gathers take, so the chain has one dial for its dominant cost on top of
+         * the per-artifact counts. With {@link #ENABLED} off the chain is skipped and the display mapper does
+         * not even sample its image.
+         * {@link #STARBURST_ENABLED}, {@link #HALO_ENABLED} and {@link #DIRT_ENABLED}
+         * split the three artifacts apart, and with all three off the chain stops as well: a flare image of
+         * zeros costs the same as no flare image at all. All values are read per frame, so they are live and
+         * rebuild nothing.
+         */
+        public static final class Lens {
+            /**
+             * Gates the two lens dispatches and the display pass's fetch of their result. Off costs
+             * nothing and leaves the image exactly as bloom left it.
+             */
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.lens.enabled", "lens.enabled", true);
+
+            /**
+             * Divisor on the display size for the flare image: it is {@code display / resolution} wide and
+             * tall, so its texel count falls with the square. The gathers run at that size, so this is the
+             * chain's resolution dial: 4 is the default, giving rings and rays their finest faceting at
+             * sixteen times the cost of 16; 8 halves that cost in each axis with no artifact visibly
+             * faceted.
+             *
+             * <p>The source field the gathers read does not follow this dial; it keeps its own eighth, because
+             * a ray is as wide as the source texels that launch it, so a finer source would fan every star out
+             * into a wedge. Unlike the other lens settings a change here reallocates the flare image on the next
+             * frame instead of only changing a push constant; nothing outside the chain reads it, so that is not
+             * a pipeline rebuild.
+             */
+            public static final IntSetting RESOLUTION =
+                    clampedInt("caustica.rt.lens.resolution", "lens.resolution", 4, 4, 16);
+
+            /**
+             * Multiplier on the tap counts of both gathers, i.e. {@link #SAMPLES} and {@link #HALO_TAPS}.
+             * The per-artifact counts shape one ray or one ring; this dial moves both at once, which is
+             * what trades the chain's cost against faceting when {@link #RESOLUTION} has already been
+             * pushed as low as the look allows. The default 2.0 doubles both counts.
+             */
+            public static final FloatSetting SAMPLE_RATE =
+                    clampedFloat("caustica.rt.lens.sampleRate", "lens.sample-rate", 2.0f, 0.25f, 2.0f);
+
+            /**
+             * Gates the starburst alone. Off skips the source reduction when the halo is off as well,
+             * because the dust is lit by bloom and needs no source field.
+             */
+            public static final BooleanSetting STARBURST_ENABLED =
+                    bool("caustica.rt.lens.starburstEnabled", "lens.starburst-enabled", true);
+
+            /**
+             * Overall scale on the starburst. 0 removes the spikes while keeping the halo and the dirt,
+             * which is how the aperture's pattern is told apart from the rest. The default 0.05 keeps
+             * the star faint enough to read only around the sun and strong lamps.
+             */
+            public static final FloatSetting STARBURST =
+                    clampedFloat("caustica.rt.lens.starburst", "lens.starburst", 0.05f, 0.0f, 3.0f);
+
+            /**
+             * Number of spike rays per source, i.e. the aperture's blade count as it reads on screen. An
+             * odd count is the common photographic case; an even one can look like a six-pointed star
+             * because opposite rays merge when they are symmetric about the source. The default is 3.
+             */
+            public static final IntSetting SPIKES =
+                    clampedInt("caustica.rt.lens.spikes", "lens.spikes", 3, 3, 12);
+
+            /**
+             * How far the spikes reach, as a fraction of the frame's height in the flare image's
+             * coordinates. The spike's weight falls off exponentially with distance, so this is the length
+             * at which the ray has faded to nothing rather than a hard cut.
+             */
+            public static final FloatSetting SPIKE_LENGTH =
+                    clampedFloat("caustica.rt.lens.spikeLength", "lens.spike-length", 0.15f, 0.02f, 0.8f);
+
+            /**
+             * Gates the halo rings alone. Like {@link #STARBURST_ENABLED} it also decides whether the
+             * source field is worth building.
+             */
+            public static final BooleanSetting HALO_ENABLED =
+                    bool("caustica.rt.lens.haloEnabled", "lens.halo-enabled", false);
+
+            /**
+             * Overall scale on the halo rings. 1 applies the shader's full ring gain, 0 removes the
+             * rings and keeps the spikes and the dirt.
+             */
+            public static final FloatSetting HALO =
+                    clampedFloat("caustica.rt.lens.halo", "lens.halo", 0.05f, 0.0f, 3.0f);
+
+            /**
+             * Radius of the halo ring, in flare-image coordinates. Real rings sit far out, near where the
+             * aperture's image lands relative to the optical axis; this radius is measured from each
+             * source rather than from the axis, which keeps a source's own ring around it.
+             */
+            public static final FloatSetting HALO_RADIUS =
+                    clampedFloat("caustica.rt.lens.haloRadius", "lens.halo-radius", 0.04f, 0.01f, 0.6f);
+
+            /**
+             * Radial spread between the colour channels of the halo. Each channel samples at
+             * {@code radius * (1 + dispersion * chroma)} with chroma 1 for red, 0 for green and -1 for
+             * blue, so the ring runs blue on the inside and orange on the outside; 0 makes it neutral
+             * white. The shift is a fraction of the radius, so the fringe stays proportional when
+             * {@link #HALO_RADIUS} changes; a large value separates the channels into three distinct
+             * rings instead of tinting the edges of one.
+             */
+            public static final FloatSetting DISPERSION =
+                    clampedFloat("caustica.rt.lens.dispersion", "lens.dispersion", 0.29f, 0.0f, 1.0f);
+
+            /**
+             * Gates the dust alone. It costs one bloom fetch per lens texel, so it is also the cheapest
+             * artifact to switch off on its own.
+             */
+            public static final BooleanSetting DIRT_ENABLED =
+                    bool("caustica.rt.lens.dirtEnabled", "lens.dirt-enabled", false);
+
+            /**
+             * Scale on the lens dirt. 1 applies the shader's authored density, 0 removes the dust
+             * entirely; the default 0.85 is slightly lighter.
+             */
+            public static final FloatSetting DIRT =
+                    clampedFloat("caustica.rt.lens.dirt", "lens.dirt", 0.85f, 0.0f, 3.0f);
+
+            /**
+             * Multiplier on the dust's spatial frequency. Above 1 the specks shrink and multiply, below 1
+             * they grow into smudges (the default 0.25 reads as soft smudges); the frequencies themselves
+             * are authored per lens-image height, so this stays a relative dial and does not tie the look
+             * to the render resolution.
+             */
+            public static final FloatSetting DIRT_SCALE =
+                    clampedFloat("caustica.rt.lens.dirtScale", "lens.dirt-scale", 0.25f, 0.25f, 4.0f);
+
+            /**
+             * Taps per spike ray. They march out at a uniform spacing and each texel slides the chain by
+             * its own random phase, so a handful already resolves into a continuous ray; the dial is here
+             * because this is the chain's dominant cost, and every tap is read on both sides of the ray.
+             */
+            public static final IntSetting SAMPLES =
+                    clampedInt("caustica.rt.lens.samples", "lens.samples", 12, 8, 32);
+
+            /**
+             * Taps around each halo ring. The ring is smooth, so this trades a visible faceting against
+             * the chain's second-largest cost.
+             */
+            public static final IntSetting HALO_TAPS =
+                    clampedInt("caustica.rt.lens.haloTaps", "lens.halo-taps", 8, 8, 48);
+
+            private Lens() {
+            }
+        }
+
+        /**
          * Display-referred sharpening of the finished display image.
          *
          * <p>What is being restored is the softness DLSS-RR's upscale leaves behind, and that softness exists
@@ -1677,12 +1872,11 @@ public final class CausticaConfig {
             /**
              * How much of the high-pass term is added back. 0.00 is a straight copy, 1.00 is a plain unsharp
              * mask over a 3x3 texel neighbourhood, and above that the difference keeps growing until the
-             * clamps at the ends of the code-value range flatten it. The default is one full mask: it
-             * restores texel-scale detail without ringing on the high-contrast edges that the temporal
-             * accumulator already reproduces cleanly.
+             * clamps at the ends of the code-value range flatten it. The default 0.50 restores most of the
+             * upscale's lost texel-scale detail without ringing on high-contrast edges.
              */
             public static final FloatSetting AMOUNT =
-                    clampedFloat("caustica.rt.sharpen.amount", "sharpen.amount", 1.0f, 0.0f, 2.0f);
+                    clampedFloat("caustica.rt.sharpen.amount", "sharpen.amount", 0.5f, 0.0f, 2.0f);
 
             private Sharpen() {
             }

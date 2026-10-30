@@ -248,6 +248,19 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool first
         float3 n = payloadNormal(); // oriented toward the incoming ray by the closest-hit
         float3 hitPos = ro + rd * payload.hitT;
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
+        // Vanilla composites the enchantment glint additively over the geometry it decorates
+        // (BlendFunction.GLINT) and it is not a scattering surface: the closest-hit resolves the overlay
+        // against this face's own UV (see world.rchit), and the path adds it here, once, on the same
+        // throughput as the surface. Seed-free at the first vertex, so the first sample routes it into
+        // the prefix and the later samples skip it.
+        if (payloadGlintOverlay()) {
+            float3 overlay = throughput * payloadOverlay();
+            if (firstSegment) {
+                if (firstSample) prefixL += overlay;
+            } else {
+                L += overlay;
+            }
+        }
         uint material = payloadMaterial();
         int hitDepth = indirectDepth++;
 
@@ -310,8 +323,16 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool first
             // the stack remembers.
             Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0), tint, transmission,
                     worldPush.waterOpacity);
+            // A face that bounds no volume (see PAYLOAD_DIELECTRIC_THIN) sits inside one medium: it filters
+            // the ray and opens nothing, so it must not be given an eta pair that could total-internally
+            // reflect. Kept identical to primary.rgen's interface and the guide traversal.
+            bool thin = !isWater && (payload.flags & PAYLOAD_DIELECTRIC_THIN) != 0u;
+            // Same rule as the primary interface: an exit needs an entry, otherwise there is no crossing.
+            if (!thin && !entering && !mediumInsideDenser(medium)) {
+                thin = !isWater;
+            }
             float etaI = medium.current.ior;
-            float etaT = entering ? entered.ior : medium.outer.ior;
+            float etaT = thin || entering ? entered.ior : medium.outer.ior;
 
             float cosI = clamp(dot(-rd, n), 0.0, 1.0);
             float F = waterReflectance(fresnelDielectric(cosI, etaI, etaT), isWater);
@@ -332,8 +353,11 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool first
                 rd = normalize(transmittedDir);
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, transmitBias);
                 // Crossing into or out of the volume. Absorption is the medium's job from here, so the
-                // tint is NOT also multiplied into the throughput — that would double-count it.
-                if (entering) {
+                // tint is NOT also multiplied into the throughput — that would double-count it. A thin
+                // face opens no medium, so nothing else would absorb it: the filter is applied directly.
+                if (thin) {
+                    throughput *= tint;
+                } else if (entering) {
                     mediumPush(medium, entered);
                 } else {
                     mediumPop(medium);

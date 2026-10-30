@@ -1,0 +1,20 @@
+{
+  "scene": "RT测试 (E:/Minecraft/26.2), sealed black-concrete box, sun pinned with /time set 6000, 1920x1080 display / 960x540 traced, DLSS-RR preset 6",
+  "note": "gpu.csv is truncated at every launch, so each arm is its own session; means over the last 240 still frames; renderer = Vulkan + DLSS-RR, confirmed in the log",
+  "arms": {
+    "per_pixel_rays": {
+      "camera": "(1,150,0) yaw 90 pitch 10, box (0,150,0) with three 1x1 ceiling holes",
+      "shafts_on": {"fog": false, "shafts": true, "shaft_density": 0.01, "tracePrimaryMs": 1.994, "traceIndirectMs": 16.866, "skyLutMs": 0.802, "dlssMs": 5.292},
+      "all_off_lean": {"fog": false, "shafts": false, "shaft_density": 0.01, "tracePrimaryMs": 0.451, "traceIndirectMs": 6.532, "skyLutMs": 0.626, "dlssMs": 5.06},
+      "fog_only": {"fog": true, "shafts": false, "shaft_density": 0.01, "tracePrimaryMs": 1.699, "traceIndirectMs": 16.03, "skyLutMs": 0.626, "dlssMs": 5.085},
+      "shafts_switch_on_density_zero": {"fog": false, "shafts": true, "shaft_density": 0.0, "tracePrimaryMs": 1.72, "traceIndirectMs": 14.572, "skyLutMs": 0.627, "dlssMs": 5.071}
+    }
+  },
+  "deltas_ms_vs_all_off": {
+    "per_pixel_rays": {
+      "shafts_on": {"tracePrimaryMs": 1.543, "traceIndirectMs": 10.334, "visible_beams": true},
+      "fog_only": {"tracePrimaryMs": 1.248, "traceIndirectMs": 9.498, "visible_beams": false},
+      "shafts_switch_on_density_zero": {"tracePrimaryMs": 1.269, "traceIndirectMs": 8.04, "visible_beams": false}
+    }
+  }
+}

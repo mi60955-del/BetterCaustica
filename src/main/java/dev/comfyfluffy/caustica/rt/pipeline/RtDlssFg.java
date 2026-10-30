@@ -48,7 +48,7 @@ public final class RtDlssFg {
     }
 
     public boolean isAvailable() {
-        return available;
+        return available && !failed;
     }
 
     /** Driver-reported maximum multi-frame-generation count (1 = 2x only); 0 until probed. */
@@ -145,7 +145,8 @@ public final class RtDlssFg {
             return true;
         } catch (Throwable t) {
             failed = true;
-            CausticaMod.LOGGER.error("DLSS-FG setup failed; frame generation disabled", t);
+            CausticaMod.LOGGER.error("DLSS-FG setup failed; the DLSS generator is unavailable. "
+                    + "Choose FSR 3.1 or another backend.", t);
             return false;
         }
     }
@@ -195,7 +196,8 @@ public final class RtDlssFg {
             return true;
         } catch (Throwable t) {
             failed = true;
-            CausticaMod.LOGGER.error("DLSS-FG evaluate failed; frame generation disabled", t);
+            CausticaMod.LOGGER.error("DLSS-FG evaluate failed; the DLSS generator is unavailable. "
+                    + "Choose another backend.", t);
             return false;
         }
     }
@@ -248,16 +250,6 @@ public final class RtDlssFg {
         failed = false;
         probed = false;
         available = false;
-    }
-
-    /**
-     * Release the feature when the frame-generation backend setting no longer names DLSS, so
-     * switching to FSR does not leave this feature holding device memory. No-op otherwise.
-     */
-    public void destroyUnlessSelected() {
-        if (!isNull(feature) && !CausticaConfig.Rt.Fg.DLSS.equals(CausticaConfig.Rt.Fg.BACKEND.get())) {
-            destroy();
-        }
     }
 
     private void releaseFeature(VulkanDevice device) {

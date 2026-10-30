@@ -231,39 +231,58 @@ public float fogMarchDensity(WorldPush push, float3 pos) {
     return base * max(0.0, 1.0 + amp * (fogFbm(q) * 2.0 - 1.0)) + sprayDensity(push, pos);
 }
 
-// ---- Cloud layer (Phase 4: the planar sheet and its shared shadow field) ----------------------------
+// ---- Cloud layer (baked volumetric clouds, the clouds_unreal scheme) --------------------------------
 //
-// One procedural coverage field serves the three consumers the plan gives the weather map at this
-// tier: the sky.rmiss planar sheet, the shadow every celestial NEE probe below the layer picks up
-// (the cloud shadows on the ground), and the fog/water sun legs (the crepuscular dimming). The
-// field is world-pinned through the EXACT cloud anchor (cloud2.xy — not the wave domain's
-// mod-4096 one: the streak lattice has no period, so the anchor must not wrap either) and rides
-// the Java-accumulated per-axis drift (cloud2.zw). The 2D field is the honest resolution of the
-// PLANAR tier — the slab has no vertical structure yet; Phase 5's volumetric tier replaces the
-// shadow estimate with a real march through the slab and takes the baked weather map with it.
+// The layer's datum is cloud0.y, its base, and cloud0.z, how deep the deck stands above it. Instances
+// stand on that base as an infinite wind-drifted grid, each rendering one baked 3D density volume
+// (the textures/cloud/*.vol assets, uploaded as one 2D-array atlas by RtCloudVolumes) in a box as
+// wide as Cloud Size and as deep as Cloud Thickness. The march and the
+// lighting are the UE "volumetric raymarcher" scheme the clouds_unreal project ships (Ryan Brucks'
+// shaderbits raymarcher): Beer-Lambert extinction per step, a short secondary march toward the
+// dominant body for self-shadow, the multi-scatter octave stack on the light leg, sky-irradiance
+// ambient.
 //
-// The shadow estimate is the honest resolution of the PLANAR tier: a flat slab's shadow along the sun
-// is the coverage sampled once where the sun ray crosses the plane, with a slant-thickened optical
-// depth. No baked weather/cloud-shadow map yet — the per-consumer cost is a few noise taps, cheaper
-// than any texture pass at this resolution, and Phase 5's volumetric tier is what actually wants the
-// baked map. cloudColor.rgb stays reserved: the planar sheet shades inside sky.rmiss's pre-conversion
-// colour space (its albedo is a constant here), while the Phase 5 tier shades ACEScg like the fog.
+// Instance placement is a deterministic hash grid, so every consumer — the sky miss shader's walk,
+// the cheap single-crossing tiers, the NEE shadow probes, the continuation-ray attenuation — derives
+// the SAME cloud at the SAME place from the push block alone. The grid reads the EXACT cloud anchor
+// (cloud2.xy) and the Java-accumulated drift (cloud2.zw), so the wind slides the instances and no
+// terrain rebase can snap them. cloud1.x selects which baked volume every instance renders.
+//
+// Per-instance variety comes from the same hash: each instance rotates its volume by a quarter-turn
+// with an optional mirror and scales it inside a patchiness-driven band, so one texture dresses the
+// whole sky without visible repetition. Near full coverage the grid saturates into a solid overcast
+// of touching decks; below that, a coarse hash of the parent cell gathers instances into weather
+// systems with clear sky between them — the patchiness setting drives how hard.
 
-public static const float CLOUD_CELL_ALONG = 96.0;      // blocks per base cell along the wind
-public static const float CLOUD_CELL_CROSS = 16.0;      // ... across it, at the narrowest
-public static const float CLOUD_CELL_CROSS_MAX = 40.0;  // ... and at the broadest (macro-modulated)
-public static const float CLOUD_DIR_JITTER = 0.17;      // rad the local wind direction wanders (~10 deg)
-public static const float CLOUD_DIR_CELL = 900.0;       // blocks that wander varies over
+public static const float CLOUD_GRID_CELL = 176.0;  // blocks per instance-grid cell at the base span
+public static const float CLOUD_BOX_SPAN = 0.86;    // instance footprint as a fraction of its cell
+// Column optical depth, in density-blocks, every tier prices the deck at: the one number that sets
+// how opaque a cloud is. The march converts it into an extinction per block by dividing by the box
+// height, and the planar tier and the shadow probes use it directly. Derived from the nine shipped
+// volumes: their mean density times this is the column the old slab calibration delivered, measured
+// over the set.
+public static const float CLOUD_COLUMN_DEPTH = 34.8;
+// Height inside the box, as a fraction, where the single-sample consumers read the field: the
+// mass-weighted centre of the authored profiles. The planar sheet's crossing, the shadow probes and
+// the continuation-ray transmittance all use it, so neither switching tiers nor flying in and out of
+// the walk moves the cloud.
+public static const float CLOUD_SHEET_HEIGHT = 0.35;
+// Vertical thickness of the two taps the planar tier averages, as a fraction of the box height. Wide
+// enough to average out one slice's speckle, narrow enough that the two taps describe one height.
+public static const float CLOUD_SHEET_BAND = 0.08;
+// Vertical resolution of the baked volumes; MUST match RtCloudVolumes.RES, which validates the
+// resources against it at load.
+public static const float CLOUD_VOLUME_RES = 128.0;
 public static const float CLOUD_EXTINCTION = 0.22;      // 1/block at unit density (water-cloud order)
 public static const float CLOUD_G = 0.4;                // phase anisotropy, the fog tier's forward doctrine
 public static const float3 CLOUD_ALBEDO = float3(0.86, 0.87, 0.90); // BT-709-linear, sky.rmiss space
 // The phase a sample is lit by: an isotropic share plus the single-scatter lobe, mostly intact. The lobe
-// alone spans nearly two orders of magnitude between looking into the body and looking away from it (the
-// shipped g puts 94x between those two directions in this tier), which drew one and the same deck blown
-// white on the body's side of the sky and black on the other. Taking that range out entirely is worse: a
-// deck with no directional falloff reads as one flat bright sheet, and the falloff IS what makes the cloud
-// field read as shape. The share below only lifts the extreme - the directions more than ~75 degrees off
-// the body, where the lobe has nothing left - and the lobe keeps the rest of its range.
+// alone spans nearly two orders of magnitude between looking into the body and looking away from it, which
+// drew one and the same deck blown white on the body's side of the sky and black on the other. Taking that
+// range out entirely is worse: a deck with no directional falloff reads as one flat bright sheet, and the
+// falloff IS what makes the cloud field read as shape. The share below only lifts the extreme - the
+// directions more than ~75 degrees off the body, where the lobe has nothing left - and the lobe keeps the
+// rest of its range.
 public static const float CLOUD_SCATTER_FLOOR = 0.15;   // the isotropic share every sample carries
 public static const float CLOUD_SCATTER_LOBE = 0.85;    // how much of the single-scatter lobe survives
 // How much of the column above a sample occludes the SKY that lights it. Light reaches a deck's base from
@@ -271,47 +290,18 @@ public static const float CLOUD_SCATTER_LOBE = 0.85;    // how much of the singl
 // occlusion. It is also what makes the base darker than the crown, so it cannot be driven to zero either:
 // the deck's own vertical gradient is this weight's whole job.
 public static const float CLOUD_AMBIENT_OCCLUSION = 0.20;
+// The sky term is the only light a thick base receives: its sun leg saturates the multi-scatter stack, and
+// what reaches a viewer under the deck is light that entered through the sides and the gaps. Two constants
+// keep that floor from collapsing. The FLOOR is the share of the unoccluded sky a sample keeps at any depth
+// (the hemisphere around it is never fully cloud), and the GAIN undoes the irradiance-to-radiance divide
+// for a scattering medium, whose in-scatter is not a Lambertian surface's.
+public static const float CLOUD_AMBIENT_FLOOR = 0.35;
+public static const float CLOUD_AMBIENT_GAIN = 5.0;
 
-// Dave Hoskins' hash12, the 2D twin of fogHash13 (and of sky.rmiss's star hash). No lattice wrap:
-// the streak lattice has no period to wrap into — real stratus streaks run along an arbitrary wind
-// azimuth, which no per-axis wrap survives — so the field leans on the exact cloud anchor and the
-// double-precision drift accumulators to keep the sample coordinates small instead.
-float cloudHash12(float2 p) {
-    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return frac((p3.x + p3.y) * p3.z);
-}
-
-float cloudValueNoise(float2 p) {
-    float2 i = floor(p);
-    float2 f = frac(p);
-    f = f * f * (3.0 - 2.0 * f);
-    return lerp(lerp(cloudHash12(i), cloudHash12(i + float2(1.0, 0.0)), f.x),
-                lerp(cloudHash12(i + float2(0.0, 1.0)), cloudHash12(i + float2(1.0, 1.0)), f.x),
-                f.y);
-}
-
-// Unit-gain value-noise FBM. Three octaves is deliberate for the streak field: a fourth put the
-// finest cells at ~2 blocks across, which is sub-pixel at cloud altitude — it read as a dense
-// speckle instead of cloud, and the whole dome turned into one woven mat. The macro field below
-// keeps four, because there the octaves land at hundreds of blocks.
-float cloudFbm(float2 p, int octaves) {
-    float sum = 0.0;
-    float amp = 0.5;
-    float norm = 0.0;
-    for (int o = 0; o < octaves; o++) {
-        sum += amp * cloudValueNoise(p);
-        norm += amp;
-        p = p * 2.0 + float2(31.0, 17.0);
-        amp *= 0.5;
-    }
-    return sum / norm;
-}
-
-// Self-shadow of the slab with the multi-scatter octave stack (see the call site for the reasoning).
-// The weights (1, 1/2, 1/4) over extinctions (tau, tau/2, tau/4) are normalised by their sum, so the
-// result is 1 at tau = 0 and falls off far more slowly than exp(-tau): that slow tail IS the missing
-// bounces, and it is what keeps a thick deck white by day and moonlit at night.
+// Self-shadow of a sample with the multi-scatter octave stack. The weights (1, 1/2, 1/4) over
+// extinctions (tau, tau/2, tau/4) are normalised by their sum, so the result is 1 at tau = 0 and falls
+// off far more slowly than exp(-tau): that slow tail IS the missing bounces, and it is what keeps a thick
+// deck white by day and moonlit at night.
 public float cloudSelfShadow(float tau) {
     float sum = 0.0;
     float weightSum = 0.0;
@@ -324,146 +314,135 @@ public float cloudSelfShadow(float tau) {
     return sum / weightSum;
 }
 
-// ---- The coverage field, split so the slab walk can advance it incrementally ------------------------
+// ---- The instance grid ------------------------------------------------------------------------------
 //
-// The field is a pure function of the horizontal position, so along a straight view ray it is a function
-// of a single parameter. What does NOT vary along such a ray is everything derived from the MACRO octave
-// - the streak breadth it breathes into, the lattice cells, the localized-coverage gate - because one
-// macro cell is 2048x1024 blocks while a slab crossing is a couple of hundred. The field is therefore
-// built in two halves: a frame of macro-derived invariants, and the per-sample octaves on top.
-//
-// Splitting it is not only a speed matter: every consumer still calls the same two functions, so the deck
-// a player sees keeps casting the shadow they see. Freezing a frame at the midpoint of a crossing freezes
-// only quantities that vary by a few percent of their own cell across it.
-public struct CloudFieldFrame {
-    float2 dir;        // the wind frame's along-drift axis (unit)
-    float2 perp;       // ... and its cross-drift axis
-    float  cellAlong;  // blocks per base cell along the drift
-    float  cellCross;  // ... across it (breathing with the macro field)
-    float  cumulus;    // the type dial, saturated: drives the cells and the rim feathering's fade-out
-    float  broaden;    // the cumulus planform's dilation of the lattice (1 for the planar tier)
-    float  threshold;  // the remap's threshold for this ray's redistributed coverage
-    float  width;      // ... and its transition width
-    float  gateMix;    // how strongly the macro gate applies (the patchiness setting)
-    float  cLocal;     // the gate-modulated coverage: below ~0.02 the sky reads as clear
-    float2 evolve;     // the field's evolution phase, per layer a different multiple of it (see below)
-    float  stepLen;    // the slab walk's sample spacing; 0 on the plane-crossing consumers, which never walk
-};
+// One hash grid answers "which cloud, where, how posed" for every consumer. The cell grows with the
+// Cloud Size dial so an instance's footprint always fits inside its cell: a sky of large decks has
+// proportionally larger gaps between their centres. Size is the only dial the grid reads, which is
+// what keeps the layout still while thickness, density and steps change what the deck is made of.
 
-// The frame at one lattice position `p` (rebased XZ + exact anchor + drift, before the broaden scaling).
-public CloudFieldFrame cloudFieldFrameAt(WorldPush push, float2 p) {
-    CloudFieldFrame f;
-    float c = push.cloud0.x;
-    f.cumulus = saturate(push.cloud1.x);
-    // The volumetric deck is a different animal from the sheet: a cumulus is an order of magnitude
-    // broader than the sheet's own streak cells, and its planform is a field of cloud-sized patches
-    // rather than a mat of lanes. Sampling the same lattice coarser turns the lanes into those patches,
-    // and doing it HERE rather than at the slab's call site is what keeps the slab, the NEE probes and
-    // the fog sun legs reading ONE field. Zero while the tier is off, so a planar frame samples exactly
-    // the lattice it always did.
-    f.broaden = (push.flags & WORLD_FLAG_CLOUD_VOLUMETRIC) != 0u
-            ? lerp(1.0, CLOUD_BROADEN, f.cumulus) : 1.0;
-    // The local wind direction wanders a few degrees over ~900-block regions - real cloud streets are
-    // not parallel across a whole sky. It belongs to the frame because the lattice cells derived from
-    // the macro field are sampled in the same rotated frame.
-    float ang = push.cloud1.y
-            + (cloudValueNoise(p / CLOUD_DIR_CELL + float2(3.0, 7.0)) - 0.5)
-                    * (2.0 * CLOUD_DIR_JITTER);
-    f.dir = float2(cos(ang), sin(ang));
-    f.perp = float2(-f.dir.y, f.dir.x);
-    float2 s = p * f.broaden;
-    // Evolution FIRST: every layer below offsets its noise taps by this phase, the macro field at a
-    // fraction of the rate the fine octaves use, so the layers crawl against EACH OTHER - the streaks
-    // deform inside their envelope, the macro patches let clouds appear and dissolve, the interior
-    // texture churns. The rates run slow-to-fast from large scale to small, which is how real cloud
-    // fields behave. The phase is a smooth monotonic function of time - never a per-frame re-roll - so
-    // RR accumulates it the way it accumulates the wind drift. It is assigned before anything reads it:
-    // the macro field directly below is the first consumer, and an uninitialised read here would feed
-    // the gate garbage.
-    f.evolve = float2(push.cloudColor.x, push.cloudColor.x * 0.618034);
-    // The macro field first: it gates the patches AND sets how broad the streaks run here. Four octaves
-    // over 2 km cells, so one sample spans a 16x size range of cloud systems - a coverage change grows
-    // and shrinks patches at every scale at once instead of one uniform size.
-    // 0.06x: the macro layout must evolve an order of magnitude SLOWER than the wind advects it. At the
-    // wind's own rate the patch layout sweeps past faster than the clouds move, and the sky cycles
-    // clear-to-overcast every couple of minutes.
-    float macro = cloudFbm(
-            float2(dot(s, f.dir) / 2048.0, dot(s, f.perp) / 1024.0) + f.evolve * 0.06, 4);
-    float crossEff = lerp(CLOUD_CELL_CROSS, CLOUD_CELL_CROSS_MAX, macro);
-    // Stratus is a mat of lanes; cumulus is a field of heaps. Those are different planforms, not the
-    // same one at two sizes: the lanes have to close up into round-ish patches whose size is the cloud's
-    // own size - which is what the slab's thickness means. So the type dial interpolates both lattice
-    // cells toward one isotropic, thickness-proportional cumulus cell. At 0 the cells are exactly the
-    // stratus ones, so a planar frame is unaffected by any of this.
-    float cumulusCell = max(push.cloud0.z * CLOUD_LOBE_RATIO, CLOUD_LOBE_MIN);
-    f.cellAlong = lerp(CLOUD_CELL_ALONG, cumulusCell, f.cumulus);
-    f.cellCross = lerp(crossEff, cumulusCell, f.cumulus);
-    // Localised coverage: the macro field REDISTRIBUTES the coverage into clustered systems with clear
-    // sky between them, as a zero-mean modulation of the LOCAL coverage around CLOUD_GATE_MEAN - patches
-    // end up denser, gaps emptier, and the sky's total roughly holds. The old multiplicative gate could
-    // not do that: it scaled the result by a mean of ~0.44, so the slider's promise was capped there and
-    // a dip in the macro field cleared the sky to a few threads.
-    f.gateMix = clamp(push.cloud1.z, 0.0, 1.0);
-    // The swing is ONE sig of the gate either way: twice this gain sent whole kilometre-scale regions
-    // to zero coverage, and the sky went bimodal - fully decked, then empty, as the camera's
-    // neighbourhood moved between macro patches.
-    f.cLocal = saturate(c * (1.0 + f.gateMix * (smoothstep(0.28, 0.78, macro)
-            - CLOUD_GATE_MEAN)));
-    // The remap: the threshold falls as c^0.7 so the response stays near-linear over the slider, and the
-    // transition width grows with it (both calibrated, see CLOUD_REMAP_* above).
-    f.threshold = 1.0 - CLOUD_REMAP_K * pow(f.cLocal, CLOUD_REMAP_GAMMA);
-    f.width = max(CLOUD_REMAP_W0 + CLOUD_REMAP_W1 * f.cLocal, 1.0e-3);
-    // The plane-crossing consumers never walk, so their frames carry no step length and the slab
-    // density's finest octave runs at full rate for them; the walk overwrites the lane with its own
-    // sample spacing, which is what the density's LOD reads (see cloudSlabDensity).
-    f.stepLen = 0.0;
-    return f;
+// Horizontal footprint (full width) of one instance box, in blocks: the Cloud Size dial. It is
+// pushed in cloudColor.x and is the ONLY thing that sizes an instance, so changing the slab's
+// thickness moves no cloud.
+float cloudSpan(WorldPush push) {
+    return clamp(push.cloudColor.x, 32.0, 2048.0);
 }
 
-// Coverage 0..1 at a lattice position, from a frame. This is the whole per-sample field: a domain warp
-// that bends the streaks over hundreds of blocks, the streak FBM, a mid-scale octave that breaks the
-// interior texture, and a cross-wind octave that feathers the rims.
-public float cloudCoverageAt(CloudFieldFrame f, float2 p) {
-    float2 s = p * f.broaden;
-    float2 q = float2(dot(s, f.dir) / f.cellAlong, dot(s, f.perp) / f.cellCross);
-    q += (float2(cloudValueNoise(q * 0.35 + 17.0 + f.evolve),
-                 cloudValueNoise(q * 0.35 + 91.0 + f.evolve)) - 0.5) * 1.1;
-    // TWO octaves, not three. The third's cells run a quarter of the base cell across - about 47 blocks at
-    // the shipped 120-block slab, i.e. below the size of a cloud element and below what a sight line that
-    // grazes the layer can carry: a pixel looking 3 degrees up covers a ~108-block footprint of the plane
-    // and the walk steps ~96 blocks there, so that octave arrives as lace and moire rather than as shape,
-    // and it is what turned the deck's lower half into a lid over the horizon. At two octaves the finest
-    // cell is half the base cell, inside the slab's own element scale, and the high-frequency content the
-    // field still needs comes from the two deliberately anisotropic taps below.
-    // The cross-wind feathering octave is a stratus device - it feathers the long rims of lanes. A
-    // cumulus heap has no long rims to feather, so it fades out with the type dial.
-    float n = cloudFbm(q, 2) - 0.07 * cloudValueNoise(q * 0.25 + 7.0 + f.evolve * 1.7)
-            - 0.12 * (1.0 - f.cumulus) * cloudValueNoise(q * float2(1.0, 6.0) + 31.0 + f.evolve * 2.3);
-    return saturate((n - f.threshold) / f.width);
+// Vertical extent of one instance box, in blocks: the Cloud Thickness dial, directly. The box STANDS
+// ON the cloud base, so the volume's flat bottom is the layer's own base and the crown grows upward
+// into clear air; a box centered on the slab would hang half a body below the base, where the terrain
+// and the planar tier both say the cloud has already ended. Thickness moves nothing else: the
+// footprint is Cloud Size, and the column the tiers price is CLOUD_COLUMN_DEPTH.
+float cloudBoxHeight(WorldPush push) {
+    return clamp(push.cloud0.z, 8.0, 1024.0);
 }
 
-// The field at one world position's projection, for the consumers that cross the slab in a single step:
-// the planar sheet, the shadow field, the NEE probes and the fog sun legs. Takes the push block
-// explicitly because the sky miss shader holds its WorldPush in a local (module globals belong to the
-// raygen entry points), while the rgen-side consumers read the global through the wrapper below.
-float cloudCoverageField(WorldPush push, float2 rebasedXZ) {
-    if (push.cloud0.x <= 0.0) {
+float cloudBoxBottom(WorldPush push) {
+    return push.cloud0.y;
+}
+
+// The height the single-sample consumers read the field at: CLOUD_SHEET_HEIGHT up the box, which is
+// where the authored profiles carry their mass. The planar sheet's crossing, the shadow probes and the
+// continuation-ray transmittance all use it, so neither switching tiers nor flying in and out of the
+// walk moves the cloud.
+public float cloudBoxMid(WorldPush push) {
+    return cloudBoxBottom(push) + CLOUD_SHEET_HEIGHT * cloudBoxHeight(push);
+}
+
+// The walk's extinction per block: the column every tier prices, spread over the deck's actual depth.
+// This is what keeps Cloud Thickness a shape dial — a deeper deck carries the same water, so it is
+// thinner per unit length and no darker — and it is the only place the box height reaches opacity.
+float cloudDensityScale(WorldPush push) {
+    return clamp(CLOUD_COLUMN_DEPTH / cloudBoxHeight(push), 0.0, 4.0);
+}
+
+float cloudGridCell(WorldPush push) {
+    return max(CLOUD_GRID_CELL, cloudSpan(push) / CLOUD_BOX_SPAN);
+}
+
+float cloudGridHash(float2 cell, float salt) {
+    return fogHash13(float3(cell.x, cell.y, salt));
+}
+
+// Density 0..1 of the layer at one drifted-grid position and one normalized box height (0 at the
+// cloud base, 1 at the crown). Returns 0 wherever no instance holds the point. `driftedXZ` has already been moved through cloud2 (anchor +
+// drift); the instance centers live in the same drifted frame, which is what makes the wind slide
+// them. The two adjacent atlas layers are lerped by hand — 2D-array filtering is nearest along the
+// layer axis — and the box window keeps a clipped neighbour from drawing a visible box wall on top
+// of the volumes' own soft borders.
+float cloudInstanceDensity(WorldPush push, float2 driftedXZ, float vertical01) {
+    if (push.cloud0.x <= 0.0 || vertical01 < 0.0 || vertical01 > 1.0) {
         return 0.0;
     }
-    float2 p = rebasedXZ + push.cloud2.xy + push.cloud2.zw;
-    return cloudCoverageAt(cloudFieldFrameAt(push, p), p);
+    float cell = cloudGridCell(push);
+    float2 cellId = floor(driftedXZ / cell);
+    float roll = cloudGridHash(cellId, 17.0);
+    // Weather systems: a bilinear-smoothed hash over 4x4-cell parent blocks modulates the occupancy
+    // threshold zero-mean, so whole neighbourhoods fill or clear together and the patchiness slider
+    // gathers instances into clusters instead of sprinkling them. The interpolation matters: a binary
+    // per-block hash drew straight grid-aligned fronts across the sky. Near-full coverage pins the
+    // gate open — a solid overcast is a deck of touching clouds, and the slider's 1.0 must deliver it.
+    float2 parent = cellId / 4.0;
+    float2 pf = floor(parent);
+    float2 pu = frac(parent);
+    float cluster = lerp(
+            lerp(cloudGridHash(pf, 83.0), cloudGridHash(pf + float2(1.0, 0.0), 83.0), pu.x),
+            lerp(cloudGridHash(pf + float2(0.0, 1.0), 83.0), cloudGridHash(pf + float2(1.0, 1.0), 83.0), pu.x),
+            pu.y);
+    float gate = push.cloud0.x >= 0.95
+            ? 2.0
+            : saturate(push.cloud0.x * (1.0 + push.cloud1.z * (cluster * 2.0 - 1.0)));
+    if (roll >= gate) {
+        return 0.0;
+    }
+    float span = cloudSpan(push);
+    float2 jitter = float2(cloudGridHash(cellId, 29.0), cloudGridHash(cellId, 43.0)) - 0.5;
+    float pose = cloudGridHash(cellId, 61.0);
+    float2 center = (cellId + 0.5 + jitter * (1.0 - span / cell)) * cell;
+    // Quarter-turns plus a mirror: eight poses out of one texture, so the grid never reads as a stamp.
+    float2 q = driftedXZ - center;
+    float turn = floor(pose * 3.999);
+    float2 r = turn < 0.5 ? q
+            : turn < 1.5 ? float2(-q.y, q.x)
+            : turn < 2.5 ? -q
+            : float2(q.y, -q.x);
+    if (frac(pose * 7.31) < 0.5) {
+        r.x = -r.x;
+    }
+    // Patchiness also breathes the footprint, so a sparse sky carries visibly smaller decks.
+    float scale = 1.0 + (frac(pose * 3.77) - 0.5) * push.cloud1.z * 0.5;
+    float2 local = r / (span * scale) + 0.5;
+    // Rounded-square window (a superellipse over the centered coordinates). A plain box window drew
+    // straight vertical walls wherever the baked cloud ran to its own border, and every instance read
+    // as a square card; the wide ramp blends the crop into the volumes' own border fade.
+    float2 cc = abs(local - 0.5) * 2.0;
+    float radius = pow(cc.x * cc.x * cc.x + cc.y * cc.y * cc.y, 1.0 / 3.0);
+    float window = 1.0 - smoothstep(0.96, 1.12, radius);
+    if (window <= 0.0) {
+        return 0.0;
+    }
+    // Shape variety: most instances render the pushed shape; a hash minority renders its neighbour in
+    // the slider order, so one sky carries two shapes without the type dial losing its meaning. The
+    // clamp rides cloudColor.y, the atlas's last shape index Java pushes alongside.
+    float shapeRoll = cloudGridHash(cellId, 97.0);
+    float shape = clamp(floor(push.cloud1.x)
+            + (shapeRoll < 0.18 ? -1.0 : shapeRoll > 0.82 ? 1.0 : 0.0),
+            0.0, max(push.cloudColor.y, 0.0));
+    // Atlas layer = shape * RES + height slice; the clamp keeps the hand-made trilinear's second
+    // tap inside the shape's own layer band.
+    float layerF = min(vertical01 * (CLOUD_VOLUME_RES - 1.0), CLOUD_VOLUME_RES - 1.001);
+    float l0 = floor(layerF);
+    float layer = shape * CLOUD_VOLUME_RES + l0;
+    float a = cloudVolumes.SampleLevel(float3(local.x, local.y, layer), 0.0).r;
+    float b = cloudVolumes.SampleLevel(float3(local.x, local.y, layer + 1.0), 0.0).r;
+    return lerp(a, b, layerF - l0) * window;
 }
 
-/** Global-reading wrapper for the raygen-side consumers (NEE probes, fog sun legs, debug views). */
-public float cloudCoverageWorld(float2 rebasedXZ) {
-    return cloudCoverageField(worldPush, rebasedXZ);
-}
-
-// Transmittance of the cloud layer along a sun leg from `pos` (rebased): the coverage sampled where
-// the leg crosses the pushed plane, with the optical depth thickened by the leg's slant. This is the
-// one estimate the ground-level NEE, the fog sun legs and the sheet's own self-shadow all share, so
-// a clouded sun dims identically in all of them. Returns 1 while clouds are off — the callers'
-// multiply keeps them bit-identical.
+// Transmittance of the cloud layer along a sun leg from `pos` (rebased): the density sampled where
+// the leg crosses the layer's mid-height plane, with the optical depth thickened by the leg's slant.
+// This is the one estimate the ground-level NEE, the fog sun legs and the sheet's own self-shadow all
+// share, so a clouded sun dims identically in all of them. Returns 1 while clouds are off — the
+// callers' multiply keeps them bit-identical.
 public float cloudShadowTransmittance(float3 pos, float3 sunDir) {
     if ((worldPush.flags & WORLD_FLAG_CLOUD) == 0u || worldPush.cloud0.x <= 0.0) {
         return 1.0;
@@ -471,16 +450,26 @@ public float cloudShadowTransmittance(float3 pos, float3 sunDir) {
     if (sunDir.y < 0.05) {
         return 1.0; // the body sits at or below the horizon; there is no light left to shadow
     }
-    float tPlane = (worldPush.cloud0.y - pos.y) / sunDir.y;
-    if (tPlane <= 0.0) {
+    float t = (cloudBoxMid(worldPush) - pos.y) / sunDir.y;
+    if (t <= 0.0) {
         return 1.0; // the sample is at or above the layer along the sun leg
     }
-    float cov = cloudCoverageWorld(pos.xz + sunDir.xz * tPlane);
-    if (cov <= 0.0) {
+    float2 drifted = pos.xz + sunDir.xz * t + worldPush.cloud2.xy + worldPush.cloud2.zw;
+    float density = cloudInstanceDensity(worldPush, drifted, 0.5);
+    if (density <= 0.0) {
         return 1.0;
     }
-    float tau = cov * worldPush.cloud0.w * CLOUD_EXTINCTION * worldPush.cloud0.z / sunDir.y;
+    float tau = density * worldPush.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / sunDir.y;
     return exp(-tau);
+}
+
+/** Field sample at one world position's projection, for the debug views. */
+public float cloudCoverageWorld(float2 rebasedXZ) {
+    if ((worldPush.flags & WORLD_FLAG_CLOUD) == 0u || worldPush.cloud0.x <= 0.0) {
+        return 0.0;
+    }
+    return cloudInstanceDensity(worldPush, rebasedXZ + worldPush.cloud2.xy + worldPush.cloud2.zw,
+            CLOUD_SHEET_HEIGHT);
 }
 
 // The colour the pushed illuminance is tinted with, and how far it may be pulled off white. The derived
@@ -503,26 +492,27 @@ public float3 cloudLightTint(float3 derivedIlluminance) {
 }
 
 // The planar sheet as sky.rmiss renders it: single scatter of the dominant celestial where the view
-// ray crosses the pushed cloud plane, plus the sky-dome ambient, with the sheet's transmittance out
-// for the caller to attenuate the sky behind it (atmosphere, stars, discs) with. The slab has no
-// vertical structure yet — the tau here is the same slant-thickened estimate the shadow field uses,
-// which is exactly what makes the sheet and its shadows agree. Camera inside the slab renders
-// nothing (the planar tier has no sides to show); far crossings fade into the haze they sit behind.
+// ray crosses the layer's mid-height plane, plus the sky-dome ambient, with the sheet's transmittance
+// out for the caller to attenuate the sky behind it (atmosphere, stars, discs) with. The density is
+// one instance fetch at the crossing — the same field the shadow probes read, which is exactly what
+// makes the sheet and its shadows agree. A camera inside the body sees the mid-height cut; far
+// crossings fade into the haze they sit behind.
 public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
                                       out float cloudT) {
     cloudT = 1.0;
     if ((push.flags & WORLD_FLAG_CLOUD) == 0u || push.cloud0.x <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
-    bool below = ro.y < push.cloud0.y;
-    bool above = ro.y > push.cloud0.y;
+    float mid = cloudBoxMid(push);
+    bool below = ro.y < mid;
+    bool above = ro.y > mid;
     if (below == above) {
         return float3(0.0, 0.0, 0.0);
     }
     if (below ? rd.y < 1.0e-3 : rd.y > -1.0e-3) {
         return float3(0.0, 0.0, 0.0); // the ray runs away from the plane
     }
-    float t = (push.cloud0.y - ro.y) / rd.y;
+    float t = (mid - ro.y) / rd.y;
     // Dissipation distance (cloud1.w): the sheet fades over the last 40% of the pushed range and
     // is not rendered at all past it — clouds beyond the fade cost nothing. Deliberately a sheet-
     // only fade: the shadow field stays unfaded, because the layer still exists overhead and a
@@ -532,12 +522,19 @@ public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyS
     if (fade <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
-    float cov = cloudCoverageField(push, ro.xz + rd.xz * t);
-    if (cov <= 0.0) {
+    // Two vertical taps straddling the sheet height average the column the crossing implies, so the
+    // flat tier's silhouette carries some of the volume the walk would resolve instead of one
+    // slice's speckle.
+    float boxH = cloudBoxHeight(push);
+    float slabBand = CLOUD_SHEET_BAND;
+    float2 drift = ro.xz + rd.xz * t + push.cloud2.xy + push.cloud2.zw;
+    float density = 0.5 * (cloudInstanceDensity(push, drift, CLOUD_SHEET_HEIGHT - slabBand)
+            + cloudInstanceDensity(push, drift, CLOUD_SHEET_HEIGHT + slabBand));
+    if (density <= 0.0) {
         return float3(0.0, 0.0, 0.0); // cloudT stays 1: clear sky, nothing to attenuate with
     }
     // Perspective thickening: a grazing sight line crosses proportionally more slab.
-    float tau = cov * push.cloud0.w * CLOUD_EXTINCTION * push.cloud0.z / max(abs(rd.y), 0.04);
+    float tau = density * push.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / max(abs(rd.y), 0.04);
     // The fade dissolves the slab's OPACITY, not just its glow: radiance and occlusion scale by
     // the same factor (cloudT = 1 - opacity). Fading the radiance alone painted the dissipation
     // band black — a grazing sight line saturates the transmittance to 0 long before the fade
@@ -558,12 +555,13 @@ public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyS
     float lightLevel = dot(lightDir, state.sunDir) >= dot(lightDir, state.moonDir)
             ? state.sunIlluminance : state.moonIlluminance;
     float3 lightIll = lightLevel * cloudLightTint(light.illuminance);
-    float tauSelf = cov * push.cloud0.w * CLOUD_EXTINCTION * push.cloud0.z / max(lightDir.y, 0.05);
+    float tauSelf = density * push.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH
+            / max(lightDir.y, 0.05);
     // Multiple-scatter approximation for the slab's self-shadow. A pure single-scatter sheet darkens a
     // thick deck to ambient-only, which reads as blue-grey daytime clouds and as black cut-outs at night;
     // real cloud tops are bright because photons bounce inside them. Three octaves of halved extinction,
     // energy-normalised so an unshadowed sample still reaches exactly 1 — thin edges keep the exact
-    // single-scatter value, thick cores keep a lit presence. Phase 5's multi-scatter LUT replaces it.
+    // single-scatter value, thick cores keep a lit presence.
     float selfT = cloudSelfShadow(tauSelf);
     float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE * hg(dot(rd, lightDir), CLOUD_G) * 0.7;
     // The sheet's ambient is the sky's HEMISPHERE irradiance — the same bake the fog and the water read,
@@ -574,136 +572,66 @@ public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyS
     // shipped a lane-order slip fed a growing drift accumulator into it and the sky glowed. A bounded read
     // makes that class of accident merely wrong instead of blinding.
     float3 ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
-            * clamp(push.cloudColor.w, 0.0, 2.0);
+            * clamp(push.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;
     return CLOUD_ALBEDO * opacity * (phase * lightIll * selfT + ambient);
 }
 
-// ---- Volumetric cloud slab (Phase 5) ----------------------------------------------------------------
+// ---- Volumetric cloud march (the raymarcher tier) ----------------------------------------------------
 //
-// The slab spans [cloudBase, cloudBase + thickness] — the SAME geometric reading cloud0.z already has in
-// the planar tier, where tau = cov * density * EXTINCTION * thickness / dir.y is exactly the optical
-// depth of a slab that thick crossed at the ray's slant. So this tier is not a second parameterisation
-// of the clouds: it is the same layer, walked instead of estimated, and both tiers answer the same
-// question at the same scale (which is why the step count can be turned down and the two must not
-// disagree about how much light gets through).
+// The walk spans the instance box — standing on cloudBase, Cloud Thickness deep — while the planar
+// tier prices the same body in one crossing: both price CLOUD_COLUMN_DEPTH, and cloudDensityScale
+// spreads that column over the box's height. So this tier is not a second
+// parameterisation of the clouds: it is the same layer, walked instead of estimated, and both tiers
+// answer the same question at the same scale (which is why the step count can be turned down and the
+// two must not disagree about how much light gets through).
 //
-// Density is the SAME field the ground NEE probes and the fog sun legs sample (cloudCoverageField): one
-// field, three consumers, so the deck a player sees casts the shadow they see. What the walk adds is the
-// vertical profile and the per-sample light gradient — the two things a single plane crossing cannot
-// express, and the reason the extra cost buys anything at all. The slab's actual SHAPE, though, has to
-// come from a 3D field sampled in the same wind frame: see cloudSlabDensity for why a density built out
-// of a 2D field times a height profile is a layer cake no matter how finely it is walked.
+// What the walk adds over a single crossing is the baked volume's real 3D shape and a light march
+// through it — the two things a plane crossing cannot express, and the reason the extra cost buys
+// anything at all. The march is the clouds_unreal raymarcher's: jittered primary steps accumulating
+// Beer-Lambert extinction, and per in-cloud sample a short secondary march toward the dominant body
+// whose accumulated tau feeds the same multi-scatter octave stack the sheet uses, so both tiers grade
+// identically under the same light.
 
-public static const float CLOUD_STEP_MIN = 8.0;        // steps below this alias visibly at the slab's rims
-// Samples the walk spends per slab thickness when the crossing is close to vertical. The vertical
-// profile and the lobe field are resolved at that rate; the pushed step lane is a CEILING the crossing
-// grows into as the perspective thickens it (1/|rd.y|), not a rate every ray must pay.
+public static const float CLOUD_STEP_MIN = 8.0;        // steps below this alias visibly at the rims
+// Samples the walk spends per slab thickness when the crossing is close to vertical. The baked shape
+// is resolved at that rate; the pushed step lane is a CEILING the crossing grows into as the
+// perspective thickens it (1/|rd.y|), not a rate every ray must pay.
 public static const float CLOUD_STEPS_PER_THICKNESS = 12.0;
-// How far along a ray the per-ray field frame may be sampled. UNBOUNDED this fans the sky into wedges
-// centred on the camera: a horizon ray crosses the slab kilometres away while an overhead ray crosses it
-// a few hundred blocks up, so each direction reads the wind-direction jitter and the macro gate from a
-// different patch, and the streak orientation snaps at the jitter cells' boundaries. Clamping keeps every
-// ray sampling one neighbourhood, which turns the angular snapping into a smooth gradient.
-public static const float CLOUD_FRAME_DIST = 1536.0;   // blocks; about 0.75 of a macro cell
-// The macro gate's measured mean over the sky (tools/fit_base_remap.py). The gate modulates the LOCAL
-// coverage around this centre rather than scaling the result, which keeps the redistribution zero-mean:
-// patches get denser, gaps emptier, and the slider's total survives.
-public static const float CLOUD_GATE_MEAN = 0.44;
-// The coverage remap, calibrated against the live field by the same tool: at patchiness 0 the covered
-// fraction of the sky tracks the coverage slider across its whole range (mean |error| 0.14). The old
-// 1.15 / 0.10+0.20 pair was tuned for the pre-cumulus field, whose different n distribution left the
-// slider delivering a fifth of what it promised.
-public static const float CLOUD_REMAP_K = 1.15;
-public static const float CLOUD_REMAP_GAMMA = 0.7;
-public static const float CLOUD_REMAP_W0 = 0.08;
-public static const float CLOUD_REMAP_W1 = 0.32;
-// The lobe cell scales WITH the slab: a cloud's own size is what the slab's thickness means, so a
-// 48-block deck is a field of altocumulus elements and a 200-block one is a field of cumulus towers,
-// from the same field and the same constants. A fixed cell cannot do this — sized for one thickness it
-// is either too coarse to vary vertically in a thin deck (back to a layer cake) or too fine to hold a
-// tower in a thick one.
-public static const float CLOUD_LOBE_RATIO = 1.1;      // lobe cell as a fraction of the slab's thickness
-public static const float CLOUD_LOBE_MIN = 24.0;       // blocks; keeps a paper-thin slab from aliasing
-public static const float CLOUD_SHAPE_CONTRAST = 1.8;  // how hard the 3D lobe field drives the boundary
-// Rim erosion rides the finest octave in the density - cells of cell/2.6, ~51 blocks at the shipped
-// 120-block slab - so its amplitude is also how much of the far field is drawn by the smallest scale
-// present. At 0.35 that octave dominated the grazing band (the same lace the 2D field's dropped third
-// octave used to contribute) and made the step-count LOD switch that gates it a visible step across the
-// sky. Halved: the rims stay ragged up close, the far field is carried by the lobe field, and the switch
-// moves half as much mass. Mean-preserving either way, so the column's optical depth is untouched.
-public static const float CLOUD_EDGE_EROSION = 0.15;
-public static const float CLOUD_BROADEN = 0.5;         // cumulus planform: sample the 2D field coarser
-public static const float CLOUD_CUMULUS_NORM = 1.3245; // normalises the cumulus shoulder to mean 1
+// Secondary (light) march: steps and their minimum world-space length. Three taps is what the baked
+// volumes need — their density is smooth on the scale of a slice, so a longer march buys aliasing
+// samples, not accuracy — and the multi-scatter stack on top of it carries the depth the raw
+// single-scatter tau would miss.
+public static const int CLOUD_LIGHT_STEPS = 3;
+public static const float CLOUD_LIGHT_STEP_MIN = 24.0; // blocks per light leg
 
-// 3D value-noise FBM over the fog's lattice. This is the field the volumetric tier's SHAPE comes from,
-// and the reason is separability: the previous density was cov(xz) * profile(h) * detail(pos/96), where
-// the 2D factor does not vary with height and the vertical factor does not vary horizontally. A product
-// of a 2D and a 1D function is a stack of identical horizontal sheets whose brightness steps with
-// height — which is exactly what it looked like: layer cake from the side, the same streaks extruded
-// through the slab as maze walls. A density whose boundary is a 3D surface cannot do that.
-public float cloudFbm3(float3 p, int octaves) {
-    float sum = 0.0;
-    float amp = 0.5;
-    float norm = 0.0;
-    for (int o = 0; o < octaves; o++) {
-        sum += amp * fogValueNoise(p);
-        norm += amp;
-        p = p * 2.0 + float3(19.0, 7.0, 31.0);
-        amp *= 0.5;
+// Light-march optical depth from one point toward the body: the instance field re-evaluated along
+// the leg, bounded, early-outing once the tau is deep enough that the octave stack is saturated
+// anyway. The leg leaves the sample's own instance quickly at off-vertical sun angles, and the
+// neighbour it enters carries the rest — the grid lookup is the same one the primary step used.
+float cloudLightTau(WorldPush push, float3 p, float3 lightDir, float boxH) {
+    float stepLen = max(boxH, CLOUD_LIGHT_STEP_MIN) / float(CLOUD_LIGHT_STEPS);
+    float tau = 0.0;
+    float3 lp = p;
+    for (int s = 0; s < CLOUD_LIGHT_STEPS; s++) {
+        lp += lightDir * stepLen;
+        float v = (lp.y - cloudBoxBottom(push)) / boxH;
+        if (v < 0.0 || v > 1.0) {
+            break; // the leg left the slab; whatever is above it no longer occludes this sample
+        }
+        tau += cloudInstanceDensity(push,
+                lp.xz + push.cloud2.xy + push.cloud2.zw, v) * CLOUD_EXTINCTION * stepLen
+                * cloudDensityScale(push);
+        if (tau > 4.0) {
+            break; // the stack's output is flat past this; the taps would be pure waste
+        }
     }
-    return sum / norm;
+    return tau;
 }
 
-// Vertical profile of the slab, normalised to a mean of 1 for BOTH shapes so the type dial changes the
-// silhouette the light falls on and never how much cloud is overhead. Stratus is an even board with
-// softened rims; cumulus is the classic heap — a flat base, a shoulder, and a crown that rounds off.
-public float cloudHeightProfile(float h, float typeMix) {
-    float flat = 1.0 - 0.6 * pow(abs(2.0 * h - 1.0), 12.0);
-    float heap = smoothstep(0.0, 0.09, h) * (1.0 - smoothstep(0.60, 1.0, h)) * CLOUD_CUMULUS_NORM;
-    return lerp(flat, heap, saturate(typeMix));
-}
-
-// Density of the slab at one point, 0 outside it. The 2D coverage decides WHERE cloud may exist (and so
-// also what it shadows — one field, three consumers, still), and a 3D lobe field decides what SHAPE the
-// cloud takes inside that envelope: its boundary is a genuine 3D surface, so the mass breaks into
-// billows and towers instead of extruded streaks. The lobe contrast and the fine-octave erosion are both
-// mean-preserving on purpose — the column's optical depth stays the coverage field's, so the deck a
-// player sees keeps casting the shadow they see and the planar tier's tau remains a fair reference.
-public float cloudSlabDensity(WorldPush push, CloudFieldFrame f, float3 pos) {
-    float thickness = max(push.cloud0.z, 1.0);
-    float h = (pos.y - push.cloud0.y) / thickness;
-    if (h < 0.0 || h > 1.0) {
-        return 0.0;
-    }
-    float cov = cloudCoverageAt(f, pos.xz + push.cloud2.xy + push.cloud2.zw);
-    if (cov <= 0.0) {
-        return 0.0;
-    }
-    // The 3D coordinate lives in the wind frame: stretched along the drift, near-isotropic across it and
-    // vertically. Sampled through the drift like every other cloud field, so the lobes never slide
-    // against the streaks they are carved out of.
-    float2 w = pos.xz + push.cloud2.zw;
-    float cell = max(thickness * CLOUD_LOBE_RATIO, CLOUD_LOBE_MIN);
-    float3 q = float3(dot(w, f.dir), pos.y, dot(w, f.perp)) / cell;
-    q.xz += f.evolve * 0.25;                         // the billows churn inside the envelope
-    float lobe = cloudFbm3(q, 2);                    // large billows, mean 0.5
-    // The rim octave's cells run cell/2.6 across, so once the walk's step is past half that the octave
-    // is sub-step and only aliasing. Holding its mean 0.5 leaves the erosion factor at exactly 1, so
-    // the LOD costs taps and never mass: the column's optical depth is unchanged.
-    float detail = 0.5;
-    if (f.stepLen <= cell * (1.0 / (2.0 * 2.6))) {
-        detail = cloudFbm3(q * 2.6 + float3(47.0, 11.0, 29.0)
-                + float3(f.evolve, 0.0) * 0.55, 1);      // rims, mean 0.5, scaled with q
-    }
-    float contrast = 1.0 + CLOUD_SHAPE_CONTRAST * (lobe * 2.0 - 1.0);
-    contrast *= 1.0 - CLOUD_EDGE_EROSION + 2.0 * CLOUD_EDGE_EROSION * detail;
-    return saturate(cov * contrast) * cloudHeightProfile(h, f.cumulus) * push.cloud0.w;
-}
-
-// Volumetric cloud slab as sky.rmiss renders it: a jittered walk across the slab accumulating in-scatter
-// and transmittance. `pix` seeds the pixel-fixed blue-noise offset that advances one golden-ratio stride
-// per frame — the plan's hard constraint: a per-frame re-roll is a signal the denoiser cannot accumulate,
-// while a rotating pixel-fixed pattern is one it averages. Both the fade and the multi-scatter doctrine
+// Volumetric cloud slab as sky.rmiss renders it: a jittered walk across the slab accumulating
+// in-scatter and transmittance. `pix` seeds the pixel-fixed blue-noise offset that advances one
+// golden-ratio stride per frame — a per-frame re-roll is a signal the denoiser cannot accumulate,
+// while a rotating pixel-fixed pattern is one it averages. The fade and the multi-scatter doctrine
 // are the planar tier's, so the tiers degrade into each other instead of jumping.
 public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
                                        float2 pix, out float cloudT) {
@@ -713,90 +641,74 @@ public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, Sky
         // cross. Either way cloudT stays 1 and the caller's compose is a no-op.
         return float3(0.0, 0.0, 0.0);
     }
-    float base = push.cloud0.y;
-    float thickness = max(push.cloud0.z, 1.0);
-    float top = base + thickness;
-    float ta = (base - ro.y) / rd.y;
-    float tb = (top - ro.y) / rd.y;
+    float boxBottom = cloudBoxBottom(push);
+    float boxH = cloudBoxHeight(push);
+    float boxTop = boxBottom + boxH;
+    float ta = (boxBottom - ro.y) / rd.y;
+    float tb = (boxTop - ro.y) / rd.y;
     float t0 = max(min(ta, tb), 0.0);
     float t1 = max(ta, tb);
     if (t1 <= t0) {
-        return float3(0.0, 0.0, 0.0); // the camera is above the slab looking away, or below looking down
+        return float3(0.0, 0.0, 0.0); // the camera is above the layer looking away, or below looking down
     }
-    // Dissipation distance (cloud1.w): same sheet-only fade the planar tier applies, and applied to the
-    // slab's OPACITY rather than to its glow alone — the v17 lesson, which the emitted fade repeats.
+    // Dissipation distance (cloud1.w): same sheet-only fade the planar tier applies, and applied to
+    // the slab's OPACITY rather than to its glow alone — fading the radiance alone painted the
+    // dissipation band black.
     float fadeDist = max(push.cloud1.w, 64.0);
     float fade = 1.0 - smoothstep(fadeDist * 0.6, fadeDist, t0);
     if (fade <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
 
-    // The same body selection and the same tinted-level rule as the sheet, so the tier toggle cannot change
-    // the light the deck is drawn under.
+    // The same body selection and the same tinted-level rule as the sheet, so the tier toggle cannot
+    // change the light the deck is drawn under.
     CelestialLight light = dominantCelestialLight(state, transmittanceLut);
     float3 lightDir = light.dir;
     float lightLevel = dot(lightDir, state.sunDir) >= dot(lightDir, state.moonDir)
             ? state.sunIlluminance : state.moonIlluminance;
     float3 lightIll = lightLevel * cloudLightTint(light.illuminance);
     float cosTheta = dot(rd, lightDir);
-    // Beer-Powder along the plan's formula: 2/(1 + exp(-2 cos)) is 1 side-on and swells toward 2 when
-    // the view runs with the light, which is what makes a back-lit rim read as a lit rim.
+    // Beer-Powder along the raymarcher's formula: 2/(1 + exp(-2 cos)) is 1 side-on and swells toward 2
+    // when the view runs with the light, which is what makes a back-lit rim read as a lit rim.
     float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE
             * hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));
     float3 ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
-            * clamp(push.cloudColor.w, 0.0, 2.0);
+            * clamp(push.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;
 
     float steps = clamp(push.volumeParams.w, CLOUD_STEP_MIN, 96.0);
-    // The budget scales with the crossing: an overhead sight line crosses the slab's own thickness,
-    // and CLOUD_STEPS_PER_THICKNESS samples resolve what the walk exists for (the vertical profile and
-    // the light gradient). Spending the full pushed lane there would only sample noise cells the step
-    // was already wider than, so the lane is a ceiling the crossing grows into as the perspective
-    // thickens it — grazing rays pay it, vertical ones pay the floor.
-    steps = clamp(ceil((t1 - t0) / max(thickness / CLOUD_STEPS_PER_THICKNESS, 1.0)),
+    // The budget scales with the crossing: an overhead sight line crosses the box's own height,
+    // and CLOUD_STEPS_PER_THICKNESS samples resolve what the walk exists for (the baked shape).
+    // Spending the full pushed lane there would only sample cells the step was already wider than,
+    // so the lane is a ceiling the crossing grows into as the perspective thickens it — grazing rays
+    // pay it, vertical ones pay the floor.
+    steps = clamp(ceil((t1 - t0) / max(boxH / CLOUD_STEPS_PER_THICKNESS, 1.0)),
             CLOUD_STEP_MIN, steps);
     float dt = (t1 - t0) / steps;
     float jitter = frac(interleaveGradientNoise(pix)
             + float(push.frameIndex) * 0.6180339887);
-    // One field frame for the whole crossing, built at its midpoint. Everything the frame carries is
-    // derived from the macro octave, whose cells (2 km x 1 km) dwarf a slab crossing, so the sample loop
-    // advances the field's per-sample octaves - the expensive part - with no per-step re-derivation of the
-    // wind frame, the lattice cells or the localized-coverage gate.
-    CloudFieldFrame frame = cloudFieldFrameAt(push,
-            ro.xz + rd.xz * min(0.5 * (t0 + t1), CLOUD_FRAME_DIST)
-            + push.cloud2.xy + push.cloud2.zw);
-    // The walk's sample spacing rides the frame so the density can LOD its finest octave against it.
-    frame.stepLen = dt;
-    // A coverage this close to zero leaves at most a hair of cloud anywhere in the crossing (the
-    // threshold it implies is past the field's reach), so the walk is skipped rather than paying the
-    // per-sample field to discover that 24 times.
-    if (frame.cLocal <= 0.02) {
-        return float3(0.0, 0.0, 0.0);
-    }
     float3 L = float3(0.0, 0.0, 0.0);
     float T = 1.0;
     for (int i = 0; i < int(steps); i++) {
         float3 p = ro + rd * (t0 + (float(i) + jitter) * dt);
-        float density = cloudSlabDensity(push, frame, p);
-        float tauCell = density * CLOUD_EXTINCTION * dt;
+        float v = (p.y - boxBottom) / boxH;
+        float density = cloudInstanceDensity(push,
+                p.xz + push.cloud2.xy + push.cloud2.zw, v);
+        // cloudDensityScale spreads the calibrated column optical depth over the box's actual height,
+        // so the walk resolves the same deck the planar tier prices rather than a denser one.
+        float tauCell = density * push.cloud0.w * CLOUD_EXTINCTION * dt * cloudDensityScale(push);
         if (tauCell > 1.0e-4) {
             float cellT = exp(-tauCell);
-            // The local-density self-shadow: the sample's own density times the geometric path left to
-            // the slab's top along the light ray. It costs no extra field tap, and it is what produces
-            // the vertical gradient — dark underbelly, lit crown — that is the whole reason to walk the
-            // slab instead of crossing it once. The octave stack stays the multi-scatter stand-in on top,
-            // and the ambient leg is occluded by the same column at a softened weight.
-            float depthToTop = max(top - p.y, 0.0);
-            float tauUp = density * CLOUD_EXTINCTION * depthToTop;
-            float tauSun = tauUp / max(lightDir.y, 0.05);
+            // The light march: the baked shape's own occlusion toward the body, graded through the
+            // same multi-scatter octaves the sheet's column estimate uses. The ambient leg is
+            // occluded by the same tau at a softened weight — what a viewer mostly sees of a deck
+            // is its BASE, where the direct sun is gone and the brightness comes from light that
+            // has bounced many times inside the cloud. Occluding the sky by the full sun tau
+            // crushed the base to a dark sheet; that softening is CLOUD_AMBIENT_OCCLUSION, and it
+            // is also the only term that can light a base at all.
+            float tauSun = cloudLightTau(push, p, lightDir, boxH) * push.cloud0.w;
             float3 sunT = cloudSelfShadow(tauSun);
-            // The ambient leg is occluded far more weakly than the sun leg, and deliberately so: what a
-            // viewer mostly sees of a deck is its BASE, where the direct sun is gone and the brightness
-            // comes from light that has bounced many times inside the cloud. Occluding the sky by the
-            // same column the sun sees crushed the base to a dark sheet and the whole deck read as thin
-            // — the opposite of the dense mass a cumulus should look like from underneath. That softening
-            // is CLOUD_AMBIENT_OCCLUSION, and it is also the only term that can light a base at all: the
-            // phase term there is two orders down on the body's own, so this weight IS the base's level.
-            float ambT = cloudSelfShadow(tauUp * CLOUD_AMBIENT_OCCLUSION);
+            float ambT = max(cloudSelfShadow(tauSun * CLOUD_AMBIENT_OCCLUSION),
+                    CLOUD_AMBIENT_FLOOR);
             float3 scatter = CLOUD_ALBEDO * (phase * lightIll * sunT + ambient * ambT);
             L += T * (1.0 - cellT) * scatter;
             T *= cellT;
@@ -813,31 +725,32 @@ public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, Sky
 }
 
 // Extinction only, at the planar tier's price: a continuation ray (a reflection, a refraction, an
-// indirect bounce) must be dimmed by the deck it passed through without paying a walk per bounce — the
-// plan's "Pass B does extinction only". One coverage tap at the slab's mid-crossing and the same
-// slant-thickened tau the planar tier uses keeps a bounce's attenuation the MEAN of what the primary ray
-// walked. The walk's own vertical detail is deliberately absent here: it is a per-sample property, and
-// the cheap stand-in for it is the mean.
+// indirect bounce) must be dimmed by the deck it passed through without paying a walk per bounce —
+// the "Pass B does extinction only" contract. One instance fetch at the slab's mid-crossing and the
+// same slant-thickened tau the planar tier uses keeps a bounce's attenuation the MEAN of what the
+// primary ray walked.
 public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd) {
     if ((push.flags & WORLD_FLAG_CLOUD) == 0u || push.cloud0.x <= 0.0 || abs(rd.y) < 1.0e-6) {
         return 1.0;
     }
-    float base = push.cloud0.y;
-    float top = base + max(push.cloud0.z, 1.0);
-    if (rd.y > 0.0 ? ro.y >= top : ro.y <= base) {
-        return 1.0; // the ray runs away from the slab
+    float boxBottom = cloudBoxBottom(push);
+    float boxH = cloudBoxHeight(push);
+    float boxTop = boxBottom + boxH;
+    if (rd.y > 0.0 ? ro.y >= boxTop : ro.y <= boxBottom) {
+        return 1.0; // the ray runs away from the layer
     }
-    float ta = (base - ro.y) / rd.y;
-    float tb = (top - ro.y) / rd.y;
+    float ta = (boxBottom - ro.y) / rd.y;
+    float tb = (boxTop - ro.y) / rd.y;
     float tMid = 0.5 * (max(min(ta, tb), 0.0) + max(ta, tb));
-    float cov = cloudCoverageField(push, ro.xz + rd.xz * tMid);
-    if (cov <= 0.0) {
+    float vMid = (ro.y + rd.y * tMid - boxBottom) / boxH;
+    float density = cloudInstanceDensity(push,
+            ro.xz + rd.xz * tMid + push.cloud2.xy + push.cloud2.zw, vMid);
+    if (density <= 0.0) {
         return 1.0;
     }
-    float tau = cov * push.cloud0.w * CLOUD_EXTINCTION * push.cloud0.z / max(abs(rd.y), 0.04);
+    float tau = density * push.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / max(abs(rd.y), 0.04);
     return exp(-tau);
 }
-
 // ---- Unified air-volume sampler --------------------------------------------------------------------
 //
 // The marcher's per-step density source (the marched tier walks this; the analytic tier above bypasses
@@ -1042,12 +955,10 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
 
 // ---- The water column ------------------------------------------------------------------------------
 //
-// The column used to carry two volumetric terms of its own, both driven by `composite.water-turbidity`:
-// a sky-lit ambient that gave it body, and a single-probe sun leg. Together they were the milky water —
-// a depth-attenuated wash with no structure and no shafts — and both are gone. What the column has now
-// is the same structure-gated shaft layer the air uses, on the medium pushed in `waterShaft`: its own
-// extinction decides how far the layer is worth integrating, its ceiling caps the forward lobe so the
-// surface you look up at cannot go white, and the gate draws the beams out of the shadow structure.
+// The column carries the same structure-gated shaft layer the air uses, on the medium pushed in
+// `waterShaft`: its own extinction decides how far the layer is worth integrating, its ceiling caps the
+// forward lobe so the surface you look up at cannot go white, and the gate draws the beams out of the
+// shadow structure.
 //
 // The body's absorption (`composite.water-opacity`) is untouched: it lives in the surface-radiance path
 // (`medium.extinction`), not in this term, so water still darkens with depth exactly as it did.

@@ -100,12 +100,18 @@ public final class RtVideoOptions {
 
     /** The value as the catalog spells it, with the restart notice vanilla has no badge for. */
     private static Component label(Option option, int widgetValue) {
-        Component value = option.valueLabel(widgetValue);
+        return withRestartNotice(option, option.valueLabel(widgetValue));
+    }
+
+    /**
+     * The restart notice for a value the widget already formatted. Both the catalog-formatted controls and
+     * the cycled ones, whose value text is built from a translation key rather than a number, need it.
+     */
+    private static Component withRestartNotice(Option option, Component value) {
         if (!option.restart()) {
             return value;
         }
-        return value.copy().append(Component.literal(" "))
-                .append(Component.translatable("caustica.options.rt.restartNeeded"));
+        return value.copy().append(" ").append(Component.translatable("caustica.options.rt.restartNeeded"));
     }
 
     private static OptionInstance<Boolean> toggle(Option option) {
@@ -177,7 +183,29 @@ public final class RtVideoOptions {
             case EXPOSURE_MODE -> exposureMode(option);
             case DLSS_QUALITY -> steppedList(option, CausticaConfig.Rt.DlssRr.QUALITY_STEPS, true);
             case HDR_PEAK -> steppedList(option, CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS, false);
+            case FRAME_GENERATION_BACKEND -> frameGenerationBackend(option);
         };
+    }
+
+    /**
+     * One of {@link CausticaConfig.Rt.Fg#BACKENDS}, stored as its TOML word. An unrecognised stored value
+     * shows as the default rather than leaving the widget without a selected entry.
+     */
+    private static OptionInstance<String> frameGenerationBackend(Option option) {
+        List<String> backends = CausticaConfig.Rt.Fg.BACKENDS;
+        String stored = option.text().get();
+        return new OptionInstance<>(option.nameKey(),
+                OptionInstance.cachedConstantTooltip(Component.translatable(option.tooltipKey())),
+                // An OptionInstance.Enum cycles with DisplayState.NAME_AND_VALUE, so the caption is
+                // already prepended and this must return only the value's text.
+                (caption, value) -> withRestartNotice(option,
+                        Component.translatable(option.nameKey() + "." + value)),
+                new OptionInstance.Enum<>(backends, Codec.STRING),
+                backends.contains(stored) ? stored : CausticaConfig.Rt.Fg.DLSS,
+                value -> {
+                    option.text().set(value);
+                    CausticaSettings.afterChange(option);
+                });
     }
 
     /**

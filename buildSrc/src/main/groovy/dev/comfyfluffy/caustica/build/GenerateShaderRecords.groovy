@@ -236,6 +236,8 @@ abstract class GenerateShaderRecords extends DefaultTask {
             ["sharpenPushProbe", "SharpenPush", "SharpenPushData"],
             ["debugPresentPushProbe", "DebugPresentPush", "DebugPresentPushData"],
             ["bloomPushProbe", "BloomPush", "BloomPushData"],
+            ["lensSourcePushProbe", "LensSourcePush", "LensSourcePushData"],
+            ["lensFlarePushProbe", "LensFlarePush", "LensFlarePushData"],
             ["pushAddrLayoutProbe", "PushAddr", "PushAddrData"],
     ]
 

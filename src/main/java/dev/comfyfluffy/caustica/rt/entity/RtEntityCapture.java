@@ -411,6 +411,10 @@ public final class RtEntityCapture implements VertexConsumer {
         // Vanilla carries some surfaces' transparency in the vertex colour's alpha byte rather than in the
         // texture — the beacon beam's glow layer is entirely opaque in its atlas and translucent only here.
         float ta = ((c >>> 24) & 0xFF) * (1f / 255f);
+        // aux1 is the end portal's layer pack. RtEntityCollector#attachGlintOverlay overwrites the same
+        // lane with the overlay texture's slot on the prims an enchantment glint repeats; a glint
+        // submission never stacks portal layers.
+        float aux1 = Float.intBitsToFloat(currentLayerTexSlot);
         for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
             prim.add(nx);
             prim.add(ny);
@@ -423,7 +427,7 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(Float.intBitsToFloat(currentMaterialId));
             prim.add(Float.intBitsToFloat(currentPrimFlags)); // flags
             prim.add(ta); // aux0 = captured vertex alpha, read back with asfloat
-            prim.add(Float.intBitsToFloat(currentLayerTexSlot)); // aux1 = layer texture slot, read as uint
+            prim.add(aux1); // aux1 = layer slot/count (end portal) or overlay texture slot (glint)
             alphaBuckets.add(currentAlphaBucket);
         }
     }

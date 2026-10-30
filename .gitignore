@@ -20,3 +20,11 @@ docs/*PLAN*.md
 todos.md
 docs/gallery/*.png
 tools/cloud-preview-out/
+tools/lens-preview-out/
+tools/shaft-preview-out/
+tools/bounce-sweep-out/
+tools/parallax-preview-out/
+
+# Local experiment outputs
+tools/glass-shadow-lab/shots/
+tools/rr-refraction-probe/out*/

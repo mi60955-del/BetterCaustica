@@ -23,13 +23,48 @@ This software contains source code provided by NVIDIA Corporation.
 
 Bundled NVIDIA SDK runtime libraries may include files matching:
 
-- `caustica/natives/windows-x64/nvngx_dlssd.dll`
-- `caustica/natives/windows-x64/nvngx_dlssg.dll`
-- `caustica/natives/linux-x64/libnvidia-ngx-dlssd.so*`
-- `caustica/natives/linux-x64/libnvidia-ngx-dlssg.so*`
+- `bettercaustica/natives/windows-x64/nvngx_dlssd.dll`
+- `bettercaustica/natives/windows-x64/nvngx_dlssg.dll`
+- `bettercaustica/natives/linux-x64/libnvidia-ngx-dlssd.so*`
+- `bettercaustica/natives/linux-x64/libnvidia-ngx-dlssg.so*`
 
 Caustica's `ngxshim` native library is project-owned glue code and follows
 Caustica's project license unless otherwise noted.
+
+## AMD FidelityFX SDK (FSR frame generation)
+
+BetterCaustica can build and distribute release artifacts that include AMD's
+FidelityFX runtime library, which provides FSR frame generation. That component
+is not licensed under the LGPL.
+
+`amd_fidelityfx_vk.dll` is part of the AMD FidelityFX SDK, Copyright (C) 2024
+Advanced Micro Devices, Inc., and is distributed under the MIT license
+(<https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK>):
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Bundled AMD SDK runtime libraries may include files matching:
+
+- `bettercaustica/natives/windows-x64/amd_fidelityfx_vk.dll`
+
+Caustica's `ffxshim` native library is project-owned glue code and follows
+Caustica's project license.
 
 ## CIE photometric and colorimetric data
 

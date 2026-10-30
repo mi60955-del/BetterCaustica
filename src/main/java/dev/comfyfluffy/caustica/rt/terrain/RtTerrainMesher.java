@@ -50,12 +50,16 @@ import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
 import java.util.List;
 
 final class RtTerrainMesher {
+    /** world_common.slang {@code TERRAIN_PRIM_THIN_DIELECTRIC}: this translucent face bounds no volume. */
+    private static final int TERRAIN_PRIM_THIN_DIELECTRIC = 2;
+
     /**
      * Reusable per-worker-thread meshing state. The mesh + captures are reset between tasks so their
      * backing arrays amortize across sections instead of re-growing per task. Everything the result carries out —
@@ -420,6 +424,10 @@ final class RtTerrainMesher {
         private static final float TRANSLUCENT_INSET = 2.0e-4f; // inward recess (blocks) for glass/ice vs coplanar neighbours
         private static final float COINCIDENT_EPS = 1.0e-4f; // verts this close are "the same" point
         private static final int RESOLVE_CAP = 128;          // skip the O(n^2) resolve for pathological blocks
+        // A translucent block whose shape is thinner than this in any axis is a sheet, not a volume: vanilla
+        // culls a pane's inner and neighbour-facing quads, so the only face the camera sees can be the one
+        // that would be the far side of a box it never entered (see TERRAIN_PRIM_THIN_DIELECTRIC).
+        private static final double SHEET_THICKNESS = 0.25;
         private final List<PendingQuad> pending = new ArrayList<>(8);
         private int pendingCount;
         private int[] gidScratch = new int[0];
@@ -452,6 +460,7 @@ final class RtTerrainMesher {
             q.cutout = layer != ChunkSectionLayer.SOLID;
             q.translucent = layer == ChunkSectionLayer.TRANSLUCENT
                     && (sprite == null || !sprite.transparency().hasTransparent());
+            q.sheet = q.translucent && isSheet();
 
             // Fabric colors are authored albedo. Continuity uses them for already-resolved overlay tint;
             // ordinary biome-tinted quads retain tintIndex and are multiplied by the world tint below.
@@ -490,6 +499,29 @@ final class RtTerrainMesher {
             }
             BlockState neighbor = view.getBlockState(cullPos.setWithOffset(pos, direction));
             return !Block.shouldRenderFace(state, neighbor, direction);
+        }
+
+        /**
+         * True when the block's own shape is too thin to hold a medium: a pane, or any decorative layer
+         * under a quarter block. Vanilla culls such a block's inner and neighbour-facing quads, so the only
+         * face a camera sees can be the far side of a box the ray never entered. The closest hit re-derives
+         * "entering" from face orientation, so that face reads as an exit and total-internal-reflects
+         * whenever the ray is past the critical angle — the background then lands on the face as a hard
+         * disc. Mesher-side, because the shape is the one thing the hit shader cannot see.
+         */
+        private boolean isSheet() {
+            if (state == null) {
+                return false; // nothing contradicts the layer's own answer
+            }
+            VoxelShape shape = state.getCollisionShape(view, pos);
+            if (shape.isEmpty()) {
+                return true;
+            }
+            double thinnest = Double.MAX_VALUE;
+            for (Direction.Axis axis : Direction.Axis.values()) {
+                thinnest = Math.min(thinnest, shape.max(axis) - shape.min(axis));
+            }
+            return thinnest < SHEET_THICKNESS;
         }
 
         /** Acquire a pooled PendingQuad for the current block (grown on demand, count reset by flushBlock). */
@@ -637,7 +669,7 @@ final class RtTerrainMesher {
                 prim.add(q.tb);
                 prim.add(0f);
                 prim.add(Float.intBitsToFloat(q.materialId)); // TerrainPrim.materialId uint bits
-                prim.add(0f); // flags
+                prim.add(Float.intBitsToFloat(q.sheet ? TERRAIN_PRIM_THIN_DIELECTRIC : 0)); // flags
                 prim.add(0f); // aux0
                 prim.add(0f); // aux1
                 g.ommSprites.add(q.sprite);
@@ -652,6 +684,7 @@ final class RtTerrainMesher {
         float nx, ny, nz;
         boolean cutout; // non-SOLID render layer (alpha-tested) — also an overlay candidate
         boolean translucent; // TRANSLUCENT layer (stained glass / ice): colored-transmission dielectric
+        boolean sheet; // translucent block thinner than a quarter block: a filter, not a volume boundary
         boolean tinted; // tintIndex >= 0 — the tinted member of a base+overlay pair
         float tr, tg, tb, emission;
         int materialId;

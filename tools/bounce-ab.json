@@ -1,0 +1,222 @@
+{
+  "scene": "RT测试 world (E:/Minecraft/26.2), two purpose-built sealed white-concrete rooms on the empty NW grassland. Daylight frozen at 6000, weather clear, camera static per scene.",
+  "renderer": "Vulkan (NVIDIA 616.92), DLSS-RR 1280x720 -> 2560x1440 preset 6, max-fps uncapped to 250 for the sweep (user setting 10 restored after), vsync off",
+  "jar": "sha256:9ad976aaf7dd356e2fa450eb11eb15f37ff3ec30290a95164284d87e73913e0b",
+  "config": {
+    "spp": 1,
+    "ris-candidates": 0,
+    "fog": false,
+    "shafts": false,
+    "cloud": false,
+    "omm": false,
+    "time": "6000 pinned (daylight cycle already frozen in the save)",
+    "weather": "clear"
+  },
+  "camera": {
+    "opaque": "(-43.7,-58,-43.7) yaw -45 pitch 10, interior corner of the diffuse room; shell x[-45,-31] y[-59,-52] z[-45,-31], three 1x1 ceiling holes on the diagonal",
+    "glass": "(-25.5,-58,-43.5) yaw -45 pitch 15; shell x[-27,-13] same y/z band, 7x9 glass ceiling strip, 7x7 source-water pool (water[level=0]) in a concrete rim, two 1x1 holes; the complex's tall orange/white building is visible through the glass (static geometry)"
+  },
+  "protocol": "10 arms per scene: bounces 2,3,4,5,6,8 sweep + default 4 interleaved after every arm as in-session reference; each arm = UI slider set (live push-constant, no restart), 2.5 s settle, 10 s quiet sampling window bracketed by gpu.csv tail reads, then a 5 s mc_perf snapshot taken OUTSIDE the sampling window (mc_perf stalls GPU query readback and collapses the timed-frame rate - first protocol revision).",
+  "noise_floor": "ref-4 arms repeated 5x per scene; drift of their medians vs the pooled ref median <= 0.052 ms (traceIndirect), <= 0.006 ms (tracePrimary) - two orders of magnitude below the marginals",
+  "curve": {
+    "opaque": {
+      "2": {
+        "tracePrimaryMs_med": 0.9977,
+        "traceIndirectMs_med": 13.4905,
+        "traceIndirectMs_p95": 13.87186,
+        "total_med": 26.2432,
+        "fps": 37.19,
+        "fps_1pct_low": 34.93,
+        "frames": 373,
+        "source": "sweep"
+      },
+      "3": {
+        "tracePrimaryMs_med": 0.9985,
+        "traceIndirectMs_med": 18.00115,
+        "traceIndirectMs_p95": 18.56569,
+        "total_med": 30.783450000000002,
+        "fps": 31.58,
+        "fps_1pct_low": 29.52,
+        "frames": 318,
+        "source": "sweep"
+      },
+      "4": {
+        "tracePrimaryMs_med": 0.9832,
+        "traceIndirectMs_med": 22.4789,
+        "traceIndirectMs_p95": 23.36043,
+        "total_med": 35.0879,
+        "fps": 27.9,
+        "fps_1pct_low": 26.46,
+        "frames": 279,
+        "source": "ref x5"
+      },
+      "5": {
+        "tracePrimaryMs_med": 0.99255,
+        "traceIndirectMs_med": 25.4163,
+        "traceIndirectMs_p95": 26.15095,
+        "total_med": 38.00865,
+        "fps": 25.73,
+        "fps_1pct_low": 24.59,
+        "frames": 258,
+        "source": "sweep"
+      },
+      "6": {
+        "tracePrimaryMs_med": 0.9799,
+        "traceIndirectMs_med": 27.75035,
+        "traceIndirectMs_p95": 28.320225,
+        "total_med": 40.170950000000005,
+        "fps": 24.43,
+        "fps_1pct_low": 23.52,
+        "frames": 246,
+        "source": "sweep"
+      },
+      "8": {
+        "tracePrimaryMs_med": 0.9709,
+        "traceIndirectMs_med": 30.583750000000002,
+        "traceIndirectMs_p95": 31.02953,
+        "total_med": 43.089999999999996,
+        "fps": 22.83,
+        "fps_1pct_low": 21.84,
+        "frames": 230,
+        "source": "sweep"
+      }
+    },
+    "glass": {
+      "2": {
+        "tracePrimaryMs_med": 1.0568,
+        "traceIndirectMs_med": 13.3887,
+        "traceIndirectMs_p95": 13.820699999999999,
+        "total_med": 26.2574,
+        "fps": 36.72,
+        "fps_1pct_low": 34.22,
+        "frames": 369,
+        "source": "sweep"
+      },
+      "3": {
+        "tracePrimaryMs_med": 1.0566,
+        "traceIndirectMs_med": 17.8466,
+        "traceIndirectMs_p95": 18.474719999999998,
+        "total_med": 30.8129,
+        "fps": 31.53,
+        "fps_1pct_low": 29.75,
+        "frames": 317,
+        "source": "sweep"
+      },
+      "4": {
+        "tracePrimaryMs_med": 1.0445,
+        "traceIndirectMs_med": 22.436,
+        "traceIndirectMs_p95": 23.2561,
+        "total_med": 35.3115,
+        "fps": 27.51,
+        "fps_1pct_low": 25.91,
+        "frames": 277,
+        "source": "ref x5"
+      },
+      "5": {
+        "tracePrimaryMs_med": 1.0413999999999999,
+        "traceIndirectMs_med": 25.509999999999998,
+        "traceIndirectMs_p95": 26.114125,
+        "total_med": 38.128600000000006,
+        "fps": 25.51,
+        "fps_1pct_low": 24.11,
+        "frames": 256,
+        "source": "sweep"
+      },
+      "6": {
+        "tracePrimaryMs_med": 1.0340500000000001,
+        "traceIndirectMs_med": 27.6368,
+        "traceIndirectMs_p95": 28.318019999999997,
+        "total_med": 40.27895,
+        "fps": 24.2,
+        "fps_1pct_low": 23.15,
+        "frames": 242,
+        "source": "sweep"
+      },
+      "8": {
+        "tracePrimaryMs_med": 1.03185,
+        "traceIndirectMs_med": 30.43085,
+        "traceIndirectMs_p95": 31.05979,
+        "total_med": 43.111149999999995,
+        "fps": 22.61,
+        "fps_1pct_low": 21.08,
+        "frames": 228,
+        "source": "sweep"
+      }
+    }
+  },
+  "marginal_traceIndirectMs": {
+    "opaque": [
+      {
+        "from": 2,
+        "to": 3,
+        "d_traceIndirectMs": 4.5106,
+        "d_tracePrimaryMs": 0.0008,
+        "d_total": 4.5403
+      },
+      {
+        "from": 3,
+        "to": 4,
+        "d_traceIndirectMs": 4.4849,
+        "d_tracePrimaryMs": -0.0161,
+        "d_total": 4.3397
+      },
+      {
+        "from": 4,
+        "to": 5,
+        "d_traceIndirectMs": 2.9303,
+        "d_tracePrimaryMs": 0.0101,
+        "d_total": 2.8855
+      },
+      {
+        "from": 5,
+        "to": 6,
+        "d_traceIndirectMs": 2.3341,
+        "d_tracePrimaryMs": -0.0127,
+        "d_total": 2.1623
+      }
+    ],
+    "glass": [
+      {
+        "from": 2,
+        "to": 3,
+        "d_traceIndirectMs": 4.4579,
+        "d_tracePrimaryMs": -0.0002,
+        "d_total": 4.5555
+      },
+      {
+        "from": 3,
+        "to": 4,
+        "d_traceIndirectMs": 4.6097,
+        "d_tracePrimaryMs": -0.0135,
+        "d_total": 4.4972
+      },
+      {
+        "from": 4,
+        "to": 5,
+        "d_traceIndirectMs": 3.0537,
+        "d_tracePrimaryMs": -0.0017,
+        "d_total": 2.8185
+      },
+      {
+        "from": 5,
+        "to": 6,
+        "d_traceIndirectMs": 2.1268,
+        "d_tracePrimaryMs": -0.0073,
+        "d_total": 2.1503
+      }
+    ]
+  },
+  "findings": [
+    "No 3->4 strategy discontinuity: the 2->3 marginal (+4.51/+4.46 ms) and the 3->4 marginal (+4.49/+4.61 ms) are equal within noise, in both scenes. rrStart moving 1->2 at maxBounces=4 (indirect.rgen.slang:79) does not show up as a frame-cost avalanche.",
+    "Marginal cost per bounce DECLINES with depth (opaque: 4.51, 4.49, 2.93, 2.33, ~1.42/bounce for 6->8): Russian roulette plus throughput decay already prune deep paths efficiently.",
+    "The glass/water scene costs the same as the opaque diffuse scene at every bounce level (medians within ~0.15 ms of each other): dielectric continuation and specular chains are not a meaningful per-bounce cost driver at this scene scale.",
+    "tracePrimaryMs is flat (~1.0 ms) across all bounce levels in both scenes: the transmission-guide crossing loop (guides.slang uses worldPush.maxBounces) does not make the primary pass scale with bounces here.",
+    "Even B=2 carries a 13.5 ms traceIndirect baseline at 1280x720 traced; B=4 default adds +9.0 ms over B=2, B=8 adds +8.1 ms over B=4 (total pass medians 35.1 -> 43.1 ms)."
+  ],
+  "gpu_csv": "E:/Minecraft/26.2/rt-frame-stats/gpu.csv (54,888 timed frames, one session)",
+  "notes": [
+    "max-fps was raised 10 -> 250 for the sweep (GPU-bound 99%) and restored to the user's 10 afterwards in options.txt.",
+    "mc_perf must not be called inside the sampling window: it stalls GPU query readback and collapses the timed-frame rate (protocol revision after the first attempt).",
+    "The two rooms were built for this sweep on empty NW grassland; the README-shaft-preview coordinates (y 149-157 box) do not exist in this save - the world's structures sit at negative Y (ground ~y-70)."
+  ]
+}

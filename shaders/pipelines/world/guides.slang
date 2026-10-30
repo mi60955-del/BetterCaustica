@@ -28,7 +28,14 @@ public static float gv_fogOpacity = 0.0;
 public static bool gv_emissive = false;
 public static float gv_rough = 0.0;
 public static float3 gv_hitCamRel = float3(0.0, 0.0, 0.0);       // primary-surface hit position relative to the current camera
-public static bool gv_motionUseRefracted = false; // true when the MV tracks the refracted hit (its own reprojection delta)
+public static bool gv_motionUseRefracted = false;
+#ifdef CAUSTICA_INTERFACE_DEBUG
+// Diagnostic lanes for writeGuides: the primary dielectric interface's decision (0 filter, 1/3 volume
+// entry, 2/3 volume exit, 1 total internal reflection), the medium it was in, and the hit's material id.
+public static float gv_dbgDecision = 0.0;
+public static float gv_dbgIor = 0.0;
+public static float gv_dbgMaterial = 0.0;
+#endif // true when the MV tracks the refracted hit (its own reprojection delta)
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 public static float3 gv_motionObjDisp = float3(0.0, 0.0, 0.0);
@@ -123,9 +130,11 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
     // deterministic guide probe. CULL_SPECULAR must match the mask the reflected radiance ray will take
     // in the indirect pass: if the probe excluded particles while the reflected image includes them, the
     // motion vectors here would reproject a different scene than the one being denoised.
+    // tmin 0.0, exactly like the radiance reflection it mirrors: the offset origin already clears the
+    // reflector, and any extra tmin would let the guide miss a surface the radiance ray still hits.
     traceGuide(CULL_SECONDARY | CULL_SPECULAR,
             offsetSurfaceOrigin(surfacePos, surface.biasNormal, specDir, SURF_BIAS),
-            RAY_TMIN, specDir, 10000.0,
+            0.0, specDir, 10000.0,
             max(length(surface.camRel) * primaryConeSpread, RAY_CONE_MIN_WIDTH),
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
     float3 reflectedHit;
@@ -176,7 +185,8 @@ public void setTransmissionGuide(float3 hitCamRel, float3 motionPrev, float3 nor
 // radiance reflection/transmission continuations are queued at the first split and traced by Pass B.
 public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
                               float3 surfaceBiasNormal, MediumStack medium, float rayBias,
-                              float rayConeWidth, float rayConeSpread, float3 guideFilter) {
+                              float rayConeWidth, float rayConeSpread, float3 guideFilter,
+                              float interfaceRoughness) {
     if (dot(transmittedDir, transmittedDir) <= 0.0) return;
 
     float3 direction = normalize(transmittedDir);
@@ -185,7 +195,13 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
     // The camera interface consumed bounce 0; the remaining configured bounce budget is the natural
     // cap for deterministic guide crossings too.
     for (uint crossing = 0u; crossing < worldPush.maxBounces; ++crossing) {
-        traceGuide(CULL_PRIMARY, ro, RAY_TMIN, direction, 10000.0,
+        // tmin 0.0, matching the radiance trace this probe stands in for. The mesher recesses a
+        // translucent face by TRANSLUCENT_INSET (2e-4) and the transmitted ray restarts
+        // INSET_TRANSMIT_BIAS (1e-4) into that gap, so a partial block or block-entity face sitting
+        // flush against the glass is 1e-4 from this origin. RAY_TMIN (1e-3) skipped it: the guide then
+        // described whatever lay behind while the color was the block in front, and DLSS-RR turned that
+        // block into a translucent ghost.
+        traceGuide(CULL_PRIMARY, ro, 0.0, direction, 10000.0,
                 rayConeWidth, rayConeSpread);
         if (payload.hitT <= 0.0) {
             setTransmissionGuide((ro + direction * 1.0e6) - worldPush.camOffset,
@@ -197,8 +213,13 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
         uint material = payloadMaterial();
         float3 interfacePos = ro + direction * payload.hitT;
         if (material == MATERIAL_OPAQUE || material == MATERIAL_PARTICLE) {
+            // What sharpens or blurs this radiance is the interface it crossed, not the surface behind
+            // it: a flat glass face transmits a delta, so the destination's own roughness describes a
+            // reflection this pixel never shows. Reporting the destination's roughness instead tells
+            // the reconstructor to expect texture-scale variance exactly where the path is sharp, and
+            // it averages the texture behind the glass into a smear.
             float endpointRoughness = material == MATERIAL_PARTICLE
-                    ? 1.0 : clamp(payloadRoughness(), 0.0, 1.0);
+                    ? 1.0 : interfaceRoughness;
             float3 hitAlbedo = payloadAlbedo();
             float3 endpointAlbedo = material == MATERIAL_PARTICLE
                     ? hitAlbedo
@@ -226,7 +247,17 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
         Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0),
                                               payloadAlbedo(), transmission,
                                               worldPush.waterOpacity);
-        float etaT = entering ? entered.ior : medium.outer.ior;
+        // A face that bounds no volume has the same medium on both sides (see PAYLOAD_DIELECTRIC_THIN): it
+        // filters the ray and leaves the stack alone, so no critical angle is invented at it. This has to
+        // agree with raygen's interface or the guide would describe a crossing the radiance path never takes.
+        bool thin = !isWater && (payload.flags & PAYLOAD_DIELECTRIC_THIN) != 0u;
+        // Same rule as raygen: an exit needs an entry, and this traversal must agree with the radiance path.
+        if (!thin && !entering && !mediumInsideDenser(medium)) {
+            thin = !isWater;
+        }
+        float etaT = thin || entering ? entered.ior : medium.outer.ior;
+        // A thin face still bends the ray exactly as an entry would: that bend is the refraction a pane
+        // gives, and with the near-side index it can never reach the critical angle.
         float3 nextDirection = refract(direction, interfaceNormal, medium.current.ior / etaT);
         if (dot(nextDirection, nextDirection) <= 0.0) {
             // Never let a TIR reflection become ordinary diffuse/depth.
@@ -235,13 +266,15 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
                     interfaceNormal, 0.0, float3(0.0, 0.0, 0.0), false);
             return;
         }
-        if (!isWater && entering) {
+        if (!isWater && (thin || entering)) {
             guideFilter *= payloadAlbedo();
         }
-        if (entering) {
-            mediumPush(medium, entered);
-        } else {
-            mediumPop(medium);
+        if (!thin) {
+            if (entering) {
+                mediumPush(medium, entered);
+            } else {
+                mediumPop(medium);
+            }
         }
         direction = normalize(nextDirection);
         ro = offsetSurfaceOrigin(interfacePos, geometricNormal, direction,
@@ -310,6 +343,15 @@ public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, f
     // Depth deliberately stays the endpoint's: DLSS-RR is not its only reader — frame generation
     // reprojects with it and the exposure histogram weights its populations by it, so moving a
     // fog-dominated pixel's depth off the surface would trade this artifact for two others.
+#ifdef CAUSTICA_INTERFACE_DEBUG
+    // Diagnostic build: the albedo guide carries the interface decision instead of albedo, so one
+    // screenshot of debug view 2 reads out what the dielectric interface saw at each pixel.
+    // The albedo guide is ACEScg and debug view 2 maps it through acesCgToSrgb, whose Rec.709
+    // matrix has coefficients above 1 and negative off-diagonals: written at full scale the lanes
+    // both clip and mix, which makes the decision and exit cases indistinguishable. Quarter scale
+    // keeps every channel inside [0, 1] so the three lanes stay invertible.
+    guideAlbedo = float3(gv_dbgDecision, gv_dbgIor, gv_dbgMaterial) * 0.25;
+#endif
     gNormal[pix] = float4(guideNormal, guideRough);
     gAlbedo[pix] = float4(guideAlbedo, gv_emissive ? 1.0 : 0.0);
     gDepth[pix] = depth;

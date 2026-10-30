@@ -415,16 +415,6 @@ public ScatteringResult integrateScatteredLuminance(
 
 // ---- Celestial geometry ------------------------------------------------------------------------
 
-/**
- * World direction of a celestial body from Minecraft's own eased angle (EnvironmentAttributes.SUN_ANGLE /
- * MOON_ANGLE, radians) and the look package's noon tilt toward south. Angle 0 puts the body at its
- * highest point. Matches vanilla's arc: east-west travel, tilted toward +Z at its peak.
- */
-public float3 celestialDirection(float angleRad, float noonTiltRad) {
-    float peak = cos(angleRad);
-    return float3(-sin(angleRad), cos(noonTiltRad) * peak, sin(noonTiltRad) * peak);
-}
-
 /** The pole the sun/moon arc about, and the axis the starfield wheels on. */
 public float3 celestialAxis(float noonTiltRad) {
     return float3(0.0, -sin(noonTiltRad), cos(noonTiltRad));

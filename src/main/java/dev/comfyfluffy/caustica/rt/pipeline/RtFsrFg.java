@@ -11,6 +11,7 @@ import dev.comfyfluffy.caustica.ffx.FfxRuntime;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
+import dev.comfyfluffy.caustica.rt.RtFramePresenter;
 
 import org.joml.Matrix4fc;
 import org.lwjgl.vulkan.VK10;
@@ -88,9 +89,9 @@ public final class RtFsrFg {
     private RtFsrFg() {
     }
 
-    /** Whether this backend was chosen in settings. */
+    /** Whether this backend is the one chosen for this launch. */
     public static boolean selected() {
-        return CausticaConfig.Rt.Fg.FSR.equals(CausticaConfig.Rt.Fg.BACKEND.get());
+        return CausticaConfig.Rt.Fg.FSR.equals(RtFramePresenter.backend());
     }
 
     /** Whether the probe succeeded and no failure has latched; drives the extra-present path. */
@@ -353,16 +354,6 @@ public final class RtFsrFg {
         probed = false;
         available = false;
         lib = null;
-    }
-
-    /**
-     * Release the context when the frame-generation backend setting no longer names FSR, so
-     * switching to DLSS does not leave this context holding device memory. No-op otherwise.
-     */
-    public void destroyUnlessSelected() {
-        if (contextUp && !selected()) {
-            destroy();
-        }
     }
 
     // --- camera ------------------------------------------------------------------------

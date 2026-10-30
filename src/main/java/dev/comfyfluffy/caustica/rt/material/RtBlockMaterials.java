@@ -585,14 +585,21 @@ public final class RtBlockMaterials {
             return result;
         }
 
+        /**
+         * Copy one mip level into its page cell with the gutter filled from wrapped source coordinates.
+         * Block textures repeat per face, so the gutter holds the sprite's tiled continuation rather
+         * than a replicated border: bilinear filtering — and the hit shader's parallax march, whose
+         * displaced samples wrap across the sprite border — then reads the opposite edge's content at
+         * the seam instead of a doubled border texel.
+         */
         private static void blit(byte[] dst, int dstWidth, int cx, int cy, int gutter,
                                  int srcWidth, int srcHeight, float[] src) {
             for (int dy = -gutter; dy < srcHeight + gutter; dy++) {
-                int sy = Math.max(0, Math.min(srcHeight - 1, dy));
+                int sy = Math.floorMod(dy, srcHeight);
                 int ty = cy + dy;
                 if (ty < 0 || ty >= dstWidth) continue;
                 for (int dx = -gutter; dx < srcWidth + gutter; dx++) {
-                    int sx = Math.max(0, Math.min(srcWidth - 1, dx));
+                    int sx = Math.floorMod(dx, srcWidth);
                     int tx = cx + dx;
                     if (tx < 0 || tx >= dstWidth) continue;
                     int si = (sy * srcWidth + sx) * 4;

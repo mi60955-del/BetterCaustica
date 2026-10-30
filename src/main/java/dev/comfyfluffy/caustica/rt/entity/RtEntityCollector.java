@@ -42,6 +42,7 @@ import net.minecraft.client.renderer.gizmos.DrawableGizmoPrimitives;
 import net.minecraft.client.renderer.item.ItemStackRenderState;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
+import net.minecraft.client.renderer.rendertype.TextureTransform;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
@@ -91,6 +92,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private static final int PRIM_FLAG_UNLIT = 1;
     /** world_common.slang {@code ENTITY_PRIM_END_PORTAL}. */
     private static final int PRIM_FLAG_END_PORTAL = 2;
+    /** world_common.slang {@code ENTITY_PRIM_GLINT}: the surface carries the enchantment overlay. */
+    private static final int PRIM_FLAG_GLINT = 128;
     /** The one vanilla fragment shader that composites the end portal and the end gateway. */
     private static final String END_PORTAL_FRAGMENT_SHADER = "core/rendertype_end_portal";
     /** The pipeline define saying how many layers that shader stacks. */
@@ -129,6 +132,17 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     // Set by order(int) for the very next submitModel call (banner/shield pattern-layer stacking), then
     // consumed. Baked-quad paths (addQuad) don't use ordering and always reset the capture's order to 0.
     private int pendingOrder;
+    // The last submission captured by submitModel and where its prims start. Vanilla draws the enchantment
+    // glint by submitting that same model a second time; pairing the two on the model instance lets the
+    // overlay ride the prims it was drawn over instead of becoming a second, coincident surface. Every
+    // other capture path clears it: only the immediate repeat of one model is a glint pair.
+    private Model<?> lastModel;
+    private int lastModelPrimStart = -1;
+
+    private void clearGlintPair() {
+        lastModel = null;
+        lastModelPrimStart = -1;
+    }
     private final RtTextVertexConsumer textVertexConsumer = new RtTextVertexConsumer();
     private final TextGlyphVisitor textGlyphVisitor = new TextGlyphVisitor();
     private final RtCustomQuadVertexConsumer customQuadVertexConsumer = new RtCustomQuadVertexConsumer();
@@ -153,6 +167,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture != null) {
             this.outlineColor = 0;
             this.pendingOrder = 0;
+            clearGlintPair();
         }
     }
 
@@ -182,6 +197,13 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // and the explicitly ordered emblem layers become 2+. Otherwise the BVH can select white cloth.
         capture.currentOrder = pendingOrder + (isBannerPattern(renderType) ? 1 : 0);
         pendingOrder = 0;
+        TextureTransform glint = glintTransform(renderType);
+        if (glint != null) {
+            attachGlintOverlay(model, renderType, glint);
+            return;
+        }
+        lastModel = model;
+        lastModelPrimStart = capture.prim.size();
         if (profileDynamicEntity) {
             RtFrameStats.FRAME.count("entityModelSubmissions", 1);
         }
@@ -416,6 +438,64 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         return i > start ? Integer.parseInt(directives, start, i, 10) : 0;
     }
 
+    /**
+     * Vanilla's enchantment overlay, or null for every other submission. The overlay is not an animated
+     * texture: vanilla submits the same model a second time with the glint image and a texture matrix
+     * that scrolls a fixed 10-degree-rotated pattern across it, so geometry alone cannot reproduce it.
+     * The matrix is therefore the marker. The two transforms that are NOT the overlay are the default
+     * (no rewrite at all) and the energy swirl's translation used by the charged creeper's shell.
+     */
+    private static TextureTransform glintTransform(RenderType renderType) {
+        if (renderType == null) {
+            return null;
+        }
+        // RenderSetup is final, so the accessor cast goes through Object (the interface is mixed in at
+        // runtime), mirroring RtEntityTextures#textureLocation.
+        Object setup = ((RenderTypeAccessor) renderType).caustica$state();
+        TextureTransform transform = ((RenderSetupAccessor) setup).caustica$textureTransform();
+        if (transform == null || transform == TextureTransform.DEFAULT_TEXTURING
+                || transform instanceof TextureTransform.OffsetTextureTransform) {
+            return null;
+        }
+        return transform;
+    }
+
+    /**
+     * The uniform UV scale that transform applies (0.16 for armour, 0.5 for items, 8.0 for the block
+     * glint). The scroll varies per frame and is pushed once for the whole frame; the scale is the part
+     * that belongs to the render type, so it rides the prim's emission lane into the hit shader.
+     */
+    private static float glintScale(TextureTransform transform) {
+        return Math.abs(transform.createMatrix().getScale(new Vector3f()).x);
+    }
+
+    /**
+     * Attach vanilla's enchantment overlay to the prims of the submission it repeats, and contribute no
+     * geometry for the overlay itself. The equipment renderer draws the glint by submitting the same model
+     * a second time with the glint texture bound and a TextureTransform scrolling that image across it,
+     * blended additively (BlendFunction.GLINT) over the geometry it decorates. That duplicate submission
+     * cannot stand in the BVH as a surface: it occupies the armour's own depth, so it competes with it for
+     * the hit and reads as a black sheet wherever the pattern is dark. The repeated prims are flagged
+     * instead, carrying the overlay texture's bindless slot in aux1 and the transform's uniform UV scale
+     * in the emission lane (see world_common's ENTITY_PRIM_GLINT), so the hit shader resolves the additive
+     * term against the same model face vanilla drew it over.
+     */
+    private void attachGlintOverlay(Model<?> model, RenderType renderType, TextureTransform transform) {
+        if (model != lastModel || lastModelPrimStart < 0) {
+            return;
+        }
+        int slot = RtEntityTextures.INSTANCE.slotForEntity(renderType);
+        float scale = glintScale(transform);
+        int end = capture.prim.size();
+        for (int i = lastModelPrimStart; i + 11 < end; i += 12) {
+            int flags = Float.floatToRawIntBits(capture.prim.getFloat(i + 9));
+            capture.prim.set(i + 3, scale);
+            capture.prim.set(i + 9, Float.intBitsToFloat(flags | PRIM_FLAG_GLINT));
+            capture.prim.set(i + 11, Float.intBitsToFloat(slot));
+        }
+        clearGlintPair();
+    }
+
     /** Whether a render type is alpha-blended (translucent) — its pipeline's color target has a blend
      *  function. Cutout/solid have none. Drives stochastic entity transparency in world.rahit. */
     private static boolean isTranslucent(RenderType renderType) {
@@ -530,6 +610,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // Vanilla submits text with no overlay, so the sign/map text a block entity draws must not inherit
         // the hurt bits its model submission may have left in the flag word.
         capture.currentPrimFlags = 0;
+        clearGlintPair();
         Matrix4f pose = poseStack.last().pose();
         Font font = Minecraft.getInstance().font;
         textGlyphVisitor.pose = pose;
@@ -651,6 +732,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(TextureAtlas.LOCATION_BLOCKS);
         capture.currentEmission = 0f;
         capture.currentPrimFlags = 0;
+        clearGlintPair();
         capture.currentLayerTexSlot = 0;
         // The feature renderer mutates the pose it was handed, at draw time and long after this call.
         // Working on a copy keeps the caller's stack top intact for the shadow and name-tag submissions
@@ -716,6 +798,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         capture.currentAlphaBucket = RtAccel.ENTITY_BUCKET_OPAQUE;
         // Vanilla's leash vertex format carries no overlay: a hurt entity's leash must not tint with it.
         capture.currentPrimFlags = 0;
+        clearGlintPair();
         Matrix4f pose = poseStack.last().pose();
         // Same derivation as LeashFeatureRenderer.prepare: the ribbon's horizontal half-extent is the
         // curve's ground-plane perpendicular, and the attachment offset shifts the whole curve in the
@@ -795,6 +878,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // Vanilla's moving-block submission takes no overlay at all, so the falling block keeps its own
         // colour instead of whatever hurt bits the entity's model left in the flag word.
         capture.currentPrimFlags = 0;
+        clearGlintPair();
         // No local catch: failures propagate through the entity-capture handler like other entities.
         emitBlockModel(poseStack.last().pose(), model, state, state.blockPos, bs,
                 bs.getSeed(state.randomSeedPos), true);
@@ -856,6 +940,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             return;
         }
         capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
+        clearGlintPair();
         Matrix4f pose = poseStack.last().pose();
         for (BlockStateModelPart part : parts) {
             addQuads(pose, part.getQuads(null), tintLayers);
@@ -882,6 +967,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
         // The delegated overload assigns the same value again; doing it here too covers the mesh-only case.
         capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
+        clearGlintPair();
         if (!parts.isEmpty()) {
             submitBlockModel(poseStack, renderTypeByLayer.apply(ChunkSectionLayer.SOLID), parts, tintLayers,
                     lightCoords, overlayCoords, outlineColor);
@@ -899,6 +985,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             return;
         }
         capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
+        clearGlintPair();
         addQuads(poseStack.last().pose(), quads, tintLayers);
         addMeshQuads(poseStack, mesh, tintLayers, true);
     }
@@ -992,6 +1079,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             return;
         }
         capture.currentPrimFlags = RtEntityOverlay.encode(overlayCoords);
+        clearGlintPair();
         addQuads(poseStack.last().pose(), quads, tintLayers);
     }
 
@@ -1046,6 +1134,13 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         float unlitEmission = RtMaterialRegistry.defaultEmissionLuminanceCdM2()
                 * (RtUnlitPipelines.beaconBeam(submission) ? BEACON_BEAM_EMISSION_SCALE : 1f);
         capture.currentEmission = unlit ? unlitEmission : 0f;
+        // An overlay submission repeats a model submitModel captured; custom geometry has no such pair, so
+        // there is nothing to attach the overlay to and the duplicate surface is not captured at all. Any
+        // other custom geometry breaks a pending pair for the same reason.
+        clearGlintPair();
+        if (glintTransform(renderType) != null) {
+            return;
+        }
         capture.currentPrimFlags = (unlit ? PRIM_FLAG_UNLIT : 0) | (portalStack ? PRIM_FLAG_END_PORTAL : 0);
         capture.currentLayerTexSlot = portalStack ? layerSlot | (layerCount << 16) : 0;
 

@@ -36,12 +36,13 @@ abstract class GenerateRtBindings extends DefaultTask {
                     RESERVOIR_PREV: "reservoirPrev", RESERVOIR_CUR: "reservoirCur",
                     RESERVOIR_SAMPLE_PREV: "reservoirSamplePrev",
                     RESERVOIR_SAMPLE_CUR: "reservoirSampleCur", VOLUME_DEBUG: "volumeDebug",
+                    CLOUD_VOLUMES: "cloudVolumes",
                     ENTITY_ALBEDO: "entityAlbedoTex", MATERIAL_SURFACE0: "materialSurface0Tex",
                     MATERIAL_NORMAL_AO: "materialNormalAoTex", MATERIAL_SURFACE1: "materialSurface1Tex"]],
             [prefix: "DISPLAY", source: "pipelines/display/main.comp.slang", resources: [
                     OUTPUT: "outputImage", RT_IMAGE: "rtImage", EXPOSURE: "exposureImage", HDR_OUTPUT: "hdrImage",
                     SDR_TONE_LUT: "toneLut", HDR_TONE_LUT: "hdrToneLut", LOOK_LUT: "lookLut", BLOOM: "bloomImage",
-                    EXPOSURE_STATE: "exposureState"]],
+                    EXPOSURE_STATE: "exposureState", FLARE: "flareImage"]],
             [prefix: "SHARPEN", source: "pipelines/sharpen/main.comp.slang", resources: [
                     OUTPUT: "outputImage", HDR_OUTPUT: "hdrOutputImage",
                     SOURCE: "sourceImage", HDR_SOURCE: "hdrSourceImage"]],
@@ -56,6 +57,10 @@ abstract class GenerateRtBindings extends DefaultTask {
                     HIST_BINS: "histBins", IMAGE: "exposureImage", STATE: "stateBuf"]],
             [prefix: "BLOOM", source: "pipelines/bloom/main.comp.slang", resources: [
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
+            [prefix: "LENS_SOURCE", source: "pipelines/lens/source.comp.slang", resources: [
+                    OUTPUT: "hotImage", SOURCE: "rtImage", EXPOSURE: "exposureImage"]],
+            [prefix: "LENS_FLARE", source: "pipelines/lens/main.comp.slang", resources: [
+                    OUTPUT: "flareImage", HOT: "hotImage", GLOW: "glowImage"]],
             [prefix: "SKY_LUT", source: "pipelines/sky_lut/view.comp.slang", resources: [
                     TRANSMITTANCE_IMAGE: "transmittanceImage", MULTISCATTER_IMAGE: "multiScatterImage",
                     SKY_VIEW_IMAGE: "skyViewImage", SKY_IRRADIANCE_IMAGE: "skyIrradianceImage",

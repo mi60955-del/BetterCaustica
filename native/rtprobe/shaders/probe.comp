@@ -40,6 +40,10 @@ layout(std140, set = 0, binding = 1) uniform Frame {
     vec4 displayCounts;    // xy = displayW/H, z = emitter count
     vec4 sunDir;           // xyz = direction toward the sun, w = sky intensity
     vec4 sunColor;         // rgb = sun tint
+    // Glass stress mode (--glass). x = enabled, y = Fresnel F, z = roughness written to the
+    // guide (0.0025 replicates Caustica's interface roughness, the destination's value the
+    // alternative), w = multiplier on the transmitted (shadowed) scene radiance.
+    vec4 glass;
 } F;
 
 layout(rgba16f, set = 0, binding = 2) uniform writeonly image2D outColor;
@@ -49,6 +53,7 @@ layout(r32f,    set = 0, binding = 5) uniform writeonly image2D gDepth;
 layout(rg16f,   set = 0, binding = 6) uniform writeonly image2D gMotion;
 layout(rgba16f, set = 0, binding = 7) uniform writeonly image2D gSpecAlbedo;
 layout(rg16f,   set = 0, binding = 8) uniform writeonly image2D gSpecMotion;
+layout(r32f,    set = 0, binding = 16) uniform writeonly image2D gSpecHitDist; // world distance to the reflected hit (1e5 = miss)
 
 layout(std430, set = 0, binding = 9)  readonly buffer Positions  { float v[]; } positions;
 layout(std430, set = 0, binding = 10) readonly buffer Normals    { float v[]; } normals;
@@ -367,6 +372,7 @@ void main() {
     vec2 outMotion;
     vec4 outSpecAlbedo = vec4(0.0, 0.0, 0.0, 1.0);
     vec2 outSpecMotion = vec2(0.0);
+    float outSpecHitDist = 1.0e5;
     bool valid;
 
     if (!h.hit) {
@@ -407,6 +413,9 @@ void main() {
             vec3 specDir = reflect(rayDir, h.nrm);
             Hit hr = trace(h.pos + h.nrm * SURF_BIAS, specDir, RAY_TMAX);
             vec3 reflectedHit = hr.hit ? hr.pos : h.pos + specDir * 1.0e6;
+            // DLSSD specular hit distance: world-space length of the reflection ray to the reflected
+            // hit. A miss (sky) stays at the far sentinel.
+            outSpecHitDist = hr.hit ? hr.t : 1.0e5;
 
             if (h.rough <= MIRROR_ALPHA_MAX && hr.hit && !hr.emissive) {
                 vec3 reflectedDiffuse = hr.albedo * (1.0 - hr.metal);
@@ -423,6 +432,33 @@ void main() {
             vec3 prevSpecNdc = projectNdc(true, mirrored, vm);
             outSpecMotion = vm ? (prevSpecNdc.xy - jndc) * 0.5 * size : vec2(0.0);
         }
+
+        // Glass stress mode: the pixel is a camera-facing glass pane with a delta interface in
+        // front of the traced destination. The color is the transmitted destination (dimmed to
+        // represent a shadowed surface) plus the Fresnel mirror of the sky. The guides describe
+        // the destination, except roughness: F.glass.z selects the glass interface's roughness
+        // (Caustica's transmission guide) or the destination's (the alternative), and the
+        // specular channel carries the interface's Fresnel reflectance.
+        if (F.glass.x > 0.5) {
+            float Fg = F.glass.y;
+            vec3 mirrorDir = reflect(rayDir, -F.camFwd.xyz);
+            vec3 transmitted = color.rgb * F.glass.w;
+            vec3 reflected = skyRadiance(mirrorDir);
+            color = vec4(transmitted * (1.0 - Fg) + reflected * Fg, 1.0);
+            // F.glass.x == 2 selects the glass-plane normal in the guide; 1 keeps the
+            // destination's. The reflection's own normal is the pane's, the transmission's is
+            // the destination's -- RR can only be told one.
+            outNormal = vec4((F.glass.x > 1.5 && F.glass.x < 2.5) ? normalize(-F.camFwd.xyz) : h.nrm, F.glass.z);
+            outSpecAlbedo = F.glass.x > 2.5 ? vec4(0.0) : vec4(Fg, Fg, Fg, 1.0);
+            // The mirror image of a point at infinity along a fixed direction: reproject that
+            // point through both cameras. A static camera keeps this exactly zero.
+            vec3 glassCur = rayOrigin + mirrorDir * 1.0e5;
+            vec3 glassPrev = F.prevCamPos.xyz + mirrorDir * 1.0e5;
+            bool vc2, vp2;
+            vec3 cur2 = projectNdc(false, glassCur, vc2);
+            vec3 prev2 = projectNdc(true, glassPrev, vp2);
+            outSpecMotion = (vc2 && vp2) ? (prev2.xy - cur2.xy) * 0.5 * size : vec2(0.0);
+        }
     }
 
     imageStore(outColor, pix, color);
@@ -432,4 +468,5 @@ void main() {
     imageStore(gMotion, pix, vec4(outMotion, 0.0, 0.0));
     imageStore(gSpecAlbedo, pix, outSpecAlbedo);
     imageStore(gSpecMotion, pix, vec4(outSpecMotion, 0.0, 0.0));
+    imageStore(gSpecHitDist, pix, vec4(outSpecHitDist, 0.0, 0.0, 0.0));
 }

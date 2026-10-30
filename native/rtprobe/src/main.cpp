@@ -155,6 +155,12 @@ struct Options {
     float fovY = 45.0f;
     float nearPlane = 0.1f;
     float sunIntensity = 1.0f;
+    bool glass = false;
+    bool glassNormal = false;
+    bool glassNoSpec = false;
+    float glassF = 0.04f;
+    float glassRoughness = 0.0025f;
+    float glassDim = 0.03f;
 };
 
 void printUsage() {
@@ -178,6 +184,11 @@ void printUsage() {
         "  --list-gpus       list devices and exit\n"
         "  --validation      enable the Khronos validation layer\n"
         "  --exposure F      preview tonemap bias     [1.0]\n"
+        "  --glass           camera-facing glass-pane transmission-guide stress mode\n"
+        "  --glass-f F       Fresnel reflectance used in that mode          [0.04]\n"
+        "  --glass-rough R   roughness written to the guide (0.0025 = interface,\n"
+        "                    >0.1 = destination-style diffuse classification)  [0.0025]\n"
+        "  --glass-dim D     multiplier on the transmitted (shadowed) scene   [0.03]\n"
         "  --quiet           suppress the human-readable summary\n"
         "\n"
         "Set NGXSHIM_VERBOSE=1 in the environment to get the shim's own per-call logging and\n"
@@ -241,6 +252,18 @@ Options parseArgs(int argc, char** argv) {
             options.gpuIndex = std::stoi(next(i));
         } else if (arg == "--exposure") {
             options.exposure = std::stof(next(i));
+        } else if (arg == "--glass") {
+            options.glass = true;
+        } else if (arg == "--glass-nospec") {
+            options.glassNoSpec = true;
+        } else if (arg == "--glass-normal") {
+            options.glassNormal = true;
+        } else if (arg == "--glass-f") {
+            options.glassF = std::stof(next(i));
+        } else if (arg == "--glass-rough") {
+            options.glassRoughness = std::stof(next(i));
+        } else if (arg == "--glass-dim") {
+            options.glassDim = std::stof(next(i));
         } else if (arg == "--dump-guides") {
             options.dumpGuides = true;
         } else if (arg == "--no-rr") {
@@ -410,6 +433,7 @@ struct FrameUniforms {
     float displayCounts[4];
     float sunDir[4];
     float sunColor[4];
+    float glass[4];
 };
 
 // --------------------------------------------------------------------------------------
@@ -910,6 +934,13 @@ int main(int argc, char** argv) {
         // --- scene + acceleration structures --------------------------------------------
         Scene scene;
         buildScene(scene);
+        if (options.glass) {
+            // Thin board at the scene centre, only in the glass stress scene: a stand-in for a wall
+            // sign / partial block seen through the pane.
+            addQuad(scene, {-0.35f, 1.00f, 0.0f}, {0.35f, 1.00f, 0.0f},
+                    {0.35f, 1.50f, 0.0f}, {-0.35f, 1.50f, 0.0f}, {0.0f, 0.0f, 1.0f},
+                    {0.82f, 0.18f, 0.12f}, 0.65f, 0.0f);
+        }
         Accel accel;
         buildAcceleration(probe, scene, accel);
 
@@ -918,7 +949,7 @@ int main(int argc, char** argv) {
                                            | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
                                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         struct GuideSet {
-            Image color, normals, albedo, depth, motion, specAlbedo, specMotion, rr;
+            Image color, normals, albedo, depth, motion, specAlbedo, specMotion, specHitDist, rr;
             uint32_t renderWidth = 0, renderHeight = 0;
         };
         GuideSet guides;
@@ -933,11 +964,12 @@ int main(int argc, char** argv) {
             guides.motion = createImage(probe, renderWidth, renderHeight, VK_FORMAT_R16G16_SFLOAT, imageUsage);
             guides.specAlbedo = createImage(probe, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT, imageUsage);
             guides.specMotion = createImage(probe, renderWidth, renderHeight, VK_FORMAT_R16G16_SFLOAT, imageUsage);
+            guides.specHitDist = createImage(probe, renderWidth, renderHeight, VK_FORMAT_R32_SFLOAT, imageUsage);
             guides.rr = createImage(probe, options.displayWidth, options.displayHeight,
                                     VK_FORMAT_R16G16B16A16_SFLOAT, imageUsage);
             for (const Image* image : {&guides.color, &guides.normals, &guides.albedo, &guides.depth,
                                        &guides.motion, &guides.specAlbedo, &guides.specMotion,
-                                       &guides.rr}) {
+                                       &guides.specHitDist, &guides.rr}) {
                 transitionToGeneral(probe, *image);
             }
         };
@@ -977,7 +1009,7 @@ int main(int argc, char** argv) {
         createGuides(renderWidth, renderHeight);
 
         // --- descriptors -----------------------------------------------------------------
-        VkDescriptorSetLayoutBinding bindings[16]{};
+        VkDescriptorSetLayoutBinding bindings[17]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
         bindings[0].descriptorCount = 1;
@@ -998,7 +1030,11 @@ int main(int argc, char** argv) {
         }
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        layoutInfo.bindingCount = 16;
+        bindings[16].binding = 16;
+        bindings[16].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[16].descriptorCount = 1;
+        bindings[16].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        layoutInfo.bindingCount = 17;
         layoutInfo.pBindings = bindings;
         VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
         if (vkCreateDescriptorSetLayout(probe.device, &layoutInfo, nullptr, &descriptorLayout) != VK_SUCCESS) {
@@ -1008,7 +1044,7 @@ int main(int argc, char** argv) {
         VkDescriptorPoolSize poolSizes[4] = {
             {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},
         };
         VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1141,6 +1177,8 @@ int main(int argc, char** argv) {
                             guides.specAlbedo.format, VK_IMAGE_LAYOUT_GENERAL);
             writeDescriptor(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE, guides.specMotion.view,
                             guides.specMotion.format, VK_IMAGE_LAYOUT_GENERAL);
+            writeDescriptor(16, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_NULL_HANDLE, guides.specHitDist.view,
+                            guides.specHitDist.format, VK_IMAGE_LAYOUT_GENERAL);
         };
         bindGuideImages();
 
@@ -1182,7 +1220,7 @@ int main(int argc, char** argv) {
                     feature = nullptr;
                     for (Image* image : {&guides.color, &guides.normals, &guides.albedo, &guides.depth,
                                          &guides.motion, &guides.specAlbedo, &guides.specMotion,
-                                         &guides.rr}) {
+                                         &guides.specHitDist, &guides.rr}) {
                         destroyImage(probe, *image);
                     }
                     createGuides(queriedRenderWidth, queriedRenderHeight);
@@ -1304,6 +1342,12 @@ int main(int argc, char** argv) {
             uniforms.sunColor[1] = sunColour.y;
             uniforms.sunColor[2] = sunColour.z;
             uniforms.sunColor[3] = 0.0f;
+            uniforms.glass[0] = options.glass
+                    ? (options.glassNoSpec ? 3.0f : (options.glassNormal ? 2.0f : 1.0f))
+                    : 0.0f;
+            uniforms.glass[1] = options.glassF;
+            uniforms.glass[2] = options.glassRoughness;
+            uniforms.glass[3] = options.glassDim;
 
             std::memcpy(uniformBuffer.mapped, &uniforms, sizeof(uniforms));
             VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
@@ -1327,7 +1371,7 @@ int main(int argc, char** argv) {
                                                guides.specAlbedo.view, guides.specAlbedo.image, int(guides.specAlbedo.format),
                                                guides.normals.view, guides.normals.image, int(guides.normals.format),
                                                guides.specMotion.view, guides.specMotion.image, int(guides.specMotion.format),
-                                               0, 0, 0,
+                                               guides.specHitDist.view, guides.specHitDist.image, int(guides.specHitDist.format),
                                                guides.rr.view, guides.rr.image, int(guides.rr.format),
                                                renderWidthFinal, renderHeightFinal,
                                                options.displayWidth, options.displayHeight,
@@ -1669,7 +1713,8 @@ int main(int argc, char** argv) {
         destroyBuffer(probe, emitterRadBuffer);
 
         for (Image* image : {&guides.color, &guides.normals, &guides.albedo, &guides.depth,
-                             &guides.motion, &guides.specAlbedo, &guides.specMotion, &guides.rr}) {
+                             &guides.motion, &guides.specAlbedo, &guides.specMotion,
+                             &guides.specHitDist, &guides.rr}) {
             destroyImage(probe, *image);
         }
 

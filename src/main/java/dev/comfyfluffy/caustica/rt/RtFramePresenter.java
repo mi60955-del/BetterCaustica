@@ -103,11 +103,19 @@ public final class RtFramePresenter {
     }
 
     /**
-     * The configured frame-generation backend, as one of the {@link CausticaConfig.Rt.Fg} names.
+     * The backend this session runs. Read once because a vendor frame-generation object cannot be
+     * released or replaced safely while its own dispatches are still in flight — doing so loses the
+     * Vulkan device — so the setting is applied at the next launch, and the option screen marks it
+     * restart-only to match.
+     */
+    private static final String SESSION_BACKEND = CausticaConfig.Rt.Fg.BACKEND.get();
+
+    /**
+     * The frame-generation backend for this launch, as one of the {@link CausticaConfig.Rt.Fg} names.
      * The setting sanitises anything unrecognised to {@code dlss}, so this never has to.
      */
     public static String backend() {
-        return CausticaConfig.Rt.Fg.BACKEND.get();
+        return SESSION_BACKEND;
     }
 
     /**
@@ -145,6 +153,19 @@ public final class RtFramePresenter {
             case CausticaConfig.Rt.Fg.FSR -> RtFsrFg.INSTANCE.isAvailable();
             default -> RtDlssFg.INSTANCE.isAvailable();
         };
+    }
+
+    /**
+     * Drop a latched present-record failure so re-enabling frame generation, or a render-state
+     * invalidation (F3+A, a dimension change), gets another attempt. No-op while healthy, so those
+     * events never disturb a working present loop.
+     */
+    public void resetFailure() {
+        if (!failed) {
+            return;
+        }
+        failed = false;
+        CausticaMod.LOGGER.info("FG present failure latch cleared; retrying frame generation");
     }
 
     /**

@@ -103,6 +103,36 @@ public struct DisplayPush {
     // CIE mesopic response itself, and above 1 deepens the shift. See purkinjeGain() in the display
     // pass.
     public float purkinjeStrength;
+    // Master scale on the lens flare image. 0 skips the fetch entirely instead of multiplying it: the
+    // flare image is only written by the lens pass, so with the effect off its contents are whatever was
+    // last there (or uninitialised), and a multiply would not be enough to keep that out of the frame.
+    public float lensStrength;
+};
+
+// One dispatch of the lens chain, reduced from the full-resolution exposed image to the field of light
+// that overflows the lens. The threshold and the ceiling it applies are shader constants because they
+// describe the lens, not the look; only the box's size has to come from the host, because it is the one
+// part of the reduction expressed in display pixels.
+public struct LensSourcePush {
+    // 1 / display size in pixels. The box the pass averages is expressed in display pixels so its
+    // footprint does not change with the texture resolution.
+    public float2 displayTexel;
+};
+
+// The flare gather: diffraction spikes, the aperture ring, and the dust field, summed into one image.
+// The three gains are the authored strengths; the shape constants live in the shader and in
+// tools/lens_preview.py, which test_lens_preview.py keeps in step.
+public struct LensFlarePush {
+    public float starburst;     // gain on the spikes; 0 skips the gather
+    public float halo;          // gain on the aperture ring; 0 skips the gather
+    public float dirt;          // gain on the dust field; 0 skips the procedural field
+    public int spikes;          // spike count, also the rotational symmetry of the star
+    public int samples;         // taps per spike
+    public int haloTaps;        // taps around the ring, per colour channel
+    public float spikeLength;   // spike length as a fraction of the display height
+    public float haloRadius;    // ring radius as a fraction of the display height
+    public float dispersion;    // ring radius spread between channels, i.e. the chromatic fringe
+    public float dirtScale;     // grain frequency scale: above 1 makes the dust finer
 };
 
 public struct BloomPush {

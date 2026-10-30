@@ -89,6 +89,14 @@ public void mediumPush(inout MediumStack stack, Medium entered) {
     stack.current = entered;
 }
 
+// True when the path is travelling through something denser than air, i.e. a dielectric face reached now can
+// be a legitimate exit. A face that reads as an exit while the stack still carries air was never entered —
+// vanilla culls the entry quad, a bias step started past it, or the path began inside the cell — so there is
+// no crossing to refract through at all (see PAYLOAD_DIELECTRIC_THIN).
+public bool mediumInsideDenser(MediumStack stack) {
+    return stack.current.ior > 1.0 + 1e-3;
+}
+
 public void mediumPop(inout MediumStack stack) {
     stack.current = stack.outer;
     stack.outer = airMedium();

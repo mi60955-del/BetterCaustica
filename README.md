@@ -1,5 +1,7 @@
 # BetterCaustica
 
+English | [简体中文](README.zh_cn.md)
+
 BetterCaustica is a fork of [Caustica](https://github.com/ComfyFluffy/Caustica) by
 ComfyFluffy, an experimental ray-traced renderer for Minecraft 26.2's Vulkan
 backend. Caustica replaces the vanilla world view with hardware ray tracing and
@@ -15,13 +17,19 @@ changes while the renderer is being built.
 Maintained by island_i. On top of upstream Caustica:
 
 - Volumetric fog and clouds, with heterogeneous volume noise, weather-driven
-  cloud thickening and evolution phase, and volume quality presets
-- Water scattering inside the volumetric medium
+  cloud thickening, nine baked cloud shapes and volume quality presets
+- Sun shafts (clear-air god rays) independent of the volumetric fog, with
+  separate underwater beam controls (off by default to save frame time)
+- Sharpening and lens flare post effects
+- Parallax styles (sharp/smooth) and parallax self-shadow for LabPBR height maps
+- DLSS-RR transparency and guide fixes, entity texture fixes and the
+  hurt/spawn-flash overlay
 - AMD FidelityFX (FSR) frame generation as a backend that runs on any
   Vulkan 1.3 device, next to the NVIDIA-only DLSS frame generation
 - Fog and cloud debug views, with the matching Video Settings options
 - Simplified and Traditional Chinese option translations
 - Mod Menu and Sodium Config API entry points for the settings screen
+- An in-game ray-tracing toggle (F9 by default)
 
 The ray-tracing core, DLSS support and the ACES HDR pipeline are upstream's.
 
@@ -41,13 +49,17 @@ Upstream Caustica (this fork's builds are not published there):
 ## Features
 
 - Vulkan hardware path-traced world rendering
-- Volumetric fog, clouds and water scattering
-- DLSS Ray Reconstruction support
+- Volumetric fog, baked volumetric clouds and clear-air/underwater sun shafts
+- Post effects: sharpening, lens flare, bloom strength and AgX tone controls
+- DLSS Ray Reconstruction support, including transparent-layer and guide fixes
 - Frame Generation through DLSS (NVIDIA, experimental) or FSR (any Vulkan 1.3 device)
 - HDR output
-- Dynamic entity rendering in the ray-traced scene
+- Dynamic entity rendering with hurt/spawn overlays, enchantment glint and
+  recycled texture slots
+- Parallax height mapping with sharp/smooth styles and self-shadowing
 - LabPBR-style material support
 - OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
+- In-game ray-tracing toggle and Mod Menu / Sodium Config screens
 
 ## Requirements
 
@@ -63,8 +75,17 @@ Upstream Caustica (this fork's builds are not published there):
 1. Install Fabric Loader for Minecraft `26.2`.
 2. Install Fabric API.
 3. Download `bettercaustica-<version>.jar` from [Releases](https://github.com/mi60955-del/BetterCaustica/releases) and put it in your Minecraft `mods` folder.
-4. Launch the game with the Vulkan graphics backend.
-5. Open Video Settings to adjust the renderer options.
+4. **For FSR frame generation**, download the AMD FidelityFX SDK (FSR 3.1) and copy
+   `amd_fidelityfx_vk.dll` into `<game directory>/bettercaustica-ffx/natives/windows-x64/`
+   (create the folder if it does not exist). The mod extracts its bundled
+   `ffxshim.dll` beside it; if your jar was built without the FidelityFX natives,
+   copy `ffxshim.dll` there as well. Without both files the FSR backend stays
+   unavailable and DLSS frame generation is unaffected. A more convenient install
+   method is planned. You can also point `-Dcaustica.ffx.path` at a folder holding
+   both DLLs.
+5. Launch the game with the Vulkan graphics backend.
+6. Open Video Settings to adjust the renderer options, or press F9 to toggle ray
+   tracing in-game (rebindable under Controls → Caustica).
 
 BetterCaustica installs in place of upstream Caustica: the two jars share the
 `caustica` system-property namespace, so remove Caustica first.

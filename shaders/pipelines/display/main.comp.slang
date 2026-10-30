@@ -53,6 +53,17 @@ float3 sampleBloom(int2 outputPixel, uint outputWidth, uint outputHeight) {
     return bloomImage.SampleLevel(uv, 0.0).rgb;
 }
 
+// The lens chain's flare image, already summed from its three artifacts and scene-referred like the bloom.
+// Skipped entirely, not scaled by zero, when the effect is off: the image is only written while the lens
+// pass runs, so its contents are undefined whenever it has not.
+float3 sampleLensFlare(int2 outputPixel, uint outputWidth, uint outputHeight) {
+    if (pc.lensStrength <= 0.0) {
+        return float3(0.0);
+    }
+    float2 uv = (float2(outputPixel) + 0.5) / float2(outputWidth, outputHeight);
+    return max(flareImage.SampleLevel(uv, 0.0).rgb, float3(0.0)) * pc.lensStrength;
+}
+
 // Artistic gamma after the view/display transform. Apply the curve to display luminance and scale
 // RGB uniformly instead of exponentiating each channel: this lifts shadows/midtones without pulling
 // chromaticities toward white. The uniform scale is limited at the display boundary so saturated
@@ -287,6 +298,9 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     float exposure = max(exposureImage[int2(0, 0)], 0.0);
     float3 exposedAcesCg = max(rt.rgb * exposure, float3(0.0));
     exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
+    // Same place in the chain as the bloom: the flare is light the lens added to the scene, so it has to
+    // meet the tonemap together with the image it belongs to.
+    exposedAcesCg += sampleLensFlare(pix, w, h);
     // Before either display transform, so all three grading paths and the PQ image shift together.
     if (pc.purkinjeEnabled != 0) {
         exposedAcesCg = applyPurkinje(exposedAcesCg);

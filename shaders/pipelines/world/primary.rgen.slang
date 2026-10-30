@@ -51,7 +51,7 @@ void writeVolumeDebug(int2 pix, float3 ro, float3 rd, float t, bool allowShadowC
     float cloudDensity = 0.0;
     float cloudShadow = 1.0;
     if ((worldPush.flags & WORLD_FLAG_CLOUD) != 0u && worldPush.cloud0.x > 0.0) {
-        float tPlane = (worldPush.cloud0.y - ro.y) / rd.y;
+        float tPlane = (cloudBoxMid(worldPush) - ro.y) / rd.y;
         if (tPlane > 0.0) {
             cloudDensity = cloudCoverageWorld(ro.xz + rd.xz * tPlane);
         }
@@ -128,6 +128,15 @@ public PathSegment tracePrimary(PathSegment seg,
             float3 diffAlb = material == MATERIAL_PARTICLE
                     ? hitAlbedo : hitAlbedo * (1.0 - metal);
             if (bounce == 0) {
+#ifdef CAUSTICA_INTERFACE_DEBUG
+                // Opaque first hit: decision lane 0 marks "no interface here", and the other two lanes
+                // report the medium the segment was written with and the material kind. Reading these is
+                // what separates "the glass surface was misclassified" from "an opaque face is being
+                // shaded while the stack still carries a dense medium".
+                gv_dbgDecision = 0.0;
+                gv_dbgIor = clamp((medium.current.ior - 1.0) / 0.6, 0.0, 1.0);
+                gv_dbgMaterial = float(material) / 3.0;
+#endif
                 gv_normal = n;
                 gv_hitCamRel = hitPos - worldPush.camOffset;
                 gv_motionUseRefracted = false;
@@ -254,10 +263,25 @@ public PathSegment tracePrimary(PathSegment seg,
         Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0),
                                               payloadAlbedo(), transmission,
                                               worldPush.waterOpacity);
+        // A face that bounds no volume (see PAYLOAD_DIELECTRIC_THIN: a pane, a decorative translucent layer, a
+        // translucent model sheet) has the medium the ray arrived with on BOTH sides. Reading etaI from the stack and
+        // etaT from the stack's outer medium there describes a crossing the geometry does not have, and
+        // wherever the incoming direction is more than asin(1/ior) from the face normal that invented exit
+        // total-internal-reflects — the background lands on the sheet as a hard-edged disc. Such a face is a
+        // filter: Fresnel against its own index on the near side, bent once as an entry (which is the
+        // refraction a pane is seen to give), stack untouched, and its tint absorbed here because no medium
+        // will do it downstream.
+        bool thinDielectric = !isWater && (payload.flags & PAYLOAD_DIELECTRIC_THIN) != 0u;
+        // An exit needs an entry. When the face reads as an exit but the path still carries air, some culled
+        // or skipped quad means this crossing was never made, and deriving etaI/etaT anyway invents an
+        // interface that total-internal-reflects past the critical angle. Falls back to the same filter.
+        bool unmatchedExit = !entering && !mediumInsideDenser(medium);
+        thinDielectric = thinDielectric || (!isWater && unmatchedExit);
         float etaI = medium.current.ior;
-        float etaT = entering ? entered.ior : medium.outer.ior;
+        float etaT = thinDielectric || entering ? entered.ior : medium.outer.ior;
         float F = waterReflectance(fresnelDielectric(clamp(dot(-rd, n), 0.0, 1.0), etaI, etaT), isWater);
         float3 transmittedDir = refract(rd, n, etaI / etaT);
+        float3 thinTint = thinDielectric ? payloadAlbedo() : float3(1.0, 1.0, 1.0);
         float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
 
         if (bounce == 0) {
@@ -275,17 +299,31 @@ public PathSegment tracePrimary(PathSegment seg,
                                       isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
                                       gv_rough, float3(F, F, F));
             gv_specWaveMirror = waveNormal;
+#ifdef CAUSTICA_INTERFACE_DEBUG
+            // Quarter-scale decision codes so all four survive the ACEScg encode: 0.25 sheet filter,
+            // 0.5 entry, 0.75 exit, 1.0 total internal reflection.
+            gv_dbgDecision = dot(transmittedDir, transmittedDir) > 0.0
+                    ? (thinDielectric ? 0.25 : (entering ? 0.5 : 0.75)) : 1.0;
+            gv_dbgIor = clamp((medium.current.ior - 1.0) / 0.6, 0.0, 1.0);
+            gv_dbgMaterial = float(payload.flags & PAYLOAD_MATERIAL_MASK) / 3.0;
+#endif
             if (dot(transmittedDir, transmittedDir) > 0.0) {
                 MediumStack guideMedium = medium;
-                if (entering) {
-                    mediumPush(guideMedium, entered);
-                } else {
-                    mediumPop(guideMedium);
+                // A thin face leaves the stack exactly as it found it: it opens no medium to cross into.
+                if (!thinDielectric) {
+                    if (entering) {
+                        mediumPush(guideMedium, entered);
+                    } else {
+                        mediumPop(guideMedium);
+                    }
                 }
+                // A volume tints only on the way in, because the medium carries the absorption from there.
+                // A sheet has no medium behind it, so it absorbs on every crossing.
+                bool tintPath = !isWater && (thinDielectric || entering);
                 resolveTransmissionGuide(hitPos, transmittedDir, geometricNormal,
                         guideMedium, transmitBias, rayConeWidth, rayConeSpread,
-                        !isWater && entering
-                                ? payloadAlbedo() : float3(1.0, 1.0, 1.0));
+                        tintPath ? payloadAlbedo() : float3(1.0, 1.0, 1.0),
+                        clamp(payloadRoughness(), 0.0, 1.0));
             }
         }
 
@@ -295,15 +333,17 @@ public PathSegment tracePrimary(PathSegment seg,
                 && F > 0.0 && F < 1.0;
         if (splitEligible) {
             MediumStack transmittedMedium = medium;
-            if (entering) {
-                mediumPush(transmittedMedium, entered);
-            } else {
-                mediumPop(transmittedMedium);
+            if (!thinDielectric) {
+                if (entering) {
+                    mediumPush(transmittedMedium, entered);
+                } else {
+                    mediumPop(transmittedMedium);
+                }
             }
             float3 deferredDir = normalize(transmittedDir);
             PathSegment deferred = makePathSegment(
                     offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
-                    deferredDir, throughput * (1.0 - F), transmittedMedium,
+                    deferredDir, throughput * (1.0 - F) * thinTint, transmittedMedium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
                     true);
             queue[splitRecord] = packPathSegment(deferred, PATH_NO_NEXT);
@@ -328,14 +368,16 @@ public PathSegment tracePrimary(PathSegment seg,
                     true);
         } else {
             float3 deferredDir = normalize(transmittedDir);
-            if (entering) {
-                mediumPush(medium, entered);
-            } else {
-                mediumPop(medium);
+            if (!thinDielectric) {
+                if (entering) {
+                    mediumPush(medium, entered);
+                } else {
+                    mediumPop(medium);
+                }
             }
             continuation = makePathSegment(
                     offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
-                    deferredDir, throughput * (1.0 - F), medium,
+                    deferredDir, throughput * (1.0 - F) * thinTint, medium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
                     true);
         }

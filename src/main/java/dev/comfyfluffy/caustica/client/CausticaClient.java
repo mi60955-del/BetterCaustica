@@ -62,21 +62,18 @@ public final class CausticaClient implements ClientModInitializer {
 					// until we're in a world with the block atlas loaded, or once already created.
 					RtComposite.INSTANCE.ensureResourcesReady(ctx);
 					RtTerrain.update(ctx);
-					// Log each backend's availability once when frame generation is enabled (capability
-					// query only; the present-loop integration that consumes it is built separately). Only
-					// the selected backend is probed, because probing the other would load a vendor runtime
-					// that this session has no use for.
+					// Log the selected backend's availability once when frame generation is enabled
+					// (capability query only; the present-loop integration that consumes it is built
+					// separately). Only the selected backend is probed, because probing the other would
+					// load a vendor runtime that this session has no use for. The backend itself is read
+					// at startup: releasing a vendor feature while its dispatches are in flight loses the
+					// device, so a change to it is applied by a restart, not here.
 					if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
 						if (dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.selected()) {
 							dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.INSTANCE.probeAvailabilityOnce();
 						} else {
 							dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
 						}
-						// A backend switch in the settings leaves the previous backend's GPU state
-						// alive; release it here so the switch does not stack two contexts or
-						// features worth of device memory.
-						dev.comfyfluffy.caustica.rt.pipeline.RtFsrFg.INSTANCE.destroyUnlessSelected();
-						dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.destroyUnlessSelected();
 					}
 				}
 			}

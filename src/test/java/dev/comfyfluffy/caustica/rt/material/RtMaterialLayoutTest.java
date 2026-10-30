@@ -44,14 +44,13 @@ final class RtMaterialLayoutTest {
     void reflectedWorldPushConstantsIncludeLightBuffersFrameIndexAndMaterialScalars() {
         // 11 uint64_t addresses (world/table/material, 6 light buffers, path queue), frameIndex, and the
         // frame-constant scalars the material path reads: surface wetness, the parallax depth cap, the
-        // parallax layer budget, and the packed material switches. The first two consumed the four bytes
-        // that used to be trailing padding plus the four after it (96 -> 104); the last two fill the
-        // second half of what was still padding, so the block lands on its 8-byte alignment at 112.
+        // parallax layer budget, the packed material switches, and the parallax style. The last one took
+        // the trailing padding, so the block stays at 112 and still lands on its 8-byte alignment.
         assertEquals(112, WorldPushConstantsData.BYTE_SIZE);
         ByteBuffer data = ByteBuffer.allocateDirect(WorldPushConstantsData.BYTE_SIZE)
                 .order(ByteOrder.nativeOrder());
-        new WorldPushConstantsData(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L, 12, 0.25f, 0.5f, 13, 15)
-                .write(data);
+        new WorldPushConstantsData(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L, 12, 0.25f, 0.5f, 13, 15,
+                1).write(data);
         assertEquals(4L, data.getLong(24));  // materialTableAddr
         assertEquals(5L, data.getLong(32));  // lightBufAddr
         assertEquals(9L, data.getLong(64));  // lightGridSpanAddr (last of the grid addresses)
@@ -62,6 +61,7 @@ final class RtMaterialLayoutTest {
         assertEquals(0.5f, data.getFloat(96));  // parallaxDepth
         assertEquals(13, data.getInt(100));     // parallaxLayers
         assertEquals(15, data.getInt(104));     // materialToggles
+        assertEquals(1, data.getInt(108));      // parallaxStyle
     }
 
     /**
@@ -72,17 +72,7 @@ final class RtMaterialLayoutTest {
      */
     @Test
     void materialToggleBitsMatchTheShader() throws IOException {
-        Path shader = null;
-        for (String candidate : new String[]{
-                "shaders/pipelines/world/world_common.slang",
-                "../shaders/pipelines/world/world_common.slang"}) {
-            if (Files.isRegularFile(Path.of(candidate))) {
-                shader = Path.of(candidate);
-                break;
-            }
-        }
-        assertNotNull(shader, "world_common.slang not found from " + Path.of("").toAbsolutePath());
-        String source = Files.readString(shader);
+        String source = worldCommonSource();
         assertEquals(CausticaConfig.Rt.Materials.TOGGLE_TEXTURE_EMISSION,
                 shaderBit(source, "MATERIAL_TOGGLE_TEXTURE_EMISSION"));
         assertEquals(CausticaConfig.Rt.Materials.TOGGLE_BLOCK_EMISSION,
@@ -93,10 +83,44 @@ final class RtMaterialLayoutTest {
                 shaderBit(source, "MATERIAL_TOGGLE_POROSITY"));
         assertEquals(CausticaConfig.Rt.Materials.TOGGLE_ENTITY_PARALLAX,
                 shaderBit(source, "MATERIAL_TOGGLE_ENTITY_PARALLAX"));
+        assertEquals(CausticaConfig.Rt.Materials.TOGGLE_PARALLAX_SHADOW,
+                shaderBit(source, "MATERIAL_TOGGLE_PARALLAX_SHADOW"));
+    }
+
+    /**
+     * The two parallax styles are an enum the shader switches on (PARALLAX_STYLE_* in world_common.slang)
+     * and {@link CausticaConfig.Rt.Materials} mirrors when it writes pc.parallaxStyle. A value that drifted
+     * would silently select the other style rather than fail, so the shader source is the oracle here too.
+     */
+    @Test
+    void parallaxStyleValuesMatchTheShader() throws IOException {
+        String source = worldCommonSource();
+        assertEquals(CausticaConfig.Rt.Materials.PARALLAX_STYLE_SMOOTH,
+                shaderInt(source, "PARALLAX_STYLE_SMOOTH"));
+        assertEquals(CausticaConfig.Rt.Materials.PARALLAX_STYLE_SHARP,
+                shaderInt(source, "PARALLAX_STYLE_SHARP"));
+    }
+
+    private static String worldCommonSource() throws IOException {
+        for (String candidate : new String[]{
+                "shaders/pipelines/world/world_common.slang",
+                "../shaders/pipelines/world/world_common.slang"}) {
+            if (Files.isRegularFile(Path.of(candidate))) {
+                return Files.readString(Path.of(candidate));
+            }
+        }
+        assertNotNull(null, "world_common.slang not found from " + Path.of("").toAbsolutePath());
+        throw new IllegalStateException();
     }
 
     private static int shaderBit(String source, String name) {
         Matcher matcher = Pattern.compile(name + "\\s*=\\s*(\\d+)u").matcher(source);
+        assertTrue(matcher.find(), name + " is not defined in world_common.slang");
+        return Integer.parseInt(matcher.group(1));
+    }
+
+    private static int shaderInt(String source, String name) {
+        Matcher matcher = Pattern.compile(name + "\\s*=\\s*(-?\\d+)").matcher(source);
         assertTrue(matcher.find(), name + " is not defined in world_common.slang");
         return Integer.parseInt(matcher.group(1));
     }

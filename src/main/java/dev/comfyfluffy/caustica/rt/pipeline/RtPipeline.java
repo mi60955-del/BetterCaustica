@@ -204,6 +204,14 @@ public final class RtPipeline {
             binds.get(WORLD_VOLUME_DEBUG).binding(WORLD_VOLUME_DEBUG)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+            // The baked cloud-volume atlas: sampled by the miss shader (the sky's cloud tiers) and
+            // by the raygen (the NEE shadow probes, the fog sun legs, the debug views). Without this
+            // entry the layout's binding 19 is an empty slot the shaders still statically reference —
+            // the same undefined-descriptor device fault binding 17's entry documents above.
+            binds.get(WORLD_CLOUD_VOLUMES).binding(WORLD_CLOUD_VOLUMES)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout");
@@ -534,6 +542,12 @@ public final class RtPipeline {
      */
     public void setEndSkyTexture(long imageView, long sampler) {
         writeAtlasBinding(WORLD_END_SKY_TEX, imageView, sampler);
+    }
+
+
+    /** Bind the baked cloud-volume atlas (all cloud shapes, one 2D-array image) for volume.slang. */
+    public void setCloudVolumeAtlas(long imageView, long sampler) {
+        writeAtlasBinding(WORLD_CLOUD_VOLUMES, imageView, sampler);
     }
 
     /** Bind this frame's atmosphere LUTs (see {@link RtSkyLut}); both share the LUT's own sampler. */

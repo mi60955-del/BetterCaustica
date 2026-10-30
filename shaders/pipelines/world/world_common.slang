@@ -13,9 +13,10 @@ public typealias DevicePtr<T> = Ptr<T, Access.ReadWrite, AddressSpace.Device, St
 // Push constant block. The hot inline lanes avoid dereferencing WorldPush for values that are read in
 // hit shaders or used for raygen control flow — every 64-bit device address lives here for exactly that
 // reason, rather than behind the worldPushAddr indirection. tableAddr/entityTableAddr/materialTableAddr
-// are read in world.rahit/world.rchit, which never load WorldPush at all; the light-buffer addresses are
-// only read in world.rgen, which loads WorldPush anyway, but keeping every Addr in one place means there
-// is exactly one struct to check when adding a new device buffer, instead of two.
+// are read in world.rahit/world.rchit, which load WorldPush only for the breaking overlay and the
+// height-field self-shadow; the light-buffer addresses are only read in world.rgen, which loads WorldPush
+// anyway, but keeping every Addr in one place means there is exactly one struct to check when adding a new
+// device buffer, instead of two.
 public struct WorldPushConstants {
     public uint64_t worldPushAddr;
     public uint64_t tableAddr;
@@ -47,9 +48,13 @@ public struct WorldPushConstants {
     // loop bound only has to be at least this large.
     public int parallaxLayers;
     // Material feature switches (bits below), read from the push constant for the same reason wetness is:
-    // the closest-hit shader evaluates materials without ever dereferencing WorldPush. Every bit is set by
-    // default, so a default frame is identical to one rendered before the switches existed.
+    // the closest-hit shader evaluates materials without dereferencing WorldPush for them. Every bit is set
+    // by default, so a default frame is identical to one rendered before the switches existed.
     public uint materialToggles;
+    // Parallax style, PARALLAX_STYLE_*. A style is a choice rather than a switch, so it rides its own lane
+    // instead of a materialToggles bit: the switches answer "is this feature on" and this answers "which
+    // one", and a frame of either style draws the same set of features.
+    public int parallaxStyle;
 };
 
 // materialToggles bits. Each one gates a material feature the renderer would otherwise apply whenever the
@@ -59,6 +64,14 @@ public static const uint MATERIAL_TOGGLE_BLOCK_EMISSION = 2u;    // block-state 
 public static const uint MATERIAL_TOGGLE_SUBSURFACE = 4u;        // labPBR subsurface scattering
 public static const uint MATERIAL_TOGGLE_POROSITY = 8u;          // labPBR porosity, which gates wetness absorption
 public static const uint MATERIAL_TOGGLE_ENTITY_PARALLAX = 16u;
+// Height-field self-shadow: the relief a height-mapped surface exposes also blocks the sun across it.
+public static const uint MATERIAL_TOGGLE_PARALLAX_SHADOW = 32u;
+
+// parallaxStyle values (pc.parallaxStyle). Sharp snaps a displaced texel onto the shading grid and
+// orients the band it uncovers as a wall, so authored hard edges read as cut geometry. Smooth leaves the
+// offset continuous and reads the field a mip coarser, so the same relief reads as a rounded bevel.
+public static const int PARALLAX_STYLE_SMOOTH = 0;
+public static const int PARALLAX_STYLE_SHARP = 1;
 
 // worldPush.flags volumetric bits (Java mirrors them in RtComposite). Every bit is clear by default, so a
 // frame rendered before the volumetrics existed is bit-identical to one after: the flags gate every
@@ -200,20 +213,19 @@ public struct WorldPush {
     public float4   fogColor;
     // x coverage, y cloud base (rebased blocks), z layer thickness (block), w density multiplier.
     public float4   cloud0;
-    // x the vertical profile mix 0..1 the volumetric tier's density uses (0 = a flat stratus board,
-    // 1 = a rounded cumulus billow; both normalised to the same column depth), y wind azimuth (rad; the
-    // streak frame's direction — the drift itself is accumulated Java-side into cloud2.zw), z the
-    // localized-coverage (patchiness) strength the field's macro gate reads, w the planar sheet's fade
-    // distance (blocks; sheet-only — the shadow field never dissolves).
+    // x the cloud shape index — which baked volume (RtCloudVolumes order) every instance of the
+    // layer renders; y wind azimuth (rad; the instance grid's drift direction — the drift itself is
+    // accumulated Java-side into cloud2.zw), z the per-instance scale/occupancy jitter strength, w
+    // the sheet's fade distance (blocks; sheet-only — the shadow field never dissolves).
     public float4   cloud1;
     // xy the EXACT terrain origin in world blocks (fp32; the streak lattice is not
     // periodic, so unlike the wave domain's mod-4096 anchor this one must not wrap), zw the
     // Java-accumulated cloud wind drift per axis (unwrapped; the accumulator is a double and only
     // sheds sub-block precision past millions of blocks of drift).
     public float4   cloud2;
-    // x the field's evolution phase (Java-accumulated, no wrap: the noise lattices it offsets are not
-    // periodic, and at the rate it advances fp32 keeps sub-cell precision for days of continuous play),
-    // yz unused, w ambient-term weight.
+    // x the cloud footprint in blocks (the Cloud Size dial; the instance grid spaces by it), y the
+    // atlas's LAST shape index — the clamp for the shader's per-instance shape variety (0 while clouds
+    // are off), z unused, w the deck's ambient-term weight.
     public float4   cloudColor;
     // x rain level 0..1, y thunder level 0..1, z spray strength, w the previous frame's rain level
     // (temporal-stability work interpolates toward it rather than jumping on a weather change).
@@ -241,7 +253,24 @@ public struct WorldPush {
     // has no way to separate the two. This is its own medium, with its own density, lit by the same
     // shaft integrator; yzw are reserved (the phase anisotropy is the water body's, read from Medium).
     public float4   waterShaft;
+    // ---- Enchantment overlay (the "glint" on enchanted equipment). Vanilla does not animate the glint
+    // texture: it scrolls a fixed pattern over the geometry with a texture matrix, so the frame's
+    // translation of that matrix is the whole animation and it is pushed here instead of being
+    // re-derived from a clock (xy). z is the Glint Strength option the fade scales by, and w converts
+    // that display-referred colour into absolute radiance (the same emitter baseline ENTITY_PRIM_UNLIT
+    // anchors on), because the path tracer accumulates radiance while vanilla adds to the framebuffer.
+    public float4   glintParams;
 };
+
+// Direction toward a celestial body sitting `angleRad` along its arc, tilted by the dimension's noon tilt.
+// Every consumer derives the sun and the moon from the same two WorldPush lanes through this one formula:
+// the LUT bakes, the miss shader that draws them, and a hit shader casting a height-field shadow along
+// one of them. Here rather than in sky.slang because the closest-hit shader evaluates materials without
+// importing the atmosphere.
+public float3 celestialDirection(float angleRad, float noonTiltRad) {
+    float peak = cos(angleRad);
+    return float3(-sin(angleRad), cos(noonTiltRad) * peak, sin(noonTiltRad) * peak);
+}
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
 // grid-relative owner section uses three unsigned 10-bit coordinates; the geometric normal is
@@ -286,6 +315,10 @@ public struct LightGridSpan {
 
 // TerrainPrim.flags bit 0: this emissive quad is in the light buffer (RtLightCollector membership).
 public static const uint TERRAIN_PRIM_IN_LIGHT_BUFFER = 1u;
+// TerrainPrim.flags bit 1: this dielectric quad belongs to a translucent block too thin to hold a medium
+// (a pane, a decorative layer), so the face never bounds a volume — see PAYLOAD_DIELECTRIC_THIN. Set by
+// RtTerrainMesher, which is the only place that knows the block's shape.
+public static const uint TERRAIN_PRIM_THIN_DIELECTRIC = 2u;
 
 // Largest finite half. Producers of fp16 HDR storage clamp to this instead of letting the conversion
 // round up to +inf and propagate as NaN — world.rgen's rgba16f outImage store most of all, which is the
@@ -326,6 +359,7 @@ public struct Payload {
     public uint   emissionSss; // packHalf2x16(emission, sss)
     public uint   iorTransmission; // packHalf2x16(IOR, transmission factor)
     public uint   rayCone;     // packHalf2x16(width, spread)
+    public half3  overlay;     // additive enchantment-glint radiance this surface carries, else zero
 };
 
 public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
@@ -342,12 +376,25 @@ public static const uint PAYLOAD_UNLIT = 256u;
 // meaningful on a miss and this bit only on a hit, so they never need to be read together, but they get
 // distinct bits anyway to keep the two concerns unambiguous.
 public static const uint PAYLOAD_DIELECTRIC_ENTERING = 8u;
+// Set on a dielectric hit whose face does not bound a volume: a glass pane, a decorative translucent layer,
+// or a translucent model sheet. Both sides of such a face are the same medium, so there is no crossing to
+// derive an eta pair from. Deriving one anyway (as if the face were an exit) compares the incoming direction
+// against the critical angle of a crossing the geometry never has, and wherever that direction is more than
+// asin(1/ior) from the face normal the invented interface total-internal-reflects: the background is painted
+// onto the face inside a hard-edged disc whose angular radius is exactly that critical angle. A thin face is
+// a filter instead — Fresnel from the medium the ray is already in, straight through, stack untouched, tint
+// absorbed at the crossing (see primary.rgen's dielectric interface).
+public static const uint PAYLOAD_DIELECTRIC_THIN = 1024u;
 // Set on a trace whose ONLY consumer is the guide buffers (Pass A's primary trace and every guide
 // probe). Alpha coverage then has to resolve deterministically: the diffuse-albedo guide is what
 // DLSS-RR demodulates against, and a coverage that flips per pixel per frame is a demodulation signal
 // no accumulation can hold, so the sheet's noise survives as a smear instead of averaging to its mean.
 // The radiance pass leaves this clear and keeps the dither, which integrates the same composite.
 public static const uint PAYLOAD_GUIDE_STABLE = 512u;
+// Set by world.rchit on a hit whose prim carries ENTITY_PRIM_GLINT. Vanilla composites the enchantment
+// glint as an additive pass over exactly this surface, so the overlay's radiance rides the payload's
+// overlay lane and the raygen adds it once alongside this hit's shading.
+public static const uint PAYLOAD_GLINT_OVERLAY = 2048u;
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;
@@ -368,12 +415,14 @@ public static const uint MATERIAL_DIELECTRIC = 3u;
 
 // Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
-    public float4 normal; // xyz = geometric normal, w = per-primitive emission strength
+    // w is the per-primitive emission strength, except on an ENTITY_PRIM_GLINT prim where the submission
+    // emitted no geometry of its own and the lane carries the overlay's uniform UV scale instead.
+    public float4 normal;
     public float4 tint;
     public uint materialId;
     public uint flags;
     public uint aux0; // asfloat() = the submission's vertex alpha; vanilla puts some transparency there
-    public uint aux1;
+    public uint aux1; // end-portal layer slot/count, or the glint overlay's texture slot
 };
 
 // The submission came from a vanilla pipeline with no lighting term, so its colour is already final and
@@ -386,6 +435,15 @@ public static const uint ENTITY_PRIM_UNLIT = 1u;
 // shading one image. The prim's aux1 lane carries the layer texture's bindless slot in its low 16 bits
 // and the layer count in the high 16.
 public static const uint ENTITY_PRIM_END_PORTAL = 2u;
+
+// Vanilla draws the enchantment "glint" by submitting the same model a SECOND time, with the glint
+// texture bound and a TextureTransform scrolling that image over the geometry, and blends it additively
+// (BlendFunction.GLINT: src*src + dst). Captured as geometry that second submission is an opaque sheet
+// competing with the armour for the same depth, which reads as black patches where the pattern is dark.
+// The capture therefore drops the duplicate submission and flags the prims it repeated instead: the prim
+// carries the overlay texture's bindless slot in aux1 and the transform's uniform UV scale in normal.w,
+// and the hit shader resolves the additive term against the surface vanilla drew it over.
+public static const uint ENTITY_PRIM_GLINT = 128u;
 
 // The submission carries vanilla's hurt / spawn-flash overlay (the OverlayTexture texel vanilla passes
 // every entity submission as UV1): bits 2..5 are the texel column and bit 6 selects the hurt row.

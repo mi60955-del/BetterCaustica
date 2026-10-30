@@ -57,6 +57,7 @@ public Payload makeRadiancePayload(uint flags, uint rayCone) {
     p.emissionSss = 0u;
     p.iorTransmission = 0u;
     p.rayCone = rayCone;
+    p.overlay = half3(0.0h, 0.0h, 0.0h);
     return p;
 }
 
@@ -103,6 +104,7 @@ public Payload makeShadowPayload() {
     shadowPayload.emissionSss = 0u;
     shadowPayload.iorTransmission = 0u;
     shadowPayload.rayCone = 0u;
+    shadowPayload.overlay = half3(0.0h, 0.0h, 0.0h);
     return shadowPayload;
 }
 
