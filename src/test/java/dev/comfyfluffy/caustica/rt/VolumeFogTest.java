@@ -32,6 +32,8 @@ final class VolumeFogTest {
     private static final Path VOLUME = Path.of("shaders/pipelines/world/volume.slang");
     private static final Path COMPOSITE =
             Path.of("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java");
+    private static final Path PIPELINE =
+            Path.of("src/main/java/dev/comfyfluffy/caustica/rt/pipeline/RtPipeline.java");
     private static final Path CONFIG =
             Path.of("src/main/java/dev/comfyfluffy/caustica/CausticaConfig.java");
     private static final Path SETTINGS =
@@ -208,6 +210,251 @@ final class VolumeFogTest {
     }
 
     /**
+     * The border haze is one flat addition to the fog's extinction, so everything the closed forms stand on
+     * has to survive it: the identity integral[T(s)·sigma_t(s) ds] = 1 - T(t) holds over the SUM as long as
+     * the albedo stays the same ratio for both terms, and a frame with no height fog at all has to degenerate
+     * to plain Beer–Lambert over the segment rather than to nothing.
+     */
+    @Test
+    void boundaryHazeJoinsTheFogMediumWithoutBreakingTheClosedForm() {
+        float sigmaB = 0.015f;
+        float baseY = 62f;
+        float heightH = 24f;
+        int steps = 200_000;
+        // Fog plus haze, thin fog with haze, and haze alone — the last one is the frame a player gets by
+        // switching on Boundary Fog and leaving Volumetric Fog off.
+        float[] sigmas = {0.05f, 0.02f, 0.0f};
+        float[] originsY = {baseY + 30f, baseY, baseY - 15f};
+        float[] dirY = {0.5f, 1.0e-7f, -0.5f};
+        float[] distances = {5f, 80f, 1200f};
+        for (float sigma0 : sigmas) {
+            for (float y0 : originsY) {
+                for (float dy : dirY) {
+                    for (float t : distances) {
+                        double h = (double) t / steps;
+                        double tau = 0.0;
+                        double weighted = 0.0;
+                        for (int i = 0; i < steps; i++) {
+                            double s = (i + 0.5) * h;
+                            double sigma = fogDensity(sigma0, baseY, heightH, (float) (y0 + dy * s))
+                                    + sigmaB;
+                            tau += sigma * h;
+                            weighted += Math.exp(-tau) * sigma * h;
+                        }
+                        // volume.slang's airOpticalDepth: the height profile's closed form plus sigmaB * t.
+                        float closed = fogOpticalDepth(sigma0, baseY, heightH, y0, dy, t) + sigmaB * t;
+                        assertClose("air optical depth sigma0=" + sigma0 + " y0=" + y0 + " dy=" + dy
+                                + " t=" + t, tau, closed, 1.0e-5);
+                        assertClose("in-scatter identity sigma0=" + sigma0 + " y0=" + y0 + " dy=" + dy
+                                + " t=" + t, weighted, 1.0 - Math.exp(-tau), 1.0e-3);
+                    }
+                }
+            }
+        }
+        // With no height fog in the profile, the flat lane is the whole medium and prices the segment exactly.
+        assertEquals(sigmaB * 40f, fogOpticalDepth(0.0f, baseY, heightH, baseY + 12f, 0.3f, 40f)
+                + sigmaB * 40f, 0.0f);
+        // A segment that starts 300 blocks above the fog base has effectively no height fog left in it —
+        // the exponential is down at 1e-5 of its base — while the haze is flat and prices the whole stretch.
+        // This is the property the marched tier's span clamp has to stand down for.
+        float high = baseY + 300f;
+        float hazeOnly = sigmaB * 200f;
+        float profileAtHeight = fogOpticalDepth(0.02f, baseY, heightH, high, 0.0f, 200f);
+        assertTrue(profileAtHeight < 1.0e-4f * hazeOnly,
+                "the height profile must be negligible up there, or the comparison below proves nothing");
+        assertEquals(hazeOnly, profileAtHeight + hazeOnly, 1.0e-4f * hazeOnly);
+    }
+
+    /**
+     * The wiring the border haze needs to be a fog rather than a second layer: it joins the density the
+     * segments integrate, on both tiers, and it raises the fog's own flag so every consumer that asks
+     * "is there air on this segment" sees it. The leg toward the sun is the one place it must NOT appear:
+     * a medium with no falloff has infinite optical depth that way, so including it would delete the sun
+     * term, and with it every light shaft, at haze levels too thin to see on the view ray.
+     */
+    @Test
+    void boundaryHazeJoinsTheFogMediumInSource() throws IOException {
+        String volume = Files.readString(VOLUME);
+        String worldCommon = Files.readString(WORLD_COMMON);
+        String composite = Files.readString(COMPOSITE);
+        String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
+
+        assertTrue(worldCommon.contains("public float4   boundaryFog;"),
+                "WorldPush must carry the border haze's lane");
+        assertTrue(volume.contains("return push.boundaryFog.x;"),
+                "the shader must read the haze straight off the pushed lane, with no second gate");
+        assertTrue(volume.contains("+ boundarySigma(worldPush) * t"),
+                "the closed form must price the flat term over the segment it is integrating");
+        assertTrue(volume.contains("sigmaT += boundarySigma(push);"),
+                "sampleVolume must hand consumers the same medium the segments integrate");
+        assertTrue(volume.contains("float sigma = fogMarchDensity(worldPush, p) + sigmaB;"),
+                "the marched tier must add the haze after its own noise modulation, so the billows "
+                        + "never scale the flat term");
+        assertTrue(volume.contains("if (sigma0 + sigmaB <= 0.0 || dot(albedo"),
+                "both tiers must run for a frame that carries only the haze, where the height profile "
+                        + "is empty");
+        assertTrue(volume.contains("float yTop = sigmaB > 0.0 ? 1.0e30"),
+                "the marched span clamp must stand down for a flat medium: it trims the stretch above "
+                        + "the fog's significant band, and a flat term has no such band to stop at");
+        assertTrue(volume.contains("float sigma = sigma0;"),
+                "the sun legs must keep the height fog's own sigma — the flat term is left out on purpose");
+        assertTrue(volume.contains("return fogTransmittance(sigma, worldPush.fog0.z, worldPush.fog0.y,"),
+                "fogT_toSunRo must stay on the height profile alone, not the combined air depth");
+        // The flag the haze rides, and where it is raised.
+        assertTrue(composite.contains("boolean boundaryOn = CausticaConfig.Rt.Volume"
+                        + ".BOUNDARY_FOG_ENABLED.value() && skyLit;"),
+                "the haze must share the fog's sky-light gate: its ambient term reads the sky basis, "
+                        + "which is only baked where the sky lights the world");
+        assertTrue(composite.contains("if (fogOn || boundaryOn) {"),
+                "the fog flag must be up for either air medium, because every air read gates on that one "
+                        + "bit; the edge fade deliberately does not raise it, since it is not a medium");
+        assertTrue(composite.contains("new Float4(boundarySigma, 0f, 0f, 0f)"),
+                "the frame must push the haze it computed, and nothing else in its lane");
+        assertTrue(composite.contains("level.getWorldBorder().getDistanceToBorder(camX, camZ)"),
+                "the ramp is measured from the camera to the border the server sent, in world blocks");
+        // The guide blend prices the same air and the same dissolve the ray does, or the reconstruct reads
+        // the fog's dither as material detail on the surface behind it.
+        assertTrue(primary.contains("float awayFromSurface = 1.0 - airT * (1.0 - coverage);"),
+                "the fog-dominated guide blend must combine the air transmittance with the edge fade's "
+                        + "coverage, or a dissolving pixel keeps the surface's albedo guide");
+    }
+
+    /**
+     * The fade's coverage is a blend weight, so its shape is the whole feature: exactly zero at the start
+     * distance, exactly the opacity dial at the edge, monotone in between. A shell of density had a step at
+     * the start — the inner wall that read as a ball of fog around the camera — and a smoothstep cannot.
+     */
+    @Test
+    void edgeFadeCoverageRampsSmoothlyToTheOpacityDial() {
+        for (float opacity : new float[] {0.25f, 0.5f, 0.9f, 1.0f}) {
+            for (float startFraction : new float[] {0.0f, 0.5f, 0.95f}) {
+                double start = 192.0 * startFraction;
+                double edge = Math.max(192.0, start + 1.0);
+                assertEquals(0.0, coverage(start, opacity, start, edge), 0.0,
+                        "the fade must not begin before its start distance");
+                assertEquals(0.0, coverage(start - 64.0, opacity, start, edge), 0.0,
+                        "nothing in front of the band may be faded at all");
+                assertEquals(opacity, coverage(edge, opacity, start, edge), 1.0e-6,
+                        "the edge must dissolve exactly as much of the surface as the dial asks");
+                assertEquals(opacity, coverage(edge * 4.0, opacity, start, edge), 1.0e-6,
+                        "past the edge the coverage saturates: it is a blend, not an integral");
+                float previous = -1.0f;
+                for (double d = start - 8.0; d <= edge + 8.0; d += 2.0) {
+                    float c = coverage(d, opacity, start, edge);
+                    assertTrue(c >= previous, "coverage must never fall with distance at d=" + d);
+                    previous = c;
+                }
+            }
+        }
+        // The off switch: a zero lane fades nothing, whatever the two distances say.
+        assertEquals(0.0, coverage(1024.0, 0.0f, 96.0, 192.0), 0.0);
+    }
+
+    /** Java port of volume.slang's edgeFadeCoverage, with the pushed lanes passed in. */
+    private static float coverage(double distance, float peak, double begin, double edge) {
+        if (peak <= 0.0) {
+            return 0.0f;
+        }
+        double t = Math.max(0.0, Math.min(1.0, (distance - begin) / (edge - begin)));
+        return (float) (peak * t * t * (3.0 - 2.0 * t)); // smoothstep
+    }
+
+    /**
+     * The fade is a blend of the finished segment toward the sky, not a medium. Nothing about it may reach
+     * the air's optical depth: an extinction lane makes it a veil that lights the view up instead of taking
+     * the terrain away, which is the failure the coverage weighting exists to rule out. And it has to be a
+     * function of the EYE, so it reaches the segment integrators and nothing that asks a point what the air
+     * is worth there — a point query has no view ray to measure a coverage from.
+     */
+    @Test
+    void edgeFadeIsABlendAndNotAMedium() throws IOException {
+        String volume = Files.readString(VOLUME);
+        String worldCommon = Files.readString(WORLD_COMMON);
+        String composite = Files.readString(COMPOSITE);
+        String indirect = Files.readString(Path.of("shaders/pipelines/world/indirect.rgen.slang"));
+        String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
+
+        assertTrue(worldCommon.contains("public float4   edgeFade;"),
+                "WorldPush must carry the fade's lanes");
+        assertTrue(worldCommon.contains("public static const uint WORLD_FLAG_EDGE_FADE = 1u << 16u;"),
+                "the fade needs its own flag: riding the fog's would tie a blend of the finished pixel to "
+                        + "whether the air is being integrated at all");
+        assertTrue(volume.contains("float3 eyeRelative = ro + rd * t - worldPush.camOffset;"),
+                "the coverage must be measured from the EYE. The trace runs in the terrain's rebased "
+                        + "space, where the eye sits at camOffset — reading the hit point's own length "
+                        + "measures distance from the terrain origin, which follows the player's "
+                        + "coordinates instead of the view");
+        assertTrue(volume.contains("return peak * smoothstep(begin, edge, length(eyeRelative));"),
+                "the coverage must be a smooth function of that eye distance — a flat density inside a "
+                        + "radius is a ball of fog with a visible inner wall");
+        assertTrue(volume.contains("public float3 edgeFadeSky(float3 rd)"),
+                "the fade needs the sky behind the ray: that is what it dissolves the surface into");
+        assertTrue(volume.contains("return fogSkyRadiance(rd);"),
+                "the fill must ride the fog's own sky lookup, so a segment the fade has fully dissolved and "
+                        + "a segment fog has made fully opaque land on the colour the miss shader would have "
+                        + "returned for the ray — never on a second, differently-priced sky");
+        assertTrue(volume.contains("skyDiffuseRadiance(skyViewLut, float3(rd.x, abs(rd.y), rd.z), state)"),
+                "fogSkyRadiance must mirror the ray's elevation: the view LUT's lower half is the space "
+                        + "floor, and terrain dissolving past the edge is haze, not space");
+        // Every piece of the old shell must be gone. One that survived in the fog's depth would keep
+        // lighting what the fade removes, and would keep attenuating the sun legs.
+        for (String gone : new String[]{"farOpticalDepth", "farSigmaOver", "farDensityAt",
+                "FAR_ESCAPE_T", "distanceHaze"}) {
+            assertTrue(!volume.contains(gone),
+                    gone + " belonged to the render-edge shell; the fade carries no optical depth at all");
+            assertTrue(!worldCommon.contains(gone),
+                    gone + " belonged to the render-edge shell; the fade carries no optical depth at all");
+        }
+
+        int sampler = volume.indexOf("public VolumeSample sampleVolume");
+        int samplerEnd = volume.indexOf("\n}", sampler);
+        assertTrue(sampler > 0 && samplerEnd > sampler, "sampleVolume must be findable");
+        assertTrue(!volume.substring(sampler, samplerEnd).contains("edgeFade"),
+                "the point sampler must not read the fade: it has no view ray to measure a coverage from");
+
+        // The blend itself: the surviving fraction scales throughput, the sky fills the rest, and the shared
+        // bounce-0 segment's fill rides the same once-per-sample prefix the fog's in-scatter does.
+        assertTrue(indirect.contains("if (CAUSTICA_VOLUME_PATH && edgeFadeOn && segmentIsAir) {"),
+                "the indirect pass must fade every air segment, so a reflection of the far world loses the "
+                        + "same edge the direct view does");
+        assertTrue(indirect.contains("throughput *= 1.0 - coverage;"),
+                "the fade must scale what the segment returns, never add to it");
+        assertTrue(indirect.contains("if (firstSegment) prefixL += fill; else L += fill;"),
+                "the shared bounce-0 segment must evaluate its fill once, or spp>1 counts it per sample");
+        assertTrue(primary.contains("float coverage = edgeFadeOn ? edgeFadeCoverage(ro, rd, payload.hitT)"),
+                "the guide blend must price the fade, or RR keeps the surface's albedo under a pixel that "
+                        + "is mostly sky");
+
+        assertTrue(composite.contains("getEffectiveRenderDistance()"),
+                "the fade's outer face is the renderer's own geometry window, which is the render "
+                        + "distance in chunks");
+        assertTrue(composite.contains(
+                        "new Float4(edgeFadeOn ? CausticaConfig.Rt.Volume.EDGE_FADE_OPACITY.value() : 0f,"),
+                "the frame must push the coverage it fades to, together with the band it computed");
+        assertTrue(composite.contains("WORLD_FLAG_EDGE_FADE"),
+                "the host must raise the flag, and must keep the frame off the volume-free raygen records "
+                        + "while it is up");
+    }
+
+    /**
+     * Fog and the render-edge fill sample the view LUT from raygen, while the visible dome samples it
+     * from the miss shader. The host descriptor must expose both stages or the raygen fill is undefined.
+     */
+    @Test
+    void skyViewLutDescriptorCoversRaygenAndMiss() throws IOException {
+        String pipeline = Files.readString(PIPELINE);
+        int start = pipeline.indexOf("binds.get(WORLD_SKY_VIEW)");
+        int end = pipeline.indexOf("binds.get(WORLD_TRANSMITTANCE)", start);
+        assertTrue(start >= 0 && end > start, "the sky-view descriptor declaration must be findable");
+        String declaration = pipeline.substring(start, end);
+        assertTrue(declaration.contains("VK_SHADER_STAGE_MISS_BIT_KHR"),
+                "the visible sky miss shader must retain access to the view LUT");
+        assertTrue(declaration.contains("VK_SHADER_STAGE_RAYGEN_BIT_KHR"),
+                "fog and render-edge sky fills sample the view LUT from raygen; a miss-only descriptor "
+                        + "leaves those reads outside the layout and their colour undefined");
+    }
+
+    /**
      * Phase 2's hardest acceptance line: the marched tier's integral must converge monotonically to
      * the Phase 1 closed form as the step count rises (8 → 16 → 32 → 64), because with the noise at
      * zero both integrate the same analytic profile.
@@ -293,7 +540,8 @@ final class VolumeFogTest {
         String java = Files.readString(COMPOSITE);
         for (String flag : new String[]{"WORLD_FLAG_FOG", "WORLD_FLAG_CLOUD", "WORLD_FLAG_SPRAY",
                 "WORLD_FLAG_VOLUME_SHADOW", "WORLD_FLAG_VOLUME_MARCH", "WORLD_FLAG_VOLUME_DEBUG",
-                "WORLD_FLAG_CLOUD_VOLUMETRIC", "WORLD_FLAG_SHAFTS"}) {
+                "WORLD_FLAG_CLOUD_VOLUMETRIC", "WORLD_FLAG_SHAFTS", "WORLD_FLAG_CLOUD_RANDOM",
+                "WORLD_FLAG_EDGE_FADE", "WORLD_FLAG_DOF_REFLECTION"}) {
             assertEquals(shaderFlagBit(shader, flag), javaFlagBit(java, flag),
                     flag + " must sit on the same bit in world_common.slang and RtComposite");
         }
@@ -323,8 +571,10 @@ final class VolumeFogTest {
                         "bool airProbeSite = (firstSegment && firstSample) || fogAfterInterface;"),
                 "shared first-segment probes must be evaluated once while behind-the-glass probes "
                         + "stay per-sample");
-        assertTrue(indirect.contains("if (CAUSTICA_VOLUME_PATH && airProbeSite && fogOn && segmentIsAir)"),
-                "the fog in-scatter must be gated on the fog flag and on an air segment");
+        assertTrue(indirect.contains(
+                        "if (CAUSTICA_VOLUME_PATH && firstAirSegment && fogOn && segmentIsAir) {"),
+                "the fog in-scatter must be gated on the fog flag and on an air segment, and its "
+                        + "transmittance must reach every resample of that segment");
         assertTrue(indirect.contains("if (CAUSTICA_VOLUME_PATH && airProbeSite && shaftOn && segmentIsAir)"),
                 "the shaft in-scatter must ride the same two gates from its own flag");
         assertTrue(!indirect.contains("(bounce == seg.bounce || fogAfterInterface) && (!fogOn || shaftOn)"),
@@ -375,8 +625,10 @@ final class VolumeFogTest {
         assertTrue(volume.contains("if (inWater || (push.flags & WORLD_FLAG_FOG) == 0u)"),
                 "the march-tier density must stay behind sampleVolume's water/fog gate");
         String composite = Files.readString(COMPOSITE);
-        assertTrue(composite.contains("boolean fogMarchOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit"),
-                "the march flag must sit behind the fog switch and the sky-light gate");
+        assertTrue(composite.contains("boolean fogOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit;"),
+                "the fog's own gate is the switch AND the sky-light gate, in one place both tiers read");
+        assertTrue(composite.contains("boolean fogMarchOn = fogOn && CausticaConfig.Rt.Volume.FOG_MARCH.value()"),
+                "the march flag must sit behind the fog switch and the sky-light gate, through fogOn");
         assertTrue(composite.contains("fogMarchOn ? CausticaConfig.Rt.Volume.FOG_NOISE.value() : 0f"),
                 "the fog1 noise lane must be zero while the march tier is off");
         assertTrue(composite.contains("(float) fogDriftX,\n"
@@ -563,14 +815,15 @@ final class VolumeFogTest {
                 "Java must raise WORLD_FLAG_CLOUD when the cloud layer is enabled");
 
         // Lane pushes, anchored by their neighbours so a look-alike Float4 cannot swallow them.
+        // Coverage is the slider's own value — rain swells the footprints instead of lifting the
+        // gate, so the count stays what the dial says in any weather.
         assertTrue(composite.contains(
-                        "new Float4(cloudOn ? CausticaConfig.Rt.Volume.rainCoverage(\n"
-                                + "                            CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value(), storm, cloudRainBoost) : 0f,\n"
+                        "new Float4(cloudOn ? CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value() : 0f,\n"
                                 + "                            CausticaConfig.Rt.Volume.CLOUD_ALTITUDE"
                                 + ".value() - terrain.blockY,"),
                 "the cloud0 lanes must be pushed behind the cloudOn gate (coverage first, rebased base second)");
         // The baked shape's index rides cloud1.x (mapped from the 0..1 slider across the atlas's
-        // shape count), the wind azimuth cloud1.y, the instance jitter strength cloud1.z, the fade
+        // shape count), the weather swell cloud1.y, the instance jitter strength cloud1.z, the fade
         // cloud1.w; the drift itself is Java-accumulated into cloud2.zw (the v15 lesson: anchor the
         // lane by its neighbours).
         assertTrue(composite.contains(
@@ -579,13 +832,13 @@ final class VolumeFogTest {
                                 + ".CLOUD_TYPE.value()\n"
                                 + "                                            * (cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0))\n"
                                 + "                                    : 0f,\n"
-                                + "                            cloudOn ? (float) Math.toRadians(\n"
-                                + "                                    CausticaConfig.Rt.Volume.CLOUD_WIND_ANGLE.value()) : 0f,\n"
+                                + "                            cloudOn ? CausticaConfig.Rt.Volume"
+                                + ".rainSwelling(storm, cloudRainBoost) : 0f,\n"
                                 + "                            cloudOn ? CausticaConfig.Rt.Volume"
                                 + ".CLOUD_PATCHINESS.value() : 0f,\n"
                                 + "                            cloudOn ? CausticaConfig.Rt.Volume"
                                 + ".CLOUD_FADE_DISTANCE.value() : 0f),"),
-                "cloud1 must carry the shape index, the drift azimuth, the jitter strength and the "
+                "cloud1 must carry the shape index, the weather swell, the jitter strength and the "
                         + "fade, with the drift gone to cloud2");
         // The volumetric tier's two own lanes: the step count rides volumeParams.w beside the fog
         // march's lanes, and the type mix rides cloud1.x. Both are zero while the tier is off.
@@ -608,10 +861,17 @@ final class VolumeFogTest {
         assertTrue(volume.contains("float cloudInstanceDensity(WorldPush push, float2 driftedXZ, float vertical01)"),
                 "every cloud consumer must read the one instance-grid density");
         assertTrue(volume.contains("cloudVolumes.SampleLevel(")
-                        && volume.contains("float shape = clamp(floor(push.cloud1.x)")
-                        && volume.contains("0.0, max(push.cloudColor.y, 0.0));")
+                        && volume.contains("shape = clamp(floor(push.cloud1.x)")
                         && volume.contains("float layer = shape * CLOUD_VOLUME_RES + l0;"),
-                "the density must fetch the pushed shape's atlas layers");
+                "the density must fetch the atlas layer of the shape the grid selected");
+        // The shape is drawn per PARENT cell, and the random-style bit switches the source from the
+        // slider to the whole atlas. A per-cell hash put a new volume against every instance wall,
+        // which is a seam the density itself does not have.
+        assertTrue(volume.contains("float2 parentId = floor(cellId / 4.0);")
+                        && volume.contains("float shapeRoll = cloudGridHash(parentId, 97.0);")
+                        && volume.contains("if ((push.flags & WORLD_FLAG_CLOUD_RANDOM) != 0u) {")
+                        && volume.contains("shape = clamp(floor(shapeRoll * (lastShape + 1.0)), 0.0, lastShape);"),
+                "the shape must be drawn per parent cell, from the atlas when the random style is on");
         assertTrue(volume.contains("float2 cellId = floor(driftedXZ / cell);")
                         && volume.contains("float2 drifted = pos.xz + sunDir.xz * t + worldPush.cloud2.xy + worldPush.cloud2.zw;"),
                 "the instance grid must sample through the exact anchor and the drift");
@@ -619,13 +879,22 @@ final class VolumeFogTest {
         // pushed look constant: a literal physical level at a one-degree sun is a rounding error, which
         // left the deck black instead of burning. The colour is a FRACTION of the derived chromaticity —
         // at full strength a one-degree sunset colour is an impossible light at that level, and the ACES
-        // highlight roll-off turned the deck khaki.
+        // highlight roll-off turned the deck khaki. The constant is ramped by the sun's elevation (next
+        // assertion): cloudLightTint is unit-luminance, so a flat level has nothing to fall off with.
         assertTrue(volume.contains("CelestialLight light = dominantCelestialLight(state, transmittanceLut);")
                         && volume.contains("float3 lightIll = lightLevel * cloudLightTint(light.illuminance);")
                         && volume.contains("public static const float CLOUD_LIGHT_TINT = 0.5;")
                         && volume.contains("return lerp(float3(1.0, 1.0, 1.0), chroma, CLOUD_LIGHT_TINT);"),
                 "the cloud tiers must take the light's colour from the derived body, trimmed, and its "
                         + "level from the pushed constant");
+        // The level rides the sun's elevation. cloudLightTint is unit-luminance by construction, so a
+        // flat level held the deck at full brightness right down to the horizon and then dropped the
+        // whole term in the frame the moon took over (128000 -> 5). The ramp must reach zero before
+        // that handoff, which is why CLOUD_LEVEL_ZERO_ALT sits just below the handoff elevation.
+        assertTrue(volume.contains("float cloudDaylightLevel(float sunDirY) {")
+                        && volume.contains("CLOUD_LEVEL_ZERO_ALT = -0.012")
+                        && volume.contains("lightLevel *= cloudDaylightLevel(state.sunDir.y);"),
+                "the deck's direct level must fade with the sun's elevation before the moon handoff");
         assertTrue(volume.contains("skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI")
                         && volume.contains("clamp(push.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;")
                         && volume.contains("max(cloudSelfShadow(tauSun * CLOUD_AMBIENT_OCCLUSION),")
@@ -668,9 +937,16 @@ final class VolumeFogTest {
         assertTrue(volume.contains("1.0 - smoothstep(fadeDist * 0.6, fadeDist, t)"),
                 "the sheet must fade over the last 40% of the dissipation range");
         assertTrue(volume.contains(
-                "float tau = density * worldPush.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / sunDir.y;"),
+                "float tau = density * worldPush.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / denom;"),
                 "cloudShadowTransmittance must price the column every tier prices, free of the fade "
                         + "distance and of the thickness dial");
+        // The shadow fades with the sun instead of switching off at 2.87 degrees: that switch put a
+        // one-frame step on every surface the deck shaded, and the tau it blends is clamped at the
+        // same floor so the leg stays finite as the gate closes.
+        assertTrue(volume.contains("float shadowGate = smoothstep(0.0, 0.06, sunDir.y);")
+                        && volume.contains("float denom = max(sunDir.y, 0.02);")
+                        && volume.contains("return lerp(1.0, exp(-tau), shadowGate);"),
+                "the cloud shadow must fade out with the sun's elevation rather than switching off");
 
         // The sheet: the miss shader imports the volume module, renders the planar in-scatter, and
         // blends it over everything behind it — in-scatter on top, transmittance over the sky.
@@ -683,10 +959,15 @@ final class VolumeFogTest {
         assertTrue(skyMiss.contains("if (!endSky) {"),
                 "the sheet must not render over an end-sky dome");
 
-        // The fog-void fill: mirrored dome only while the fog actually renders.
+        // The fog-void fill: mirrored dome only while some air fog actually renders — the height profile
+        // or the border's haze, since either one is air standing in front of the sky.
         assertTrue(skyMiss.contains(
-                        "(worldPush.flags & WORLD_FLAG_FOG) != 0u && worldPush.fog0.x > 0.0"),
+                        "(worldPush.flags & WORLD_FLAG_FOG) != 0u"),
                 "the below-horizon void fill must gate on a fog that is actually rendering");
+        assertTrue(skyMiss.contains(
+                        "(worldPush.fog0.x > 0.0 || worldPush.boundaryFog.x > 0.0)"),
+                "the void fill must also cover a border-only frame, where the height profile is empty "
+                        + "and the haze is the only thing between the eye and the space floor");
         assertTrue(skyMiss.contains("float3 domeDir = fogVoidFill && dir.y < 0.0"),
                 "the void fill must mirror below-horizon dome lookups only");
 
@@ -758,6 +1039,31 @@ final class VolumeFogTest {
         assertTrue(cloud2Call < cloudColorCall,
                 "the call site must pass the cloud anchor/drift block BEFORE the cloud colour lane, "
                         + "matching the generated record order");
+
+        // The border haze's lane, added between the march parameters and the water-volume block: the same
+        // three-way check, because the argument that feeds it is a bare Float4 like every other one here.
+        int volumeParamsField = shader.indexOf("public float4   volumeParams;");
+        int hazeField = shader.indexOf("public float4   boundaryFog;");
+        assertTrue(volumeParamsField > 0 && hazeField > volumeParamsField,
+                "world_common.slang must declare boundaryFog after volumeParams");
+        int volumeParamsArg = record.indexOf("Float4 volumeParams,");
+        int hazeArg = record.indexOf("Float4 boundaryFog,");
+        assertTrue(volumeParamsArg > 0 && hazeArg > volumeParamsArg,
+                "the generated record must keep boundaryFog after volumeParams");
+        int hazeCall = composite.indexOf("new Float4(boundarySigma, 0f, 0f, 0f)");
+        int waterVolumeCall = composite.indexOf("new Float4(0f, 0.6f, 1.5f,");
+        assertTrue(hazeCall > 0 && waterVolumeCall > hazeCall,
+                "the call site must pass the haze lane before the water-volume block, matching the "
+                        + "generated record order");
+        // The edge fade's lane sits right behind the border's, and both before the water-volume block.
+        int fadeField = shader.indexOf("public float4   edgeFade;");
+        assertTrue(fadeField > hazeField,
+                "world_common.slang must declare edgeFade after boundaryFog");
+        int fadeArg = record.indexOf("Float4 edgeFade,");
+        assertTrue(fadeArg > hazeArg, "the generated record must keep edgeFade after boundaryFog");
+        int fadeCall = composite.indexOf("new Float4(edgeFadeOn ?");
+        assertTrue(fadeCall > hazeCall && fadeCall < waterVolumeCall,
+                "the call site must pass the fade lane between the border's and the water-volume block");
     }
 
     /**
@@ -958,10 +1264,12 @@ final class VolumeFogTest {
 
     /**
      * Two behaviours that make the deck a weather system rather than a decal: rain thickens it, and
-     * the layer reads one baked shape whose index the type slider selects. The thickening is computed
-     * Java-side and pushed, which is what keeps every consumer - sheet, walk, shadow field, NEE, fog
-     * legs - on the same lifted numbers; the test ports those formulas and pins the wiring on both
-     * sides of the push, and pins the shape index's path from the slider to the atlas layer base.
+     * the layer reads one baked shape whose index the type slider selects. The thickening closes the
+     * sky by swelling the instances' footprints (cloud1.y) rather than lifting the coverage gate, so
+     * the count stays what the slider says; the density lift stays Java-side and pushed, which is
+     * what keeps every consumer - sheet, walk, shadow field, NEE, fog legs - on the same numbers.
+     * The test ports those formulas and pins the wiring on both sides of the push, and pins the
+     * shape index's path from the slider to the atlas layer base.
      */
     @Test
     void cloudWeatherThickeningAndFieldEvolution() throws IOException {
@@ -970,8 +1278,9 @@ final class VolumeFogTest {
         String volume = Files.readString(VOLUME);
 
         // Java port of the pushed formulas. Identity at no weather and at boost 0 - the two cases that
-        // have to reproduce the pre-feature sky bit for bit - monotone in weather, clamped at overcast,
-        // and thunder stacking on rain rather than replacing it.
+        // have to reproduce the pre-feature sky bit for bit - monotone in weather, clamped at full
+        // swell, and thunder stacking on rain rather than replacing it. Coverage does not appear:
+        // the weather never lifts it.
         float[] boosts = {0.0f, 0.35f, 0.6f, 1.0f};
         for (float boost : boosts) {
             for (int rainPct = 0; rainPct <= 10; rainPct++) {
@@ -979,48 +1288,75 @@ final class VolumeFogTest {
                     float rain = rainPct / 10f;
                     float thunder = thunderPct / 10f;
                     float storm = Math.clamp(rain + 0.35f * thunder, 0.0f, 1.0f);
-                    float cov = Math.clamp(0.5f + 0.45f * boost * storm, 0.0f, 1.0f);
+                    float swell = Math.clamp(boost * storm, 0.0f, 1.0f);
                     float den = 0.06f * (1.0f + 1.6f * boost * storm);
                     if (rain == 0f && thunder == 0f) {
-                        assertClose("no weather must leave the coverage alone", 0.5f, cov, 1.0e-6f);
+                        assertClose("no weather must leave the swell alone", 0.0f, swell, 1.0e-6f);
                         assertClose("no weather must leave the density alone", 0.06f, den, 1.0e-6f);
                     }
-                    assertTrue(cov >= 0.5f && den >= 0.06f,
-                            "weather must never thin the deck (cov=" + cov + " den=" + den + ")");
-                    assertTrue(cov <= 1.0f, "the coverage must clamp at solid overcast");
+                    assertTrue(swell >= 0.0f && den >= 0.06f,
+                            "weather must never thin the deck (swell=" + swell + " den=" + den + ")");
+                    assertTrue(swell <= 1.0f, "the swell must clamp at full");
                     // thunder only ever adds: a thunderstorm is at least as thick as the same rain alone
                     float stormNoThunder = Math.clamp(rain, 0.0f, 1.0f);
-                    float covNoThunder = Math.clamp(0.5f + 0.45f * boost * stormNoThunder, 0.0f, 1.0f);
-                    assertTrue(cov >= covNoThunder - 1.0e-6f,
-                            "thunder must not reduce the coverage");
+                    float swellNoThunder = Math.clamp(boost * stormNoThunder, 0.0f, 1.0f);
+                    assertTrue(swell >= swellNoThunder - 1.0e-6f,
+                            "thunder must not reduce the swell");
                 }
             }
         }
         // boost 0 is the second identity: any weather, no thickening.
-        assertClose("boost 0 must hold the coverage to the slider", 0.5f,
-                Math.clamp(0.5f + 0.45f * 0.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
+        assertClose("boost 0 must hold the swell to zero", 0.0f,
+                Math.clamp(0.0f * 1.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
         assertClose("boost 0 must hold the density to the slider", 0.06f,
                 0.06f * (1.0f + 1.6f * 0.0f * 1.0f), 1.0e-6f);
-        // a full storm at full boost decks over completely and near-triples the shadow strength
-        assertClose("a full storm at full boost lifts 50% to 95%", 0.95f,
-                Math.clamp(0.5f + 0.45f * 1.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
+        // a full storm at full boost saturates the swell and near-triples the shadow strength
+        assertClose("a full storm at full boost saturates the swell", 1.0f,
+                Math.clamp(1.0f * 1.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
         assertClose("a full storm at full boost multiplies the density by 2.6", 0.06f * 2.6f,
                 0.06f * (1.0f + 1.6f * 1.0f * 1.0f), 1.0e-6f);
 
         // The formulas live in the config as pure functions and the push reads them, so no consumer can
         // re-derive a different answer.
         assertTrue(config.contains("public static float stormLevel(float rain, float thunder)")
-                        && config.contains("public static float rainCoverage(float coverage, float storm, float boost)")
+                        && config.contains("public static float rainSwelling(float storm, float boost)")
                         && config.contains("public static float rainDensity(float density, float storm, float boost)"),
                 "the weather formulas must be pure functions in the config");
-        assertTrue(composite.contains("CausticaConfig.Rt.Volume.rainCoverage(")
+        assertTrue(composite.contains("CausticaConfig.Rt.Volume.rainSwelling(")
                         && composite.contains("CausticaConfig.Rt.Volume.rainDensity(")
                         && composite.contains("CausticaConfig.Rt.Volume.stormLevel(rainLevel, thunderLevel)"),
-                "the push must carry the weather-lifted coverage and density");
+                "the push must carry the weather swell and the lifted density");
+        // The coverage lane must be the slider's own value: no weather lift may re-enter it.
+        assertTrue(composite.contains("new Float4(cloudOn ? CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value() : 0f,"),
+                "the coverage lane must push the slider's value untouched by the weather");
+        assertTrue(!composite.contains("rainCoverage("),
+                "the old coverage lift must be gone with the count-driven weather");
 
-        // The baked-volume layer has no evolving procedural field left — the shape selection replaced
-        // the evolution phase in cloudColor.x — so the old accumulator and its lane must be gone, and
-        // the shape index must be what rides cloud1.x instead.
+        // The deck closes by growth: the swell widens the footprint toward the size that tiles the
+        // cell, and the occupancy gate must not read the weather at all — rain may widen the
+        // admitted clouds, never admit new ones.
+        assertTrue(volume.contains("float swell = lerp(1.0, swellFull * 1.15, clamp(push.cloud1.y, 0.0, 1.0));"),
+                "the weather swell must grow the footprints toward tiling the cell");
+        assertTrue(volume.contains("float gate = push.cloud0.x >= 0.95 ? 2.0\n"
+                        + "            : saturate(push.cloud0.x * (1.0 + push.cloud1.z * (cluster * 2.0 - 1.0)));"),
+                "the occupancy gate must not read the weather swell — the count is the slider's, "
+                        + "in any weather");
+        assertTrue(volume.contains("float2 fp = r / (span * scale * swell);"),
+                "the swell must widen the footprint in the one place every consumer reads");
+
+        // The bodies flow on the pushed phase: a warp scrolls the sampled shape inside its fixed
+        // footprint, accumulated Java-side on the clamped wave clock behind the flow dial.
+        assertTrue(volume.contains("float2 warp = (cloudFlowNoise(fp * 3.0")
+                        && volume.contains("float2 local = fp + 0.5 + warp * CLOUD_FLOW_AMPLITUDE;"),
+                "the flow must warp the sampled shape, not the footprint or the gate");
+        assertTrue(composite.contains("cloudFlowClock = (cloudFlowClock + waveClockStep")
+                        && composite.contains("CausticaConfig.Rt.Volume.CLOUD_FLOW.value()"),
+                "the flow phase must accumulate on the clamped wave clock behind the flow dial");
+        assertTrue(composite.contains("cloudOn ? cloudFlowClock : 0f, 1f),"),
+                "the flow phase must ride cloudColor.z, gated on the cloudOn lane");
+
+        // The baked-volume layer's evolution rides cloudColor.z as a flow phase — the shape index and
+        // the Cloud Size footprints keep their lanes, and the old procedural-field accumulator is gone.
         assertTrue(!volume.contains("f.evolve")
                         && volume.contains("clamp(push.cloudColor.x, 32.0, 2048.0)"),
                 "cloudColor.x carries the Cloud Size lane, not an evolution phase: the shader must read "
@@ -1032,9 +1368,10 @@ final class VolumeFogTest {
                 "the shape index must be mapped across the atlas's shape count");
         assertTrue(volume.contains("float layer = shape * CLOUD_VOLUME_RES + l0;")
                         && composite.contains("new Float4(CausticaConfig.Rt.Volume.CLOUD_SIZE.value(),\n"
-                                + "                            cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0f, 0f, 1f),"),
+                                + "                            cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0f,\n"
+                                + "                            cloudOn ? cloudFlowClock : 0f, 1f),"),
                 "the shape index must reach the atlas as the layer base, with the atlas's last shape "
-                        + "index riding cloudColor.y for the variety clamp");
+                        + "index riding cloudColor.y and the flow phase riding cloudColor.z");
     }
 
     // ---- Sun shafts (air and water) -------------------------------------------------------------------
@@ -1137,8 +1474,9 @@ final class VolumeFogTest {
                 "the underwater lobe must be capped by the pushed ceiling");
         assertTrue(volume.contains("structure = lerp(WATER_SHAFT_STRUCTURE_FLOOR, 1.0, structure);"),
                 "the underwater gate must keep a floor");
-        assertTrue(volume.contains("float fogT = underwater ? 1.0 : fogTransmittance("),
-                "the air fog must not attenuate the underwater term");
+        assertTrue(volume.contains("float fogT = underwater ? 1.0 : airTransmittance(ro, rd, reach);"),
+                "the air fog must not attenuate the underwater term, and on the air side the veil that "
+                        + "swallows a beam is the whole medium — height profile and border haze together");
         assertTrue(volume.contains("vis *= exp(-sigma * probe.waterHitT);"),
                 "every underwater probe must carry its own Beer-Lambert up to the surface");
         assertTrue(volume.contains("caustic = waterWaves"),
@@ -1215,8 +1553,9 @@ final class VolumeFogTest {
                         "new Float4(shaftOn ? CausticaConfig.Rt.Volume.WATER_SHAFT_DENSITY.value() : 0f,"),
                 "Java must push the underwater medium's density, zeroed while the feature is off");
         String config = Files.readString(CONFIG);
-        assertTrue(config.contains("bool(\"caustica.rt.volume.shafts\", \"volume.shafts\", true)"),
-                "the shaft master switch ships on: a clear-air effect nobody can see is not shipped");
+        assertTrue(config.contains("bool(\"caustica.rt.volume.shafts\", \"volume.shafts\", false)"),
+                "the shaft master switch ships off: its per-pixel probes are a frame budget a fresh "
+                        + "install keeps for the rest");
         String settings = Files.readString(SETTINGS);
         assertTrue(settings.contains("\"volume.shafts\", RT + \"shafts\""),
                 "the shaft switch must be reachable from the settings surface");

@@ -39,8 +39,8 @@ public final class RtGpuTiming {
 
     /** Ordered pass boundaries. Interval i is NAMES[i-1] -> NAMES[i]. */
     private static final String[] NAMES = {
-            "setup", "skyLut", "tracePrimary", "traceIndirect", "dlss", "exposure", "bloom", "lens", "display",
-            "copy"
+            "setup", "skyLut", "tracePrimary", "traceIndirect", "focusMeter", "dlss", "exposure", "bloom",
+            "lens", "display", "copy"
     };
     private static final int MAX_MARKS = NAMES.length;
 

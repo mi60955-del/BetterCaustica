@@ -24,6 +24,7 @@ tools/lens-preview-out/
 tools/shaft-preview-out/
 tools/bounce-sweep-out/
 tools/parallax-preview-out/
+tools/dof-preview-out/
 
 # Local experiment outputs
 tools/glass-shadow-lab/shots/

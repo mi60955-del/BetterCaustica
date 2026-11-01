@@ -4,6 +4,7 @@ import com.mojang.blaze3d.platform.InputConstants;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.rt.RtStillRender;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.minecraft.client.KeyMapping;
@@ -12,7 +13,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
 /**
- * Renderer switches a player flips while looking at the world instead of from a screen.
+ * Renderer controls a player reaches for while looking at the world instead of from a screen.
  *
  * <p>The ray-tracing master switch is the comparison a player makes most often — a traced frame
  * against the vanilla rasterizer — and Video Settings cannot serve it: opening the screen replaces
@@ -23,12 +24,20 @@ import net.minecraft.resources.Identifier;
  * <p>Switching off leaves the RT runtime alive (context, worker pool, terrain residency) because a
  * hot switch is meant for repeated A/B; tearing residency down would put the world into the
  * waiting-for-terrain state on every flip. Releasing those resources belongs to client shutdown.
+ *
+ * <p>The still-render binding is the other half of the same idea: the picture worth keeping is the one in
+ * front of the player, so averaging it cannot ask them to stop the world, leave the world, or rebuild it
+ * through a settings screen. Counting frames, restarting on a camera move and saving live in
+ * {@link RtStillRender}; the press only starts a run or drops the one in flight, and the ticks give the run
+ * the moments it needs to resolve.
  */
 public final class CausticaHotkeys {
 	private static final String TOGGLE_RT_TRANSLATION = "key.caustica.toggle-rt";
+	private static final String STILL_TRANSLATION = "key.caustica.render-still";
 	private static final KeyMapping.Category CATEGORY =
 			KeyMapping.Category.register(Identifier.fromNamespaceAndPath("caustica", "caustica"));
 	private static KeyMapping toggleRayTracing;
+	private static KeyMapping renderStill;
 
 	private CausticaHotkeys() {
 	}
@@ -37,11 +46,22 @@ public final class CausticaHotkeys {
 	public static void register() {
 		toggleRayTracing = KeyMappingHelper.registerKeyMapping(new KeyMapping(TOGGLE_RT_TRANSLATION,
 				InputConstants.Type.KEYSYM, InputConstants.KEY_F9, CATEGORY));
+		renderStill = KeyMappingHelper.registerKeyMapping(new KeyMapping(STILL_TRANSLATION,
+				InputConstants.Type.KEYSYM, InputConstants.KEY_F10, CATEGORY));
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			// consumeClick() yields one event per press, so a held key cannot oscillate the renderer.
 			while (toggleRayTracing.consumeClick()) {
 				toggleRayTracing(client, !CausticaConfig.Rt.ENABLED.value());
 			}
+			while (renderStill.consumeClick()) {
+				RtStillRender.INSTANCE.toggle();
+			}
+			// A still run finishes on a tick rather than on the frame that filled it: the last sample is in
+			// a submission this tick is past, and a tick still runs once the world is gone.
+			if (client.level == null) {
+				RtStillRender.INSTANCE.cancel("the world was left");
+			}
+			RtStillRender.INSTANCE.service();
 		});
 	}
 

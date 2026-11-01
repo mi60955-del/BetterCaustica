@@ -94,6 +94,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool first
     bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
     bool fogOn = (worldPush.flags & WORLD_FLAG_FOG) != 0u; // analytic height fog on this segment
     bool shaftOn = (worldPush.flags & WORLD_FLAG_SHAFTS) != 0u; // clear-air sun shafts
+    bool edgeFadeOn = (worldPush.flags & WORLD_FLAG_EDGE_FADE) != 0u; // the render edge's dissolve
     // Set when the path crosses a dielectric interface: the air segment right behind the glass also
     // carries fog, which is what keeps aerial perspective alive when looking through panes. Consumed
     // by the next fog evaluation, and kept alive across a crossing's own (non-air) segment.
@@ -231,11 +232,23 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool first
         // right behind a dielectric crossing is NOT shared: which sample sits behind the glass is the
         // outcome of that sample's own Fresnel choice, so every sample evaluates its own.
         bool airProbeSite = (firstSegment && firstSample) || fogAfterInterface;
-        if (CAUSTICA_VOLUME_PATH && airProbeSite && fogOn && segmentIsAir) {
+        if (CAUSTICA_VOLUME_PATH && firstAirSegment && fogOn && segmentIsAir) {
             float fogT;
-            float3 fogL = throughput * fogSegmentInScatter(ro, rd, payload.hitT, pix, true, fogT);
-            if (fogAfterInterface) L += fogL; else prefixL += fogL;
-            fogAfterInterface = false;
+            if (airProbeSite) {
+                // The in-scatter accumulates along the segment, so it is added at the throughput the segment
+                // STARTED with; the attenuation below then applies to whatever lies behind it.
+                float3 fogL = throughput * fogSegmentInScatter(ro, rd, payload.hitT, pix, true, fogT);
+                if (fogAfterInterface) L += fogL; else prefixL += fogL;
+                fogAfterInterface = false;
+            } else {
+                // A resample of the shared bounce-0 segment. Its in-scatter is already in the prefix, but
+                // this sample's own continuation still looks through the same air, so it pays the air's
+                // transmittance. The closed form is the quantity the analytic tier's in-scatter uses; the
+                // marched tier's own fogT (noise modulation included) only exists where the field is
+                // actually walked, i.e. on the probe site above.
+                fogT = airTransmittance(ro, rd, payload.hitT);
+            }
+            throughput *= fogT;
         }
         if (CAUSTICA_VOLUME_PATH && airProbeSite && shaftOn && segmentIsAir) {
             float shaftShare;
@@ -243,6 +256,25 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, bool first
                     worldPush.shaft.x, worldPush.shaft.y, false, shaftShare);
             if (fogAfterInterface) L += shaftL; else prefixL += shaftL;
             fogAfterInterface = false;
+        }
+
+        // The render edge's fade. Not a medium: this segment's coverage is the fraction of it that has
+        // dissolved into the sky behind it, so everything the segment and its subtree return is scaled by
+        // what survives while the sky fills the rest. It runs on every segment rather than the first one
+        // only, because a mirror or a refraction of the far world has to lose the same edge the direct view
+        // does. A segment that escaped to the sky needs no check of its own: fading sky toward sky is a
+        // no-op by construction.
+        if (CAUSTICA_VOLUME_PATH && edgeFadeOn && segmentIsAir) {
+            float coverage = edgeFadeCoverage(ro, rd, payload.hitT);
+            if (coverage > 0.0) {
+                // The bounce-0 segment is one ray shared by every sample, so its fill is evaluated once and
+                // carries no per-sample state; deeper segments each own their ray and add their own.
+                if (!firstSegment || firstSample) {
+                    float3 fill = throughput * coverage * edgeFadeSky(rd);
+                    if (firstSegment) prefixL += fill; else L += fill;
+                }
+                throughput *= 1.0 - coverage;
+            }
         }
 
         float3 n = payloadNormal(); // oriented toward the incoming ray by the closest-hit

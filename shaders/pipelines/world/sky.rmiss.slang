@@ -271,11 +271,12 @@ void main(inout Payload payload) {
         }
     } else {
         // The dome. Below-horizon rays that escaped the loaded world sample the LUT's space-black
-        // floor; while the fog is actually rendering (flag up AND non-zero density — the md5
-        // baseline keeps a fog-off frame's raw dome), mirror those rays to their horizon elevation
-        // instead: real air seen downward is haze, not space, and thin fog no longer lets the void
-        // band through the horizon.
-        bool fogVoidFill = (worldPush.flags & WORLD_FLAG_FOG) != 0u && worldPush.fog0.x > 0.0;
+        // floor; while any air fog is actually rendering (flag up AND non-zero density in either the
+        // height profile or the border's haze — the md5 baseline keeps a fog-off frame's raw dome),
+        // mirror those rays to their horizon elevation instead: real air seen downward is haze, not
+        // space, and thin fog no longer lets the void band through the horizon.
+        bool fogVoidFill = (worldPush.flags & WORLD_FLAG_FOG) != 0u
+                && (worldPush.fog0.x > 0.0 || worldPush.boundaryFog.x > 0.0);
         float3 domeDir = fogVoidFill && dir.y < 0.0 ? float3(dir.x, -dir.y, dir.z) : dir;
         color = skyDome(skyViewLut, domeDir, state);
         // Airglow plus integrated unresolved starlight: the real floor of a moonless night sky (~1e-3 cd/m²),

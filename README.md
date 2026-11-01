@@ -30,6 +30,9 @@ Maintained by island_i. On top of upstream Caustica:
 - Simplified and Traditional Chinese option translations
 - Mod Menu and Sodium Config API entry points for the settings screen
 - An in-game ray-tracing toggle (F9 by default)
+- An accumulated still render (F10 by default): the frames you are looking at
+  are averaged into one PNG at the display resolution while the game keeps
+  running, with DLSS-RR and frame generation left exactly as configured
 
 The ray-tracing core, DLSS support and the ACES HDR pipeline are upstream's.
 
@@ -75,17 +78,19 @@ Upstream Caustica (this fork's builds are not published there):
 1. Install Fabric Loader for Minecraft `26.2`.
 2. Install Fabric API.
 3. Download `bettercaustica-<version>.jar` from [Releases](https://github.com/mi60955-del/BetterCaustica/releases) and put it in your Minecraft `mods` folder.
-4. **For FSR frame generation**, download the AMD FidelityFX SDK (FSR 3.1) and copy
-   `amd_fidelityfx_vk.dll` into `<game directory>/bettercaustica-ffx/natives/windows-x64/`
-   (create the folder if it does not exist). The mod extracts its bundled
-   `ffxshim.dll` beside it; if your jar was built without the FidelityFX natives,
-   copy `ffxshim.dll` there as well. Without both files the FSR backend stays
-   unavailable and DLSS frame generation is unaffected. A more convenient install
-   method is planned. You can also point `-Dcaustica.ffx.path` at a folder holding
-   both DLLs.
+4. **FSR frame generation needs no extra download** — release jars from 0.1.1
+   onward bundle AMD's
+   `amd_fidelityfx_vk.dll` and the project's own `ffxshim.dll`, and the mod
+   extracts both into `<game directory>/bettercaustica-ffx/natives/windows-x64/`
+   when the FSR backend first loads. A jar you build yourself without `FFX_SDK`
+   carries neither file, so copy them there by hand, or point
+   `-Dcaustica.ffx.path` at a folder holding both DLLs. DLSS frame generation is
+   unaffected either way.
 5. Launch the game with the Vulkan graphics backend.
 6. Open Video Settings to adjust the renderer options, or press F9 to toggle ray
-   tracing in-game (rebindable under Controls → Caustica).
+   tracing in-game (rebindable under Controls → Caustica). Press F10 to average
+   the configured number of frames into one screenshot in `screenshots/`; hold
+   the camera still while it runs, and press the key again to drop the run.
 
 BetterCaustica installs in place of upstream Caustica: the two jars share the
 `caustica` system-property namespace, so remove Caustica first.

@@ -176,13 +176,21 @@ static const float PARALLAX_WALL_GRADIENT = 0.15;
 // Extra mip levels the smooth style reads, and how much of a wall it still claims.
 static const float PARALLAX_SMOOTH_MIP_BIAS = 0.75;
 static const float PARALLAX_SMOOTH_WALL = 0.35;
-// Self-shadow walk: steps from the displaced texel up to the surface plane, the sine of the light's
+// Self-shadow walk: steps from the shaded texel up to the surface plane, the sine of the light's
 // elevation below which nothing is worth shadowing, the depth difference that saturates an occlusion, and
-// the bias that keeps a texel from shading itself.
-static const int PARALLAX_SHADOW_STEPS = 10;
+// the bias that keeps a texel from shading itself. Sixteen steps keep the stride under one texel across
+// the walk's full span.
+static const int PARALLAX_SHADOW_STEPS = 16;
 static const float PARALLAX_SHADOW_MIN_ELEVATION = 0.10;
 static const float PARALLAX_SHADOW_SOFTNESS = 0.15;
 static const float PARALLAX_SHADOW_BIAS = 0.02;
+// How far the walk lets one unit of stored depth reach laterally, in sprite widths, at a 45° light. The
+// physical quarter-block conversion the march uses leaves the walk sub-texel on the fields packs
+// author — sandstone's deepest texel sits at 17% of the range, a 0.7-texel walk at 45° that ends before
+// it can cross onto a shallower column — so the contact shadow read nothing. One sprite width per depth
+// unit is a 4x exaggeration at LabPBR's 16-px scale: one texel of depth casts one texel of shadow at a
+// 45° light, and the ratio holds at other sprite sizes.
+static const float PARALLAX_SHADOW_STRETCH = 1.0;
 
 struct ParallaxSample {
     // Sprite-local UV to shade at.
@@ -237,16 +245,19 @@ float2 spriteTexelGrid(uint page, float2 pageUvScale, float lod) {
     return max(floor(pageUvScale * pageTexels / exp2(floor(lod)) + 0.5), float2(1.0, 1.0));
 }
 
-// Directional self-shadow through the same height field. From the displaced texel the ray is walked back
+// Directional self-shadow through the same height field. From the shaded texel the ray is walked back
 // up toward the light; any stretch of field it passes over that sits above it blocks what reaches the
 // texel. The walk stops at the surface plane, so only relief the face itself carries can contribute, and
 // the effect reads as contact shading inside the relief rather than as a shadow thrown across the face.
 //
-// The light is whichever body is up, sun first, both from the lanes the sky bakes from, so a shadow can
-// never point somewhere the sky is not lit from. This is the one place a hit dereferences WorldPush; it
-// sits behind the material switch and the height-field test, so a surface without relief never pays.
+// The lateral conversion is the walk's own, not the march's reach: stored depth is read at face value
+// against the sprite (PARALLAX_SHADOW_STRETCH), because the physical quarter block puts the whole walk
+// inside one texel for the fields packs actually author. The light is whichever body is up, sun first,
+// both from the lanes the sky bakes from, so a shadow can never point somewhere the sky is not lit from.
+// This is the one place a hit dereferences WorldPush; it sits behind the material switch and the
+// height-field test, so a surface without relief never pays.
 float parallaxShadow(uint page, float2 pageUvMin, float2 pageUvScale, float2 uv, float hitDepth, float lod,
-        float3 n, float3 T, float3 B, float reach) {
+        float3 n, float3 T, float3 B) {
     if ((pc.materialToggles & MATERIAL_TOGGLE_PARALLAX_SHADOW) == 0u || hitDepth <= 1.0e-4) {
         return 1.0;
     }
@@ -261,7 +272,7 @@ float parallaxShadow(uint page, float2 pageUvMin, float2 pageUvScale, float2 uv,
     if (lightTS.z <= PARALLAX_SHADOW_MIN_ELEVATION) {
         return 1.0;
     }
-    float2 lateral = (lightTS.xy / lightTS.z) * reach;
+    float2 lateral = (lightTS.xy / lightTS.z) * PARALLAX_SHADOW_STRETCH;
     float stepDepth = hitDepth / float(PARALLAX_SHADOW_STEPS);
     float shadow = 1.0;
     [loop]
@@ -284,9 +295,10 @@ float columnDepth(uint page, float2 pageUvMin, float2 pageUvScale, float lod, fl
     return 1.0 - samplePageNormalAo(page, pageUvMin + wrapSpriteUv(uv) * pageUvScale, lod).a;
 }
 
-// Where to shade a height-mapped face, and how much light its own relief lets through. A ray that never
-// leaves its starting column returns its input unchanged, which is what "no relief here" has to look
-// like.
+// Where to shade a height-mapped face, and how much light its own relief lets through. A ray that
+// never leaves its starting column keeps the flat mapping — no relief was exposed — but its column's
+// own depth still self-shadows: a face-on view of a groove bottom is exactly where contact shading
+// has to show.
 ParallaxSample sampleParallax(MaterialHeader header, uint page, float2 localUv, float lod, float maxLod,
         float3 n, float3 T, float3 B, float3 vdir, float depthScale) {
     ParallaxSample result = untouchedParallax(localUv);
@@ -333,9 +345,10 @@ ParallaxSample sampleParallax(MaterialHeader header, uint page, float2 localUv, 
     for (int i = 0; i < layers; i++) {
         if (field <= t) {
             // The ray entered this column already below its ceiling: it struck the crossed face.
-            // The shadow walk climbs from the ceiling, the top of that face — starting at the
+            // The shadow walk climbs from that ceiling, the top of the face — starting at the
             // boundary depth would shadow the wall by its own column.
             wallHit = true;
+            hitDepth = field;
             landed = true;
             break;
         }
@@ -361,9 +374,9 @@ ParallaxSample sampleParallax(MaterialHeader header, uint page, float2 localUv, 
         field = columnDepth(page, pageUvMin, pageUvScale, marchLod, grid, texel);
     }
 
-    if (!landed || (move.x == 0.0 && move.y == 0.0)) {
-        // The budget ran out with the ray still in air, or the ray never left its starting column
-        // (a face-on view): the flat mapping is the answer, not a snapped texel centre.
+    if (!landed) {
+        // The budget ran out with the ray still in air: the flat mapping is the answer, not a snapped
+        // texel centre, and a sample that never met the field casts no self-shadow.
         return result;
     }
 
@@ -371,10 +384,16 @@ ParallaxSample sampleParallax(MaterialHeader header, uint page, float2 localUv, 
     // enter it, facing back along that boundary's own axis; its strength is the height step across
     // the face, so sandstone strata (~0.14) and bark plateaus (~0.2) read as cut faces while stone's
     // noise (≤0.04) keeps its normal map.
+    if (move.x == 0.0 && move.y == 0.0) {
+        // The ray never left its starting column (a face-on view): the flat mapping stays — no relief
+        // was exposed — but the column's own depth still casts a contact shadow toward a low light.
+        result.shadow = parallaxShadow(page, pageUvMin, pageUvScale, localUv, hitDepth, marchLod,
+                n, T, B);
+        return result;
+    }
     float2 displaced = wrapSpriteUv((texel + 0.5) / grid);
     result.uv = displaced;
-    result.shadow = parallaxShadow(page, pageUvMin, pageUvScale, displaced, hitDepth, marchLod, n, T, B,
-            reach);
+    result.shadow = parallaxShadow(page, pageUvMin, pageUvScale, displaced, hitDepth, marchLod, n, T, B);
     if (wallHit) {
         result.wallDir = -normalize(move);
         result.wallAmount = smoothstep(PARALLAX_WALL_GRADIENT * 0.33, PARALLAX_WALL_GRADIENT,

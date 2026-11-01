@@ -11,6 +11,10 @@
 // from the matrix. camOffset shifts camera-relative space into the terrain's rebased coordinates. Depth
 // is reversed-Z (near=1, far=0).
 //
+// Depth of field puts its lens on that near plane. The bobbing eye is not a point these unprojected
+// coordinates can name, while the near plane is, and sliding a lens sample along its own pixel ray tilts
+// that ray only by aperture * nearDistance / focus^2.
+//
 // Pass A deliberately uses ordinary TraceRay. Its short, visually coherent direct/interface walk is
 // latency-sensitive and does not amortize an SER reorder barrier.
 import world_common;
@@ -62,11 +66,16 @@ void writeVolumeDebug(int2 pix, float3 ro, float3 rd, float t, bool allowShadowC
     volumeDebug[pix] = float4(fogT, luminance(insc), cloudDensity, cloudShadow);
 }
 
+// Pass A's camera segment walk. `guidesOnly` runs the same walk for a second ray purely to land the
+// gv_* guide state: it writes no radiance, so it skips the prefix (and with it the fog and shaft
+// integrators, which is most of what the walk costs) and skips queueing the transmitted branch, which
+// would otherwise overwrite the record the radiance pass already wrote.
 public PathSegment tracePrimary(PathSegment seg,
                                 DevicePtr<PackedPathSegment> queue,
                                 uint splitRecord,
                                 int2 pix,
                                 bool volumeDebugOn,
+                                bool guidesOnly,
                                 out bool prefixInImage,
                                 out uint nextRecord) {
     float3 ro = seg.ro;
@@ -80,10 +89,14 @@ public PathSegment tracePrimary(PathSegment seg,
     bool waterWaves = (worldPush.flags & 16u) != 0u;
     bool fogOn = (worldPush.flags & WORLD_FLAG_FOG) != 0u;
     bool shaftOn = (worldPush.flags & WORLD_FLAG_SHAFTS) != 0u;
+    bool edgeFadeOn = (worldPush.flags & WORLD_FLAG_EDGE_FADE) != 0u;
     nextRecord = PATH_NO_NEXT;
     prefixInImage = false;
     // Per-pixel specular guide state: only the water interface below sets it.
     gv_specWaveMirror = false;
+    // Reset with it: a pixel whose hit sets neither of the two surfaces below is showing a surface, not a
+    // reflection, and the lens's focus meter reads the zero that leaves.
+    gv_reflectShare = 0.0;
 
     {
         int bounce = seg.bounce;
@@ -107,7 +120,6 @@ public PathSegment tracePrimary(PathSegment seg,
                 gv_emissive = false;
                 gv_rough = 1.0;
                 gv_hitCamRel = rd * 1.0e6;
-                gv_motionUseRefracted = false;
                 gv_motionObjDisp = float3(0.0, 0.0, 0.0);
                 gv_spec = makeSpecSurface(gv_hitCamRel, gv_normal, 1.0, SKY_SPEC_ALBEDO);
             }
@@ -139,7 +151,6 @@ public PathSegment tracePrimary(PathSegment seg,
 #endif
                 gv_normal = n;
                 gv_hitCamRel = hitPos - worldPush.camOffset;
-                gv_motionUseRefracted = false;
                 gv_motionObjDisp = payload.motionPrev;
                 gv_emissive = payloadEmission() > 0.0;
                 if (material == MATERIAL_PARTICLE) {
@@ -153,16 +164,25 @@ public PathSegment tracePrimary(PathSegment seg,
                     gv_rough = rough;
                     gv_spec = makeSpecSurface(gv_hitCamRel, n, float3(payload.motionPrev), rough,
                                               rrSpecularAlbedo(payload.f0, rough, dot(n, v)));
+                    // How much of this pixel's light leaves along the mirror lobe. A metal has only that
+                    // lobe, so all of it; a non-metal keeps Schlick's share, which is a few per cent face-on
+                    // and most of the surface at grazing incidence, where any floor is a mirror. The focus
+                    // meter reads it to decide whether this pixel shows a reflected image.
+                    float3 mirrorShare = fresnelSchlick(clamp(dot(n, v), 0.0, 1.0), payload.f0);
+                    gv_reflectShare = clamp(metal + (1.0 - metal)
+                            * max(mirrorShare.r, max(mirrorShare.g, mirrorShare.b)), 0.0, 1.0);
                 }
-                // A fog-dominated pixel's diffuse guide converges toward mid-grey by the fog's opacity:
-                // RR demodulates against gv_albedo, and the fog term in front of the surface is not that
-                // surface's albedo, so leaving it would brighten dark surfaces and darken bright ones
-                // wherever fog sits in front. Guarded so the fog-off guide write stays untouched.
-                if (CAUSTICA_VOLUME_PATH && fogOn) {
-                    float fogOpacity = 1.0 - fogTransmittance(worldPush.fog0.x, worldPush.fog0.z,
-                            worldPush.fog0.y, ro.y, rd.y, payload.hitT);
-                    if (fogOpacity > 0.0) {
-                        gv_albedo = lerp(gv_albedo, float3(0.5, 0.5, 0.5), fogOpacity);
+                // A pixel whose radiance is mostly not the surface converges its diffuse guide toward
+                // mid-grey by how much of it isn't: RR demodulates against gv_albedo, and neither the fog in
+                // front nor the render edge's fade dissolving the surface is that surface's albedo, so
+                // leaving the surface's value there would brighten dark surfaces and darken bright ones
+                // wherever either sits in front. Guarded so a frame with both off keeps the plain write.
+                if (CAUSTICA_VOLUME_PATH && (fogOn || edgeFadeOn)) {
+                    float airT = fogOn ? airTransmittance(ro, rd, payload.hitT) : 1.0;
+                    float coverage = edgeFadeOn ? edgeFadeCoverage(ro, rd, payload.hitT) : 0.0;
+                    float awayFromSurface = 1.0 - airT * (1.0 - coverage);
+                    if (awayFromSurface > 0.0) {
+                        gv_albedo = lerp(gv_albedo, float3(0.5, 0.5, 0.5), awayFromSurface);
                     }
                 }
                 // The shafts deliberately do NOT join this blend. Their term is high-frequency by
@@ -189,7 +209,10 @@ public PathSegment tracePrimary(PathSegment seg,
         // accumulates on top of the stored value instead of overwriting it. The write is guarded so a
         // fog-off frame never touches outImage from this pass.
         prefixInImage = false;
-        {
+        // A guide probe carries no radiance: the pass that owns this pixel already wrote its prefix, and
+        // re-running the fog and shaft integrators for a result that is thrown away is most of what the
+        // probe would otherwise cost.
+        if (!guidesOnly) {
             // Both air terms are radiance common to the two Fresnel branches, so they are summed into
             // one prefix write. The transmittance only comes from the fog: the shafts are airlight and
             // deliberately attenuate nothing.
@@ -217,19 +240,19 @@ public PathSegment tracePrimary(PathSegment seg,
                         float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
                 prefixInImage = true;
             }
-        }
-        // The water medium's own scattering over the camera-to-interface stretch (the camera started
-        // submerged): the same prefix doctrine as the fog branch above — the radiance is common to
-        // both Fresnel continuations and can ride neither record, so it is written into outImage once
-        // and flagged, and the indirect pass accumulates on top. The two branches never co-fire: the
-        // fog stands down while any extinction is present, the water term needs the water medium.
-        if (CAUSTICA_VOLUME_PATH && medium.current.water && shaftOn) {
-            float shaftShare;
-            float3 prefixWater = shaftInScatter(ro, rd, payload.hitT, pix, worldPush.waterShaft.x,
-                    medium.current.phaseG, true, shaftShare);
-            outImage[pix] = float4(clamp(prefixWater * worldPush.preExposure,
-                    float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
-            prefixInImage = true;
+            // The water medium's own scattering over the camera-to-interface stretch (the camera started
+            // submerged): the same prefix doctrine as the fog branch above — the radiance is common to
+            // both Fresnel continuations and can ride neither record, so it is written into outImage once
+            // and flagged, and the indirect pass accumulates on top. The two branches never co-fire: the
+            // fog stands down while any extinction is present, the water term needs the water medium.
+            if (CAUSTICA_VOLUME_PATH && medium.current.water && shaftOn) {
+                float shaftShare;
+                float3 prefixWater = shaftInScatter(ro, rd, payload.hitT, pix, worldPush.waterShaft.x,
+                        medium.current.phaseG, true, shaftShare);
+                outImage[pix] = float4(clamp(prefixWater * worldPush.preExposure,
+                        float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
+                prefixInImage = true;
+            }
         }
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0),
                            RAY_CONE_MIN_WIDTH);
@@ -293,12 +316,14 @@ public PathSegment tracePrimary(PathSegment seg,
             // far face.
             gv_emissive = payloadEmission() > 0.0;
             gv_hitCamRel = hitPos - worldPush.camOffset;
-            gv_motionUseRefracted = false;
             gv_motionObjDisp = isWater ? float3(0.0, 0.0, 0.0) : payload.motionPrev;
             gv_spec = makeSpecSurface(gv_hitCamRel, n, previousNormal, geometricNormal,
                                       isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
                                       gv_rough, float3(F, F, F));
             gv_specWaveMirror = waveNormal;
+            // The face splits what leaves it by Fresnel and nothing else, so this is the reflection's share
+            // of the pixel outright — the same number the split below hands the reflected branch.
+            gv_reflectShare = F;
 #ifdef CAUSTICA_INTERFACE_DEBUG
             // Quarter-scale decision codes so all four survive the ACEScg encode: 0.25 sheet filter,
             // 0.5 entry, 0.75 exit, 1.0 total internal reflection.
@@ -328,10 +353,11 @@ public PathSegment tracePrimary(PathSegment seg,
         }
 
         // Split once, write both post-interface continuations, and stop Pass A radiance traversal.
-        // Pass B owns every radiance trace after this point.
+        // Pass B owns every radiance trace after this point. A guide probe owns no continuation at all:
+        // its split record would overwrite the one the radiance pass queued for this pixel.
         bool splitEligible = dot(transmittedDir, transmittedDir) > 0.0
                 && F > 0.0 && F < 1.0;
-        if (splitEligible) {
+        if (splitEligible && !guidesOnly) {
             MediumStack transmittedMedium = medium;
             if (!thinDielectric) {
                 if (entering) {
@@ -398,11 +424,47 @@ void main() {
     float4 farH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
     float3 nearP = nearH.xyz / nearH.w;
     float3 farP = farH.xyz / farH.w;
+    float3 pinholeDir = normalize(farP - nearP);
+    float rayConeSpread = primaryRayConeSpread(jndc, size, pinholeDir);
+    uint pixelSeed = dispatchIndex.x * 1973u + dispatchIndex.y * 9277u + 26699u;
+    uint seed = pixelSeed ^ (worldPush.frameIndex * 2654435761u);
     float3 origin = nearP + worldPush.camOffset;
-    float3 dir = normalize(farP - nearP);
-    float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
-    uint seed = (dispatchIndex.x * 1973u + dispatchIndex.y * 9277u + 26699u)
-            ^ (worldPush.frameIndex * 2654435761u);
+    float3 dir = pinholeDir;
+    bool lensSampled = false;
+    // The lens: this pixel's pinhole ray is moved sideways inside the sensor plane and re-aimed at the
+    // point where it crosses the focal plane. That plane keeps the pinhole's radiance, and a surface at
+    // range s lands off the pinhole ray by radius * (1 - s / focus) — so the disc closes at the focal
+    // plane, settles at radius / focus of the frame's tangent span out at the horizon, and opens to
+    // radius / s on this side of it. One aperture point per frame, and the reconstruct averages the run of
+    // them into a disc, exactly as it averages the sun square into a penumbra.
+    if (worldPush.dof.x > 0.0 && worldPush.dof.y > 0.0) {
+        float3 axis;
+        float3 lensRight;
+        float3 lensUp;
+        sensorFrame(axis, lensRight, lensUp);
+        // The host already holds the horizon inside the ceiling (it softens at radius / focus). What it
+        // cannot see is this pixel's own surface, and a surface in front of the focal plane softens at
+        // radius / depth instead, which runs away as depth falls -- a wall half a block from the eye asks
+        // for a disc a hundred pixels wide, and no denoiser fills that from one aperture point per
+        // frame. Last frame's pinhole distance closes it: solve radius * (1/depth - 1/focus) <= ceiling.
+        float radius = worldPush.dof.x;
+        // Clamped into [0, focus] because a texel no frame has written yet hands back whatever
+        // vkAllocateMemory held, and a NaN or a negative distance must not reach the ray: inside the
+        // clamp, garbage can only ask for a narrower lens, never a wider one. A zero ceiling lane is the
+        // host's way of saying the cap is switched off, and then the dial is the whole lens.
+        float behind = worldPush.dof.y - clamp(focusDepthPrev[pix], 0.0, worldPush.dof.y);
+        if (worldPush.dof.z > 0.0 && behind > 1.0e-3) {
+            float seen = worldPush.dof.y - behind;
+            radius = min(radius, worldPush.dof.z * seen * worldPush.dof.y / behind);
+        }
+        float2 aperture = sampleLensDisk(worldPush.frameIndex, pixelSeed) * radius;
+        float3 lensPoint = nearP + aperture.x * lensRight + aperture.y * lensUp;
+        float3 focalPoint = nearP
+                + pinholeDir * (worldPush.dof.y / max(dot(pinholeDir, axis), 1.0e-4));
+        origin = lensPoint + worldPush.camOffset;
+        dir = normalize(focalPoint - lensPoint);
+        lensSampled = true;
+    }
     MediumStack cameraMedium = makeMediumStack((worldPush.flags & 1u) != 0u
             ? makeDielectricMedium(true, WATER_IOR, worldPush.waterParams.xyz, 1.0,
                     worldPush.waterOpacity)
@@ -431,12 +493,29 @@ void main() {
     uint nextRecord;
     bool prefixInImage;
     PathSegment terminal = tracePrimary(
-            current, queue, splitRecord, pix, volumeDebugOn, prefixInImage, nextRecord);
+            current, queue, splitRecord, pix, volumeDebugOn, false, prefixInImage, nextRecord);
     PackedPathSegment packedTerminal = packPathSegment(terminal, nextRecord);
     if (prefixInImage) {
         packedTerminal.pathFlags |= PATH_PREFIX_IN_IMAGE;
     }
     queue[pixelIndex] = packedTerminal;
 
-    writeGuides(pix, dir, jndc, size, rayConeSpread);
+    // The guides describe what the pinhole sees, not what the lens sample hit. DLSS-RR classifies and
+    // reprojects with them and its contract is a pinhole camera, while a lens lands its hit off this
+    // pixel by its circle of confusion -- guides taken from that ray hand the reconstruct a depth,
+    // normal, albedo and mirror motion that walk across scene layers every frame, which it paints over
+    // as a smear instead of resolving as blur. Re-walking the same bounce-0 segment on the pinhole ray
+    // lands them back on this pixel; the radiance above stays on the lens ray, so the defocus is still
+    // traced rather than post-smudged. The probe writes no radiance and queues no continuation, and it is
+    // the feature's real cost: with a lens on, Pass A walks the bounce-0 segment twice per pixel.
+    // `dof.w` is the player's say over that cost, and with it off the guides carry the aperture point.
+    if (lensSampled && worldPush.dof.w > 0.0) {
+        bool probePrefix;
+        uint probeNext;
+        tracePrimary(makePathSegment(nearP + worldPush.camOffset, pinholeDir, float3(1.0, 1.0, 1.0),
+                        cameraMedium, 0.0, rayConeSpread, seed, 0, true),
+                queue, splitRecord, pix, false, true, probePrefix, probeNext);
+    }
+
+    writeGuides(pix, pinholeDir, size, rayConeSpread);
 }

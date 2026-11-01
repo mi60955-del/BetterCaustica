@@ -1,5 +1,6 @@
 // Stateless math: luminance, GGX (D/G/VNDF), Fresnel, Henyey-Greenstein, the RR specular-albedo
-// fit, the PCG stream, and direction sampling. No bindings, no globals, no rays.
+// fit, the PCG stream, the camera's own frame, and direction sampling. No bindings, no rays, and no module
+// state beyond the lens lattice's step.
 
 import world_common;
 import world_core;
@@ -119,6 +120,44 @@ public float primaryRayConeSpread(float2 ndc, float2 size, float3 dir) {
     float3 dx = primaryRayDir(ndc + float2(onePixelNdc.x, 0.0));
     float3 dy = primaryRayDir(ndc + float2(0.0, onePixelNdc.y));
     return max(max(length(cross(dir, dx)), length(cross(dir, dy))), RAY_CONE_MIN_SPREAD);
+}
+
+// The plastic number's two reciprocal powers: the per-frame step of the 2D low-discrepancy lattice the
+// lens samples walk.
+public static const float2 LENS_LATTICE_STEPS = float2(0.7548776662, 0.5698402910);
+
+// The frame the sensor sits in: the optical axis and two unit vectors spanning the plane it is
+// perpendicular to, read off the same unprojection the pinhole rays come from. View bobbing is baked into
+// the projection, so it is inside this frame instead of something the host has to describe. Which way
+// `right` and `up` face is irrelevant to a circular aperture, so only the unprojection's own x axis is
+// orthogonalised against the axis and `up` is taken from the cross product.
+public void sensorFrame(out float3 axis, out float3 right, out float3 up) {
+    float4 centreNearH = mul(worldPush.invViewProj, float4(0.0, 0.0, 1.0, 1.0));
+    float4 centreFarH = mul(worldPush.invViewProj, float4(0.0, 0.0, 0.0, 1.0));
+    float4 edgeNearH = mul(worldPush.invViewProj, float4(1.0, 0.0, 1.0, 1.0));
+    float3 centreNear = centreNearH.xyz / centreNearH.w;
+    axis = normalize((centreFarH.xyz / centreFarH.w) - centreNear);
+    float3 toEdge = (edgeNearH.xyz / edgeNearH.w) - centreNear;
+    right = normalize(toEdge - axis * dot(toEdge, axis));
+    up = cross(axis, right);
+}
+
+// One point of a circular aperture, in units of its radius. Successive frames of one pixel walk the
+// plastic-number lattice, which covers the aperture evenly instead of clumping — that is the difference
+// between a temporal filter averaging a bokeh disc and one averaging a few scattered dots inside it. The
+// lattice is rotated by a phase drawn from the pixel's own stream, because one shared point across the
+// whole screen translates the image rather than defocusing it; the frame index is masked because fp32
+// stops resolving a fraction of it long before a session ends, and a wrapped walk is still an even one.
+public float2 sampleLensDisk(uint frameIndex, uint pixelSeed) {
+    uint phaseSeed = pcg(pixelSeed);
+    float phaseX = rndf(phaseSeed);
+    float phaseY = rndf(phaseSeed);
+    float2 u = frac(float(frameIndex & 1023u) * LENS_LATTICE_STEPS + float2(phaseX, phaseY));
+    // Area-preserving map of the unit square onto the unit disk: sqrt on the radius, so the samples hold a
+    // constant density per unit of area instead of crowding the centre.
+    float r = sqrt(u.x);
+    float phi = 2.0 * PI * u.y;
+    return r * float2(cos(phi), sin(phi));
 }
 
 // Cosine-weighted hemisphere sample about n (Malley's method). For a Lambertian BRDF this is the

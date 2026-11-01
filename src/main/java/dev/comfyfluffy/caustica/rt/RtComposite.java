@@ -11,6 +11,8 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.client.CausticaJitter;
 import dev.comfyfluffy.caustica.mixin.CommandEncoderAccessor;
+import dev.comfyfluffy.caustica.rt.gen.DofPostGatherPushData;
+import dev.comfyfluffy.caustica.rt.gen.DofPostRecombinePushData;
 import dev.comfyfluffy.caustica.rt.gen.LensFlarePushData;
 import dev.comfyfluffy.caustica.rt.gen.LensSourcePushData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushConstantsData;
@@ -70,7 +72,9 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtLensPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSkyLut;
 import dev.comfyfluffy.caustica.rt.pipeline.RtCloudVolumes;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDofPostPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSharpenPipeline;
+import dev.comfyfluffy.caustica.rt.pipeline.RtFocusProbe;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
 import dev.comfyfluffy.caustica.rt.pipeline.RtFgInterpPipeline;
@@ -157,6 +161,12 @@ public final class RtComposite {
     private static final int WORLD_FLAG_CLOUD_VOLUMETRIC = 1 << 13;
     /** Clear-air sun shafts: airlight independent of the height fog. */
     private static final int WORLD_FLAG_SHAFTS = 1 << 14;
+    /** The cloud layer draws its shape from the whole atlas instead of the Cloud Type slider. */
+    private static final int WORLD_FLAG_CLOUD_RANDOM = 1 << 15;
+    /** The render edge's fade: a blend of the finished pixel toward the sky, not an air medium. */
+    private static final int WORLD_FLAG_EDGE_FADE = 1 << 16;
+    /** The focus meter's depth image carries reflected-image distances, not the reflector's own. */
+    private static final int WORLD_FLAG_DOF_REFLECTION = 1 << 17;
     // Debug views the primary raygen fills the volume debug image for; one channel per view.
     private static final int DEBUG_VIEW_VOLUME_FIRST = 10;
     private static final int DEBUG_VIEW_VOLUME_LAST = 13;
@@ -225,6 +235,7 @@ public final class RtComposite {
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
     private RtSharpenPipeline sharpenPipeline;
+    private RtDofPostPipeline dofPostPipeline;
     private RtBloomPipeline bloomPipeline;
     // Atmosphere LUTs (transmittance + multiple scattering + this frame's sky view). Device-lifetime; the
     // two static tables are baked on the first frame that records the pass.
@@ -249,6 +260,14 @@ public final class RtComposite {
     // member exists only while HDR output is enabled, exactly like hdrDisplayImage.
     private RtImage displayComposeImage;
     private RtImage hdrComposeImage;
+    // The post-process depth of field's half-res accumulation pair: the gather's far and near fields
+    // for the SDR channel, plus the HDR pair while HDR output is on. Always allocated — the dof mode
+    // is a live setting and these are the smallest images in the display chain's buffer set (~7 MB a
+    // pair at 1440p) — so switching the mode never needs a resource rebuild.
+    private RtImage dofFarImage;
+    private RtImage dofNearImage;
+    private RtImage dofHdrFarImage;
+    private RtImage dofHdrNearImage;
     // Bloom pyramid, finest first: level 0 is half display resolution and each level halves again. The
     // display mapper reads level 0, which the upsample sweep leaves holding the sum of every band.
     private RtImage[] bloomLevels = new RtImage[0];
@@ -353,6 +372,15 @@ public final class RtComposite {
     private int reservoirWrite;
     private RtImage gSpecAlbedo;
     private RtImage gSpecMotion;
+    // The pinhole view depth per render pixel. Two things read it back: the primary raygen, to ceiling its
+    // own aperture per pixel, and the autofocus meter, to decide where the focal plane sits next (see
+    // RtDepthOfField and RtFocusProbe). Not a guide: DLSS-RR never sees it, and only a frame with a lens
+    // open writes it. A ping-pong pair for the same reason the reservoirs are one -- a thread reads the
+    // texel the previous traced frame wrote while writing its own -- and it advances on that pair's step.
+    private RtImage[] focusDepthImages = new RtImage[0];
+    private int focusDepthWrite;
+    /** Meters the centre of that depth into this frame's focal distance. Created while the lens is open. */
+    private RtFocusProbe focusProbe;
     // Per-pixel volumetric diagnostics (debug views 10..13), render-res like the guides. Written by the
     // primary raygen only on frames whose WorldPush carries WORLD_FLAG_VOLUME_DEBUG; the debug present
     // pass shows one channel per view. Allocated only while one of those views is selected: it is a
@@ -412,6 +440,14 @@ public final class RtComposite {
     private double fogDriftZ;
     private double cloudDriftX;
     private double cloudDriftZ;
+    // The cloud flow phase (seconds, wave-clock rate scaled by the flow dial). The shapes' warp
+    // scrolls on it; 0 on the dial freezes it, leaving the wind's translate as the only motion.
+    // Wrapped hourly like the wave clock, so the phase argument stays well inside fp32's precise
+    // range — the warp's lattice has no period to snap at the wrap, it just keeps evolving.
+    private float cloudFlowClock;
+    // The traced camera's lens, which carries the focal plane from frame to frame so auto-focus racks
+    // into place rather than jumping to whatever the crosshair found last frame.
+    private final RtDepthOfField depthOfField = new RtDepthOfField();
     private long atlasSampler;
     private long endSkySampler;
     private boolean failed;
@@ -694,6 +730,18 @@ public final class RtComposite {
     }
 
     /**
+     * The size the display chain renders at — what the still run's accumulator and output are sized to, and
+     * what {@link RtStillRender#record} compares a new frame against.
+     */
+    public int displayWidth() {
+        return displayW;
+    }
+
+    public int displayHeight() {
+        return displayH;
+    }
+
+    /**
      * Reset per-frame present state at the very start of {@link net.minecraft.client.renderer.GameRenderer}
      * render (before any RT work). Critical for menu/no-world frames: {@link #composite()} is only called
      * while a level is rendering ({@code WorldRenderScaler} opens its window in {@code renderLevel}), so on
@@ -771,6 +819,9 @@ public final class RtComposite {
             }
             if (sharpenPipeline == null) {
                 sharpenPipeline = RtSharpenPipeline.create(ctx);
+            }
+            if (focusProbe == null && usesFocusMeter()) {
+                focusProbe = RtFocusProbe.create(ctx);
             }
             if (bloomPipeline == null) {
                 bloomPipeline = RtBloomPipeline.create(ctx);
@@ -1118,6 +1169,7 @@ public final class RtComposite {
         worldPipeline.setExtraStorageImage(4, gSpecAlbedo.view);
         worldPipeline.setExtraStorageImage(5, gSpecMotion.view);
         bindReservoirImages();
+        bindFocusDepthImages();
         // Always bound: the trace writes this slot on frames flagged for volume diagnostics, and the
         // placeholder keeps that write legal while no debug view samples the image.
         long volumeView = volumeDebugView();
@@ -1157,6 +1209,21 @@ public final class RtComposite {
                 reservoirImages[reservoirWrite].view,
                 reservoirSampleImages[reservoirWrite ^ 1].view,
                 reservoirSampleImages[reservoirWrite].view);
+    }
+
+    /** Whether this frame's focal plane comes from metering the trace, which needs the depth image live. */
+    private static boolean usesFocusMeter() {
+        return CausticaConfig.Rt.DepthOfField.MODE.value() != 0
+                && CausticaConfig.Rt.DepthOfField.AUTO_FOCUS.value();
+    }
+
+    /** Bind the lens ceiling's depth pair, prev and cur, into the world pipeline. */
+    private void bindFocusDepthImages() {
+        if (worldPipeline == null || focusDepthImages.length != 2) {
+            return;
+        }
+        worldPipeline.setFocusDepthImages(focusDepthImages[focusDepthWrite ^ 1].view,
+                focusDepthImages[focusDepthWrite].view);
     }
 
     /** Zero the images this frame's trace is about to write, so uncovered texels read as empty history. */
@@ -1218,6 +1285,32 @@ public final class RtComposite {
         if (gSpecMotion != null) {
             gSpecMotion.destroy();
             gSpecMotion = null;
+        }
+        for (RtImage image : focusDepthImages) {
+            image.destroy();
+        }
+        focusDepthImages = new RtImage[0];
+        if (focusProbe != null) {
+            // Every view the meter binds is gone with this pair, so anything it still holds was measured
+            // off surfaces the next frame will not show.
+            focusProbe.reset();
+        }
+        focusDepthWrite = 0;
+        if (dofFarImage != null) {
+            dofFarImage.destroy();
+            dofFarImage = null;
+        }
+        if (dofNearImage != null) {
+            dofNearImage.destroy();
+            dofNearImage = null;
+        }
+        if (dofHdrFarImage != null) {
+            dofHdrFarImage.destroy();
+            dofHdrFarImage = null;
+        }
+        if (dofHdrNearImage != null) {
+            dofHdrNearImage.destroy();
+            dofHdrNearImage = null;
         }
         if (volumeDebug != null) {
             volumeDebug.destroy();
@@ -1323,6 +1416,22 @@ public final class RtComposite {
                 hdrComposeImage = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         "RT HDR display compose " + width + "x" + height);
             }
+            // The post dof's half-res accumulation pair, SDR always and HDR alongside its compose
+            // pair, recreated on the same resize cadence as everything else in the display chain.
+            int dofHalfWidth = Math.max(1, (width + 1) / 2);
+            int dofHalfHeight = Math.max(1, (height + 1) / 2);
+            dofFarImage = ctx.createStorageImage(dofHalfWidth, dofHalfHeight,
+                    VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "dof post far " + dofHalfWidth + "x" + dofHalfHeight);
+            dofNearImage = ctx.createStorageImage(dofHalfWidth, dofHalfHeight,
+                    VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "dof post near " + dofHalfWidth + "x" + dofHalfHeight);
+            if (hdrEnabled) {
+                dofHdrFarImage = ctx.createStorageImage(dofHalfWidth, dofHalfHeight,
+                        VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        "dof post HDR far " + dofHalfWidth + "x" + dofHalfHeight);
+                dofHdrNearImage = ctx.createStorageImage(dofHalfWidth, dofHalfHeight,
+                        VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                        "dof post HDR near " + dofHalfWidth + "x" + dofHalfHeight);
+            }
             // Bloom pyramid. Level 0 is half display resolution (the prefilter's 13-tap already covers a 5x5
             // display-pixel footprint, so nothing is lost by starting there); each further level halves again
             // until the look package's level count or the smallest useful size is reached.
@@ -1361,6 +1470,14 @@ public final class RtComposite {
             gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
             gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
             gSpecMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide specular motion " + renderW + "x" + renderH);
+            // The lens ceiling's depth history. r32f because it carries an axial distance the raygen
+            // compares against the frame's focus, not the reversed-Z value the depth guide holds.
+            focusDepthImages = new RtImage[]{
+                    ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT,
+                            "lens focus depth A " + renderW + "x" + renderH),
+                    ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT,
+                            "lens focus depth B " + renderW + "x" + renderH)};
+            focusDepthWrite = 0;
             // Bounce-0 RIS reservoir ping-pong. Both sides are render-res RGBA32F: the trace writes one and
             // reads the other, and they alternate per traced frame. They are not DLSS-RR guides, so they get
             // their own bindings rather than a guide slot. The format must match the rgba32f the shaders
@@ -1490,6 +1607,10 @@ public final class RtComposite {
         // bound as prev.
         reservoirWrite ^= 1;
         bindReservoirImages();
+        // The lens depth pair rides the same step: the texel this frame reads must be the one the
+        // previous traced frame wrote.
+        focusDepthWrite ^= 1;
+        bindFocusDepthImages();
         mvCurProjView.set(frameProjection).mul(frameViewRotation);
         if (mvHasPrev) {
             mvPushMatrix.set(mvPrevProjView);
@@ -1519,6 +1640,9 @@ public final class RtComposite {
         // Reuse a completed readback slot, then latch one pre-exposure value for both raygen and resolve.
         // This belongs after the timeline snapshot and before any world push data is written.
         exposure.beginFrame(graphicsUseWaiter, nightFactor());
+        if (focusProbe != null) {
+            focusProbe.beginFrame(graphicsUseWaiter);
+        }
         pendingGraphicsUse = graphicsUse;
         RtEntities.FrameEntities frameEntities = null;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
@@ -1612,6 +1736,11 @@ public final class RtComposite {
                 double cloudAzim = Math.toRadians(CausticaConfig.Rt.Volume.CLOUD_WIND_ANGLE.value());
                 cloudDriftX += cloudSpeed * Math.cos(cloudAzim) * waveClockStep;
                 cloudDriftZ += cloudSpeed * Math.sin(cloudAzim) * waveClockStep;
+                // The flow phase advances on the same clamped step, rate scaled by the flow dial:
+                // 0 freezes the shapes so the layer only translates, and a stall or pause cannot
+                // fast-forward the billowing.
+                cloudFlowClock = (cloudFlowClock + waveClockStep
+                        * 2.0f * CausticaConfig.Rt.Volume.CLOUD_FLOW.value()) % 1024.0f;
             }
             float waterWaveTime = waterWaveClock;
             float waterWaveDelta = waterWaveTime - previousWaterWaveTime;
@@ -1658,14 +1787,39 @@ public final class RtComposite {
             // without sky light must not read it. The volume debug views ask the primary raygen to fill
             // the volume debug image this frame.
             boolean skyLit = sky.skyEnvironment().x() > 0f;
-            if (CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit) {
+            boolean fogOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit;
+            // The world border's haze is a property of the border and of where the camera stands, and only
+            // the CPU can see either: the border is not geometry, and the distance that matters is the
+            // player's. One division per frame, and it joins the fog's medium instead of starting a layer of
+            // its own — hence the fog's flag, which is why that flag now covers both features.
+            boolean boundaryOn = CausticaConfig.Rt.Volume.BOUNDARY_FOG_ENABLED.value() && skyLit;
+            float boundarySigma = boundaryOn
+                    ? CausticaConfig.Rt.Volume.boundaryExtinction(
+                            level.getWorldBorder().getDistanceToBorder(camX, camZ),
+                            CausticaConfig.Rt.Volume.BOUNDARY_FOG_RAMP.value(),
+                            CausticaConfig.Rt.Volume.BOUNDARY_FOG_DENSITY.value())
+                    : 0f;
+            // The render edge's fade. Its geometry is the view distance, which only the CPU knows: the
+            // renderer's own window is this many chunks around the player's chunk (RtTerrain reads the same
+            // dial), so the far step in the world sits at 16·chunks blocks axial. The shader turns those two
+            // distances into a coverage that rises from zero to the opacity setting between them, so the
+            // look survives a render-distance change — priced per block instead, the same dial would barely
+            // show at 32 chunks and wipe the view at 4.
+            boolean edgeFadeOn = CausticaConfig.Rt.Volume.EDGE_FADE_ENABLED.value() && skyLit;
+            double edgeBlocks = 16.0 * Math.max(1, Minecraft.getInstance().options
+                    .getEffectiveRenderDistance());
+            float edgeFadeStart = (float) (edgeBlocks
+                    * CausticaConfig.Rt.Volume.EDGE_FADE_START.value());
+            if (fogOn || boundaryOn) {
                 flags |= WORLD_FLAG_FOG;
+            }
+            if (edgeFadeOn) {
+                flags |= WORLD_FLAG_EDGE_FADE;
             }
             if (CausticaConfig.Rt.Volume.FOG_SHADOW.value()) {
                 flags |= WORLD_FLAG_VOLUME_SHADOW;
             }
-            boolean fogMarchOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit
-                    && CausticaConfig.Rt.Volume.FOG_MARCH.value();
+            boolean fogMarchOn = fogOn && CausticaConfig.Rt.Volume.FOG_MARCH.value();
             if (fogMarchOn) {
                 flags |= WORLD_FLAG_VOLUME_MARCH;
             }
@@ -1682,6 +1836,11 @@ public final class RtComposite {
             boolean cloudOn = CausticaConfig.Rt.Volume.CLOUD_ENABLED.value() && skyLit;
             if (cloudOn) {
                 flags |= WORLD_FLAG_CLOUD;
+                // Only the density's shape lookup reads this, and it is only meaningful with the
+                // layer on: a shape drawn for a layer that renders nothing would still cost the push.
+                if (CausticaConfig.Rt.Volume.CLOUD_RANDOM_STYLE.value()) {
+                    flags |= WORLD_FLAG_CLOUD_RANDOM;
+                }
             }
             // The volumetric tier is a second bit, not a replacement of the first: every consumer that
             // only wants the layer's mean opacity (the NEE probes, the fog sun legs, a continuation ray)
@@ -1697,8 +1856,7 @@ public final class RtComposite {
             }
             // The volume debug image reads the push block rather than the flags, so the fog density is
             // pushed as zero while the fog is off — otherwise the debug views would keep showing a fog
-            // the flags no longer render.
-            boolean fogOn = CausticaConfig.Rt.Volume.FOG_ENABLED.value() && skyLit;
+            // the flags no longer render. (`fogOn` itself was decided with the flag above.)
             // Clear-air sun shafts: their own medium, so their own switch, and no dependence on any
             // fog setting. The sky-light gate is shared with the fog because the sun term is the same
             // derived celestial body — a dimension with no sun has nothing to scatter.
@@ -1706,9 +1864,23 @@ public final class RtComposite {
             if (shaftOn) {
                 flags |= WORLD_FLAG_SHAFTS;
             }
+            // The one bit in this block that is not about a volume. It is raised only where the meter that
+            // reads the depth image exists, because the same image is the per-pixel blur ceiling's history:
+            // a manual focus has no meter to serve, and handing its ceiling a reflected image's distance
+            // would stop it narrowing the lens on exactly the pixels closest to the plane. Traced mode
+            // only: the post-process gather computes every pixel's circle of confusion from this same
+            // image, and a mirror pixel defocused by its reflection's distance instead of its own would
+            // put the water's blur at the mountain's range — autofocus loses reflection racking there,
+            // which is the honest trade for a depth every reader can trust.
+            if (CausticaConfig.Rt.DepthOfField.MODE.value() == 1
+                    && usesFocusMeter() && CausticaConfig.Rt.DepthOfField.REFLECTION_FOCUS.value()) {
+                flags |= WORLD_FLAG_DOF_REFLECTION;
+            }
             // The volume-free raygen records are only correct while nothing that consumes those integrals
-            // is on — that is exactly what this names. Any of them on, and the full records run.
-            boolean leanVolumePath = (flags & (WORLD_FLAG_FOG | WORLD_FLAG_CLOUD
+            // is on — that is exactly what this names. Any of them on, and the full records run. The render
+            // edge's fade is one of them: it lives on the same side of CAUSTICA_NO_VOLUME_PATH as the fog,
+            // because a build that compiles the volume path out has no segment shading left to blend.
+            boolean leanVolumePath = (flags & (WORLD_FLAG_FOG | WORLD_FLAG_CLOUD | WORLD_FLAG_EDGE_FADE
                     | WORLD_FLAG_VOLUME_DEBUG)) == 0 && !shaftOn;
             // Weather drives the volume block: the levels are pushed whether or not a feature currently
             // consumes them, so every volume shader reads one consistent weather snapshot. The previous
@@ -1739,6 +1911,10 @@ public final class RtComposite {
             Float4 glintParams = new Float4(glintScroll.x, glintScroll.y,
                     Minecraft.getInstance().options.glintStrength().get().floatValue(),
                     1.0f);
+            // The frame's lens. waveClockStep is this frame's clamped wall-clock step, which is what the
+            // focus rack needs to move the same distance per second at any frame rate.
+            Float4 dof = depthOfField.push(waveClockStep, displayH, frameProjection,
+                    focusProbe == null ? 0.0f : focusProbe.distanceBlocks());
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1821,28 +1997,28 @@ public final class RtComposite {
                     // cloud base already rebased like fog0.z, z the slab thickness the sheet's and
                     // the shadow's optical depths scale with, w the density multiplier (the shadow
                     // strength).
-                    // Coverage and density are the WEATHER-LIFTED values, not the sliders': rain decks
-                    // the sky over and shadows harder, and every consumer of these two lanes - sheet,
-                    // walk, shadow field, NEE, fog legs - reads the same lifted numbers because they were
-                    // lifted before the push rather than re-derived per consumer.
-                    new Float4(cloudOn ? CausticaConfig.Rt.Volume.rainCoverage(
-                            CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value(), storm, cloudRainBoost) : 0f,
+                    // Coverage is the SLIDER's value, not a weather-lifted one: rain decks the sky
+                    // by swelling the instances' footprints (cloud1.y), never by admitting more of
+                    // them, so the count stays what the dial says in any weather. The density IS
+                    // weather-lifted, and every consumer of these two lanes - sheet, walk, shadow
+                    // field, NEE, fog legs - reads the same numbers because they were lifted before
+                    // the push rather than re-derived per consumer.
+                    new Float4(cloudOn ? CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value() : 0f,
                             CausticaConfig.Rt.Volume.CLOUD_ALTITUDE.value() - terrain.blockY,
                             CausticaConfig.Rt.Volume.CLOUD_THICKNESS.value(),
                             CausticaConfig.Rt.Volume.rainDensity(
                                     CausticaConfig.Rt.Volume.CLOUD_DENSITY.value(), storm, cloudRainBoost)),
                     // x the cloud shape index (which baked volume every instance of the layer
                     // renders; see RtCloudVolumes for the slider order, clamped to the shapes this
-                    // device's atlas holds), y the wind azimuth (the instance grid's drift
-                    // direction; the drift itself accumulates into cloud2.zw Java-side), z the
-                    // per-instance scale/occupancy jitter strength, w the fade distance (blocks).
-                    // Gated lanes ride zero while off.
+                    // device's atlas holds), y the weather swell (Rain Boost x storm: how far the
+                    // footprints grow toward tiling their cells; the shader owns the growth curve),
+                    // z the per-instance scale/occupancy jitter strength, w the fade distance
+                    // (blocks). Gated lanes ride zero while off.
                     new Float4(cloudOn
                                     ? (float) Math.round(CausticaConfig.Rt.Volume.CLOUD_TYPE.value()
                                             * (cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0))
                                     : 0f,
-                            cloudOn ? (float) Math.toRadians(
-                                    CausticaConfig.Rt.Volume.CLOUD_WIND_ANGLE.value()) : 0f,
+                            cloudOn ? CausticaConfig.Rt.Volume.rainSwelling(storm, cloudRainBoost) : 0f,
                             cloudOn ? CausticaConfig.Rt.Volume.CLOUD_PATCHINESS.value() : 0f,
                             cloudOn ? CausticaConfig.Rt.Volume.CLOUD_FADE_DISTANCE.value() : 0f),
                     // ---- Cloud anchoring block. xy the EXACT terrain origin (no mod-4096: the
@@ -1857,9 +2033,11 @@ public final class RtComposite {
                     // x the cloud footprint in blocks (the Cloud Size dial; the instance grid derives
                     // its spacing from it, so thickness never moves a cloud), y the atlas's LAST shape
                     // index — the clamp the shader's per-instance shape variety reads (0 when clouds
-                    // are off), z unused, w the deck's ambient-term weight.
+                    // are off), z the flow phase (the shapes' warp scrolls on it; 0 while clouds are
+                    // off), w the deck's ambient-term weight.
                     new Float4(CausticaConfig.Rt.Volume.CLOUD_SIZE.value(),
-                            cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0f, 0f, 1f),
+                            cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0f,
+                            cloudOn ? cloudFlowClock : 0f, 1f),
                     // z spray strength: the setting's base lifted by rain (rain is what spray is for),
                     // and zero unless the spray flag went up with the marched tier.
                     new Float4(rainLevel, thunderLevel,
@@ -1877,6 +2055,21 @@ public final class RtComposite {
                             0f,
                             volumetricCloudOn
                                     ? (float) CausticaConfig.Rt.Volume.CLOUD_STEPS.value() : 0f),
+                    // ---- The world border's haze. x is the flat extinction the border adds to the fog's
+                    // medium, in 1/block: the camera's distance to the nearest border plane, ramped against
+                    // the band and density dials. It joins the fog's medium rather than composing a layer of
+                    // its own, so this is the only lane the feature needs — and it is zero by construction
+                    // when the switch is off or the border sits outside the band, which leaves every optical
+                    // depth the fog integrators compute bit-identical to what it computed without the lane.
+                    new Float4(boundarySigma, 0f, 0f, 0f),
+                    // ---- The render edge's fade. x the peak coverage 0..1 (zero while the feature is off,
+                    // which is the shader's own early-out), y where the fade begins and z where the loaded
+                    // world stops — both measured from the EYE, because a coverage measured along the
+                    // segment would restart on the second bounce and put the boundary back into every
+                    // reflection. yz are read only through x, so an off frame pushes an inert band whatever
+                    // the render distance says.
+                    new Float4(edgeFadeOn ? CausticaConfig.Rt.Volume.EDGE_FADE_OPACITY.value() : 0f,
+                            edgeFadeStart, (float) edgeBlocks, 0f),
                     // ---- Water-volume block. x turbidity (the water's sigmaS/sigmaT fraction), y the
                     // water phase's Henyey–Greenstein g (forward-biased per the plan's 0.5..0.9 range),
                     // z spray band height in blocks, w the band's base: the sea level, already rebased
@@ -1900,7 +2093,8 @@ public final class RtComposite {
                     // lobe, which is what stops a sun-facing water surface from turning white.
                     new Float4(shaftOn ? CausticaConfig.Rt.Volume.WATER_SHAFT_DENSITY.value() : 0f,
                             shaftOn ? CausticaConfig.Rt.Volume.WATER_SHAFT_CEILING.value() : 0f, 0f, 0f),
-                    glintParams
+                    glintParams,
+                    dof
             ).write(push);
             previousRainLevel = rainLevel;
             pushBuf.flush(0L, WORLD_PUSH_SIZE);
@@ -1991,6 +2185,19 @@ public final class RtComposite {
             }
             RtGpuTiming.mark(cmd, "traceIndirect");
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
+            // Where the lens focuses next, metered off the depth the primary pass just wrote for its own
+            // blur ceiling. The answer reaches the host through a readback ring a few frames later, which
+            // the focal glide is slower than, and it is the traced surface rather than the block shape:
+            // entities, particles, water faces and half-blocks are in it.
+            if (focusProbe != null && usesFocusMeter() && focusDepthImages.length == 2) {
+                try (RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.focusMeter")) {
+                    focusProbe.record(cmd, stack, focusDepthImages[focusDepthWrite].view,
+                            renderW, renderH, RtDepthOfField.FAR_BLOCKS);
+                }
+            }
+            // Marked whether or not the meter ran: the names above are positional, so a mark that came and
+            // went with the setting would relabel every interval after it.
+            RtGpuTiming.mark(cmd, "focusMeter");
             // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
             // RR reads them and writes the display-res denoised result straight into rrOutput.
             if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
@@ -2093,6 +2300,49 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // compose images visible to the sharpen pass
 
+            // Post-process depth of field, mode 2: defocuses the mapper's compose pair in place before
+            // sharpening reads it. The gather runs at half res and the recombine layers its fields back
+            // over the pair, so the sharpen pass below keeps reading the compose pair no matter which
+            // dof mode is set — in the other two modes this block is skipped and the pair arrives as
+            // the mapper wrote it. The depth it defocuses with is the one this frame's primary pass
+            // published (its cur side), and the focus distance is the one this frame's push racked to.
+            // Marked unconditionally either way: the marks are positional, and a mark that came and
+            // went with the mode would relabel every interval after it.
+            if (CausticaConfig.Rt.DepthOfField.MODE.value() == 2) {
+                if (dofPostPipeline == null) {
+                    dofPostPipeline = RtDofPostPipeline.create(ctx);
+                }
+                int dofHalfWidth = dofFarImage.width;
+                int dofHalfHeight = dofFarImage.height;
+                boolean dofHdr = CausticaConfig.Rt.Hdr.enabled();
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "dof post gather");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.dofPost")) {
+                    dofPostPipeline.setImages(dofFarImage.view, dofNearImage.view,
+                            hdrBindingView(ctx, dofHdrFarImage), hdrBindingView(ctx, dofHdrNearImage),
+                            displayComposeImage.view, hdrBindingView(ctx, hdrComposeImage),
+                            focusDepthImages[focusDepthWrite].view,
+                            displayComposeImage.view, hdrBindingView(ctx, hdrComposeImage));
+                    dofPostPipeline.dispatchGather(cmd, dofHalfWidth, dofHalfHeight,
+                            new DofPostGatherPushData(
+                                    dofHdr ? 1 : 0,
+                                    CausticaConfig.Rt.DepthOfField.APERTURE.value(),
+                                    depthOfField.focusBlocks(),
+                                    RtDepthOfField.tangentPerDisplayPixel(displayH, frameProjection),
+                                    CausticaConfig.Rt.DepthOfField.MAX_BLUR_PIXELS.value(),
+                                    CausticaConfig.Rt.DepthOfField.BLADES.value(),
+                                    (float) Math.toRadians(
+                                            CausticaConfig.Rt.DepthOfField.BLADE_ROTATION.value()),
+                                    new DofPostGatherPushData.Float2(renderW, renderH),
+                                    new DofPostGatherPushData.Float2(dofHalfWidth, dofHalfHeight)));
+                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // fields visible to the recombine
+                    dofPostPipeline.dispatchRecombine(cmd, displayW, displayH,
+                            new DofPostRecombinePushData(
+                                    dofHdr ? 1 : 0,
+                                    new DofPostRecombinePushData.Float2(dofHalfWidth, dofHalfHeight)));
+                }
+            }
+            RtGpuTiming.mark(cmd, "dofPost");
+
             // Sharpening closes the display chain: it reads the mapper's compose pair and writes the images
             // every present path already consumes, so the copy below, the HDR present and the FG hudless
             // captures all see the sharpened frame without knowing this pass exists.
@@ -2121,6 +2371,14 @@ public final class RtComposite {
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
+            // A still run sums the image this frame presents, so it reads what the copy below writes: bloom,
+            // the tone curve, sharpening and any debug view are inside the average the way they are inside
+            // the picture. The next frame's dispatch reads this frame's write the same way the upscaler's and
+            // the exposure meter's own history does.
+            RtStillRender.INSTANCE.record(ctx, cmd, displayImage, camX, camY, camZ,
+                    frameViewRotation, frameProjection);
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target");
                  RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.copyOutput")) {
                 VK10.vkCmdCopyImage(cmd, displayImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
@@ -2138,6 +2396,9 @@ public final class RtComposite {
         // every owner in this frame's manifest is protected through the final overlay consumer.
         RtEntities.INSTANCE.markGraphicsUse(frameEntities, graphicsUse);
         exposure.markStateReadbackUse(graphicsUse);
+        if (focusProbe != null) {
+            focusProbe.markReadbackUse(graphicsUse);
+        }
     }
 
     /**
@@ -2480,14 +2741,23 @@ public final class RtComposite {
             continuationQueue = null;
         }
         destroyGuideImages();
+        if (focusProbe != null) {
+            focusProbe.destroy();
+            focusProbe = null;
+        }
         exposure.destroy();
         if (displayPipeline != null) {
             displayPipeline.destroy();
             displayPipeline = null;
         }
+        RtStillRender.INSTANCE.destroy();
         if (sharpenPipeline != null) {
             sharpenPipeline.destroy();
             sharpenPipeline = null;
+        }
+        if (dofPostPipeline != null) {
+            dofPostPipeline.destroy();
+            dofPostPipeline = null;
         }
         if (bloomPipeline != null) {
             bloomPipeline.destroy();

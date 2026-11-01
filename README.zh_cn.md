@@ -71,12 +71,12 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
 2. 安装 Fabric API。
 3. 从 [Releases](https://github.com/mi60955-del/BetterCaustica/releases) 下载
    `bettercaustica-<version>.jar`，放入 Minecraft 的 `mods` 文件夹。
-4. **若要使用 FSR 帧生成**：下载 AMD FidelityFX SDK（FSR 3.1），把
-   `amd_fidelityfx_vk.dll` 复制到 `<游戏目录>/bettercaustica-ffx/natives/windows-x64/`
-   （文件夹不存在时请自行创建）。模组会把自带的 `ffxshim.dll` 解压到同一目录；
-   若该 jar 未内置 FidelityFX 原生库，请把 `ffxshim.dll` 也放入该目录。缺少任一
-   文件时 FSR 后端不可用，但不影响 DLSS 帧生成。后续会提供更便捷的安装方式。
-   也可以用 `-Dcaustica.ffx.path` 指向同时存放这两个 DLL 的文件夹。
+4. **FSR 帧生成无需额外下载**：从 0.1.1 起的发布 jar 已内置 AMD 的
+   `amd_fidelityfx_vk.dll` 与项目自带的 `ffxshim.dll`，FSR 后端首次加载时模组会把
+   两者解压到 `<游戏目录>/bettercaustica-ffx/natives/windows-x64/`。自行构建且
+   构建时未设置 `FFX_SDK` 的 jar 不含这两个文件，需要手动复制，也可以用
+   `-Dcaustica.ffx.path` 指向同时存放这两个 DLL 的文件夹。两种情况下 DLSS
+   帧生成都不受影响。
 5. 使用 Vulkan 图形后端启动游戏。
 6. 打开视频设置调整渲染器选项，或在游戏内按 F9 切换光线追踪（可在
    “控制 → Caustica” 中改键）。

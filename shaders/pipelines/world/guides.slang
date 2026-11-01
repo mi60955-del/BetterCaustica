@@ -28,14 +28,13 @@ public static float gv_fogOpacity = 0.0;
 public static bool gv_emissive = false;
 public static float gv_rough = 0.0;
 public static float3 gv_hitCamRel = float3(0.0, 0.0, 0.0);       // primary-surface hit position relative to the current camera
-public static bool gv_motionUseRefracted = false;
 #ifdef CAUSTICA_INTERFACE_DEBUG
 // Diagnostic lanes for writeGuides: the primary dielectric interface's decision (0 filter, 1/3 volume
 // entry, 2/3 volume exit, 1 total internal reflection), the medium it was in, and the hit's material id.
 public static float gv_dbgDecision = 0.0;
 public static float gv_dbgIor = 0.0;
 public static float gv_dbgMaterial = 0.0;
-#endif // true when the MV tracks the refracted hit (its own reprojection delta)
+#endif
 // World-space displacement of the motion-guide surface since the previous frame (0 for static
 // terrain/sky, an entity's per-vertex/object motion for a dynamic hit).
 public static float3 gv_motionObjDisp = float3(0.0, 0.0, 0.0);
@@ -58,6 +57,26 @@ public static SpecSurface gv_spec = {};
 // image and the motion vector it is reprojected with describe two different scenes on exactly the
 // pixels where the lift fires.
 public static bool gv_specWaveMirror = false;
+// The share of the light leaving this pixel that left along the mirror lobe: 1 for a metal, which has no
+// diffuse lobe to compete with it, the Fresnel term of the face for a dielectric interface (water, ice,
+// a pane), and Schlick's reflectance for an opaque non-metal, which is what makes a floor a mirror at
+// grazing incidence. Everything else is 0 and reads as "this pixel shows a surface". The lens's focus
+// meter reads it through resolveSpecularGuides: a pixel is showing a reflected image only where that
+// image is a real share of what leaves it, and one comparison covers all three cases because the physics
+// already puts the answer in the number.
+public static float gv_reflectShare = 0.0;
+
+// Above this share a reflected image is what the pixel shows rather than a guest on the surface. A quarter
+// is where a reflection stops being a sheen and starts being the picture: a lake's far half clears it (a
+// grazing water face keeps most of its Fresnel term), the near water under the player's feet does not — it
+// is showing the bottom — and an ordinary floor only clears it at the incidence where it genuinely becomes
+// a mirror.
+public static const float REFLECT_IMAGE_SHARE = 0.25;
+// The far end of the focus meter's depth image. A reflection that escapes to the sky images the sky, so
+// it belongs at the far stop rather than at the mirror, and this is what it is written as: the meter
+// clamps everything past its own far distance to that stop, and the blur ceiling clamps to the focal
+// plane, which is the same "behind everything" answer without a value that could overflow the multiply.
+public static const float REFLECT_IMAGE_MAX = 1.0e6;
 
 // Static surfaces reuse one normal for all three roles. Water overrides them (wave-displaced shading
 // normal now and last frame, flat geometric normal for the bias) via the six-argument form.
@@ -111,10 +130,16 @@ public float2 previousReflectionNdc(float3 surfacePos, float3 surfaceNormal, flo
 // mirrors, the reflected terminal's diffuse content. Destinations without a stable diffuse albedo keep
 // the foreground material reflectance: sky, emissive surfaces, metals, and another dielectric/mirror
 // would otherwise give RR a zero or recursively defined demodulation signal.
+//
+// `imageDepth` is where the picture this pixel shows sits when that picture is a reflection: the axial
+// distance from the eye to the reflected image, or 0 where this pixel is not showing one. It rides this
+// probe because the probe already answers where the mirror ray lands, so the lens's focus meter pays no
+// ray of its own for it.
 public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
-                             float2 currentNdc, float2 size, float primaryConeSpread,
-                             out float3 specAlbedo) {
+                             float2 size, float primaryConeSpread,
+                             out float3 specAlbedo, out float imageDepth) {
     specAlbedo = surface.albedo;
+    imageDepth = 0.0;
     if (length(surface.normal) < 0.5
             || max(surface.albedo.r, max(surface.albedo.g, surface.albedo.b)) <= 0.001
             || surface.roughness > SPEC_MOTION_ALPHA_MAX) {
@@ -125,6 +150,9 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
     float3 n = normalize(surface.normal);
     float3 specDir = gv_specWaveMirror ? waterReflectedDir(primaryDir, n, surface.biasNormal)
             : reflect(primaryDir, n);
+    // Hoisted out of the mirror-motion return below: the interface's own axial distance is the scale the
+    // reflected image's distance is expressed in.
+    float4 curClip = mul(worldPush.curViewProj, float4(surface.camRel, 1.0));
 
     // Pass A stops radiance traversal at the first split, so reflection motion keeps one dedicated,
     // deterministic guide probe. CULL_SPECULAR must match the mask the reflected radiance ray will take
@@ -139,6 +167,9 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
             max(primaryConeSpread, RAY_CONE_MIN_SPREAD));
     float3 reflectedHit;
     float3 reflectedMotionPrev;
+    // Distance along the mirror ray to whatever the reflection shows; 0 is the miss sentinel the probe
+    // leaves, and a miss means the reflection is the sky.
+    float reflectedRange = payload.hitT;
     if (payload.hitT > 0.0) {
         reflectedHit = surfacePos + specDir * payload.hitT;
         uint reflectedMaterial = payloadMaterial();
@@ -160,6 +191,16 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
     } else {
         reflectedHit = surfacePos + specDir * 1.0e6;
         reflectedMotionPrev = float3(0.0, 0.0, 0.0);
+        reflectedRange = 1.0e6;
+    }
+    // A plane reflector images a point at |image - eye| = (eye to mirror) + (mirror to point), and the eye
+    // sees that image down the very ray it is looking along, so the image's axial distance is the
+    // interface's own scaled by how much further the path went: |CM| + r against |CM|. No second
+    // projection, no angle, and it stays exact for a wave-perturbed face, because the mirror symmetry that
+    // produces the image does not care which way the normal leaned to send the ray there.
+    float reach = length(surface.camRel);
+    if (gv_reflectShare >= REFLECT_IMAGE_SHARE && curClip.w > 0.0 && reach > 1.0e-4) {
+        imageDepth = min(curClip.w * (1.0 + reflectedRange / reach), REFLECT_IMAGE_MAX);
     }
     float3 previousN = length(surface.previousNormal) >= 0.5
             ? normalize(surface.previousNormal) : n;
@@ -167,14 +208,18 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
     float2 prevNdc = previousReflectionNdc(
             surfacePos, previousN, surface.motionPrev,
             reflectedHit, reflectedMotionPrev, prevValid);
-    return prevValid ? (prevNdc - currentNdc) * 0.5 * size : float2(0.0, 0.0);
+    // The mirror's current screen position is where the reflector itself projects. For a primary hit that
+    // is the pixel it was seen through -- the interface lies on the sampled ray -- but the reflector is
+    // kept as its own point so the vector describes the surface the reflection physically lives on rather
+    // than whatever endpoint the ordinary tuple later moved to.
+    return prevValid && curClip.w > 0.0
+            ? (prevNdc - curClip.xy / curClip.w) * 0.5 * size : float2(0.0, 0.0);
 }
 
 public void setTransmissionGuide(float3 hitCamRel, float3 motionPrev, float3 normal,
                           float roughness, float3 diffuseAlbedo, bool emissive) {
     gv_hitCamRel = hitCamRel;
     gv_motionObjDisp = motionPrev;
-    gv_motionUseRefracted = true;
     gv_normal = normal;
     gv_rough = roughness;
     gv_albedo = diffuseAlbedo;
@@ -283,12 +328,13 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
 }
 
 // Resolve the captured gv_* guide state into the DLSS-RR guide images after Pass A queues continuations.
-public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, float primaryConeSpread) {
+public void writeGuides(int2 pix, float3 primaryDir, float2 size, float primaryConeSpread) {
     // Reflection remains owned by the foreground interface even when a dielectric replaced the ordinary
     // tuple with the transmitted destination.
     float3 specAlbedo;
+    float imageDepth;
     float2 specMotion = resolveSpecularGuides(
-            gv_spec, primaryDir, jndc, size, primaryConeSpread, specAlbedo);
+            gv_spec, primaryDir, size, primaryConeSpread, specAlbedo, imageDepth);
 
     // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
     // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
@@ -297,32 +343,41 @@ public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, f
     float4 curClip = mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0));
     float depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
 
-    // Motion vector: reproject this guide point through the previous frame's view-projection.
-    // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is
-    // jndc, NOT the pixel centre. Subtract jndc so the MV is jitter-free (= 0 when static), which is
-    // what DLSS expects with MVJittered unset. Scaled from NDC into render-pixel space.
+    // The lens ceiling the next frame needs, in the one unit its geometry works in: the axial distance
+    // this pixel's pinhole ray travelled. A surface's blur disc is radius * |1/depth - 1/focus| in
+    // tangent space, so bounding the disc means bounding the radius against the depth the pixel actually
+    // showed -- and this frame's depth is precisely what the bound is for, so it cannot be consulted
+    // before the ray is built. Two things read it: the per-pixel ceiling, and the autofocus meter that
+    // decides where the focal plane sits next. Both need it only while the lens is on.
+    //
+    // With the reflection-focus switch up, a pixel whose mirror lobe is what it shows reports the
+    // reflected image's distance instead, and that is the same number for both readers: the meter then
+    // puts the focal plane on the thing behind the mirror, and the ceiling stops narrowing a mirror
+    // pixel's lens as if it were a surface standing far in front of that plane.
+    if (worldPush.dof.x > 0.0) {
+        float focusDepth = (worldPush.flags & WORLD_FLAG_DOF_REFLECTION) != 0u && imageDepth > 0.0
+                ? imageDepth : curClip.w;
+        focusDepthCur[pix] = focusDepth > 0.0 ? focusDepth : 0.0;
+    }
+
+    // Motion vector: the guide point's own displacement on screen, its previous-frame projection minus
+    // where it projects now. Both terms come from the same world point, so a static scene answers exactly
+    // zero. Projecting the point rather than subtracting the jittered ray's ndc is the same answer while
+    // the camera is a pinhole -- the hit lies on that ray, so its projection recovers the sub-pixel offset
+    // -- and it is the only answer that stays right when the guide point is not on the sampled ray at all,
+    // which is what a transmitted destination is. Scaled from NDC into render-pixel space.
     // For a dynamic surface, previous-frame position is the current point minus its world-space
     // displacement; subtracting gv_motionObjDisp de-cameras the MV.
     float4 prevClip = mul(worldPush.prevViewProj,
             float4(gv_hitCamRel + worldPush.camDelta - gv_motionObjDisp, 1.0));
-    float2 curNdc = jndc; // primary hit's current screen position is exactly the jittered ray ndc
-    // Transmitted content is its own feature: compare its previous and current projections rather than
-    // subtracting the primary interface's jittered NDC.
-    float4 curClipMotion = gv_motionUseRefracted
-            ? mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0))
-            : float4(0.0, 0.0, 0.0, 1.0); // unused; keeps the guard below uniform
     // Guard both perspective divides the way the depth above does. A guide point can land behind either
     // camera — most easily a transmitted destination seen at a grazing angle, or one that leaves the
     // frustum as the camera turns — and w at or below zero turns the divide into an arbitrarily large
-    // vector that DLSS-RR reprojects with. No valid previous position exists in that case, so report no
-    // motion and let RR fall back instead of handing it garbage.
-    float2 motion;
-    if (prevClip.w > 0.0 && (!gv_motionUseRefracted || curClipMotion.w > 0.0)) {
-        if (gv_motionUseRefracted) curNdc = curClipMotion.xy / curClipMotion.w;
-        motion = (prevClip.xy / prevClip.w - curNdc) * 0.5 * size;
-    } else {
-        motion = float2(0.0, 0.0);
-    }
+    // vector that DLSS-RR reprojects with. No valid position exists in that case, so report no motion and
+    // let RR fall back instead of handing it garbage.
+    float2 motion = prevClip.w > 0.0 && curClip.w > 0.0
+            ? (prevClip.xy / prevClip.w - curClip.xy / curClip.w) * 0.5 * size
+            : float2(0.0, 0.0);
 
     // The medium owns this pixel to the extent the camera ray crosses it. Every guide RR uses to
     // classify the signal moves with that fraction: a camera-facing normal and full roughness (a

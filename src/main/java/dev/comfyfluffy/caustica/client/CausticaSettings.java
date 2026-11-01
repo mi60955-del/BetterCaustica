@@ -64,7 +64,7 @@ public final class CausticaSettings {
      * {@code value} is always in the setting's own units, not in the widget's scaled integers.
      */
     public enum Unit {
-        COUNT, PERCENT, MULTIPLE, EV, SECONDS, NITS;
+        COUNT, PERCENT, MULTIPLE, EV, SECONDS, NITS, CENTIMETRES, DEGREES;
 
         public String format(double value) {
             return switch (this) {
@@ -74,6 +74,12 @@ public final class CausticaSettings {
                 case EV -> twoDecimals(value) + " EV";
                 case SECONDS -> twoDecimals(value) + " s";
                 case NITS -> Integer.toString((int) Math.round(value)) + " nits";
+                // A length the renderer keeps in blocks, read out in the unit the thing it describes is
+                // actually measured in: one block is one metre, so the lens radius is a centimetre count.
+                case CENTIMETRES -> Integer.toString((int) Math.round(value * 100.0)) + " cm";
+                // An angle the player dials in whole degrees, which is the unit an aperture's blade
+                // rotation is read by eye.
+                case DEGREES -> Integer.toString((int) Math.round(value)) + "°";
             };
         }
 
@@ -212,6 +218,29 @@ public final class CausticaSettings {
             && CausticaConfig.Rt.Lens.HALO_ENABLED.value();
     private static final Supplier<Boolean> LENS_DIRT = () -> LENS_ENABLED.get()
             && CausticaConfig.Rt.Lens.DIRT_ENABLED.value();
+    // The lens's radius is what the far field blurs by, so the blur budget is only read while the lens
+    // exists at all; the focus dial is only read while nothing is probing the view axis for it.
+    private static final Supplier<Boolean> DOF_ENABLED =
+            () -> CausticaConfig.Rt.DepthOfField.MODE.value() != 0;
+    private static final Supplier<Boolean> DOF_MANUAL_FOCUS =
+            () -> DOF_ENABLED.get() && !CausticaConfig.Rt.DepthOfField.AUTO_FOCUS.value();
+    // Reflection focus is a rule the meter applies, so it only means anything while a meter is running.
+    private static final Supplier<Boolean> DOF_AUTO_FOCUS =
+            () -> DOF_ENABLED.get() && CausticaConfig.Rt.DepthOfField.AUTO_FOCUS.value();
+    // The cap's dial only does anything while the cap itself is on, and the cap only binds while a lens is.
+    private static final Supplier<Boolean> DOF_TRACED =
+            () -> CausticaConfig.Rt.DepthOfField.MODE.value() == 1;
+    private static final Supplier<Boolean> DOF_BLUR_CAP =
+            () -> DOF_TRACED.get() && CausticaConfig.Rt.DepthOfField.BLUR_CAP.value();
+    // The post-process gather carries its own aperture shape, and the rotation only shows on a polygon.
+    private static final Supplier<Boolean> DOF_POST =
+            () -> CausticaConfig.Rt.DepthOfField.MODE.value() == 2;
+    private static final Supplier<Boolean> DOF_POST_BLADED =
+            () -> DOF_POST.get() && CausticaConfig.Rt.DepthOfField.BLADES.value() >= 3;
+    // The widest blur is bounded two ways: the traced lens by its cap switch, the post gather by its
+    // kernel always. Either way the dial names the bound.
+    private static final Supplier<Boolean> DOF_MAX_BLUR =
+            () -> DOF_BLUR_CAP.get() || DOF_POST.get();
 
     public static final List<Option> ALL = build();
 
@@ -309,6 +338,28 @@ public final class CausticaSettings {
         scaled(out, Page.VOLUME, "volumetrics", "volume.fog-rain-boost", RT + "fogRainBoost",
                 CausticaConfig.Rt.Volume.FOG_RAIN_BOOST, 0, 100, 5, 100.0, Unit.PERCENT, Impact.LOW);
 
+        // The world border's haze. Its own three controls because it is its own ramp: it joins the fog's
+        // medium, so it borrows that medium's albedo, phase and lighting dials above, but it stays out of
+        // the height profile, the day curve and the weather lift entirely.
+        toggle(out, Page.VOLUME, "volumetrics", "volume.boundary-fog", RT + "boundaryFog",
+                CausticaConfig.Rt.Volume.BOUNDARY_FOG_ENABLED);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.boundary-fog-density", RT + "boundaryFogDensity",
+                CausticaConfig.Rt.Volume.BOUNDARY_FOG_DENSITY, 0, 250, 5, 1000.0, Unit.PERCENT,
+                Impact.MEDIUM);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.boundary-fog-ramp", RT + "boundaryFogRamp",
+                CausticaConfig.Rt.Volume.BOUNDARY_FOG_RAMP, 8, 1024, 8, 1.0, Unit.COUNT, Impact.LOW);
+
+        // The render edge's fade. Its own three controls, and the reason it needs no density dial is that
+        // there is no density: the coverage is a blend weight, so the opacity at the edge is the whole shape
+        // of the effect and the render distance only decides where that edge sits.
+        toggle(out, Page.VOLUME, "volumetrics", "volume.edge-fade", RT + "edgeFade",
+                CausticaConfig.Rt.Volume.EDGE_FADE_ENABLED);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.edge-fade-opacity", RT + "edgeFadeOpacity",
+                CausticaConfig.Rt.Volume.EDGE_FADE_OPACITY, 0, 100, 5, 100.0, Unit.PERCENT,
+                Impact.MEDIUM);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.edge-fade-start", RT + "edgeFadeStart",
+                CausticaConfig.Rt.Volume.EDGE_FADE_START, 0, 95, 5, 100.0, Unit.PERCENT, Impact.LOW);
+
         // ---- Clear-air sun shafts: the god-ray layer that does not need the fog ----------------------
         // Its own group because it is its own medium: every control here works with the fog off, and the
         // fog's own controls have no effect on it.
@@ -354,10 +405,16 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Volume.CLOUD_VOLUMETRIC);
         count(out, Page.VOLUME, "volumetrics", "volume.cloud-steps", RT + "cloudSteps",
                 CausticaConfig.Rt.Volume.CLOUD_STEPS, 8, 48, 4, Impact.HIGH);
+        toggle(out, Page.VOLUME, "volumetrics", "volume.cloud-random-style", RT + "cloudRandomStyle",
+                CausticaConfig.Rt.Volume.CLOUD_RANDOM_STYLE);
+        // The slider only feeds cloud1.x, which the shader stops reading while the random style is on.
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-type", RT + "cloudType",
-                CausticaConfig.Rt.Volume.CLOUD_TYPE, 0, 100, 5, 100.0, Unit.PERCENT, Impact.LOW);
+                CausticaConfig.Rt.Volume.CLOUD_TYPE, 0, 100, 5, 100.0, Unit.PERCENT, Impact.LOW,
+                () -> !CausticaConfig.Rt.Volume.CLOUD_RANDOM_STYLE.value());
         scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-rain-boost", RT + "cloudRainBoost",
                 CausticaConfig.Rt.Volume.CLOUD_RAIN_BOOST, 0, 100, 5, 100.0, Unit.PERCENT, Impact.MEDIUM);
+        scaled(out, Page.VOLUME, "volumetrics", "volume.cloud-flow", RT + "cloudFlow",
+                CausticaConfig.Rt.Volume.CLOUD_FLOW, 0, 200, 5, 100.0, Unit.PERCENT, Impact.LOW);
 
         // ---- Materials: what a surface is made of ---------------------------------------------------
         // Everything here describes the surface itself rather than the world around it, which is why the
@@ -511,6 +568,42 @@ public final class CausticaSettings {
         scaled(out, Page.IMAGE, "lens", "lens.dirt-scale", RT + "lensDirtScale",
                 CausticaConfig.Rt.Lens.DIRT_SCALE, 25, 400, 5, 100.0, Unit.PERCENT, Impact.LOW,
                 LENS_DIRT);
+
+        // ---- Depth of field: the traced camera's own lens, or a post-process stand-in ---------------
+        // The traced mode sits beside the flare rather than with the post effects because it is not
+        // one: the blur is sampled by the primary ray, so the light it softens has already reflected,
+        // refracted and scattered on the way in, and no pass downstream of the trace could produce it.
+        // The post mode is exactly such a pass: cheaper, denoiser-free, and an approximation of the
+        // same defocus, which is why both exist behind one mode switch.
+        count(out, Page.IMAGE, "depth-of-field", "dof.mode", RT + "dofMode",
+                CausticaConfig.Rt.DepthOfField.MODE, 0, 2, 1, Impact.MEDIUM, RT + "dofMode.");
+        toggle(out, Page.IMAGE, "depth-of-field", "dof.auto-focus", RT + "dofAutoFocus",
+                CausticaConfig.Rt.DepthOfField.AUTO_FOCUS, DOF_ENABLED);
+        toggle(out, Page.IMAGE, "depth-of-field", "dof.reflection-focus", RT + "dofReflectionFocus",
+                CausticaConfig.Rt.DepthOfField.REFLECTION_FOCUS, DOF_AUTO_FOCUS);
+        scaled(out, Page.IMAGE, "depth-of-field", "dof.focus-distance", RT + "dofFocusDistance",
+                CausticaConfig.Rt.DepthOfField.FOCUS_BLOCKS, 1, 256, 1, 1.0, Unit.COUNT, Impact.LOW,
+                DOF_MANUAL_FOCUS);
+        scaled(out, Page.IMAGE, "depth-of-field", "dof.rack-time", RT + "dofFocusTime",
+                CausticaConfig.Rt.DepthOfField.RACK_SECONDS, 2, 100, 1, 100.0, Unit.SECONDS, Impact.LOW,
+                DOF_ENABLED);
+        scaled(out, Page.IMAGE, "depth-of-field", "dof.aperture", RT + "dofAperture",
+                CausticaConfig.Rt.DepthOfField.APERTURE, 0, 10, 1, 100.0, Unit.CENTIMETRES,
+                Impact.MEDIUM, DOF_ENABLED);
+        toggle(out, Page.IMAGE, "depth-of-field", "dof.blur-cap", RT + "dofBlurCap",
+                CausticaConfig.Rt.DepthOfField.BLUR_CAP, DOF_TRACED);
+        scaled(out, Page.IMAGE, "depth-of-field", "dof.max-blur", RT + "dofMaxBlur",
+                CausticaConfig.Rt.DepthOfField.MAX_BLUR_PIXELS, 2, 48, 1, 1.0, Unit.COUNT, Impact.MEDIUM,
+                DOF_MAX_BLUR);
+        toggle(out, Page.IMAGE, "depth-of-field", "dof.per-pixel-cap", RT + "dofPerPixelCap",
+                CausticaConfig.Rt.DepthOfField.PER_PIXEL_CAP, DOF_BLUR_CAP);
+        toggle(out, Page.IMAGE, "depth-of-field", "dof.pinhole-guides", RT + "dofPinholeGuides",
+                CausticaConfig.Rt.DepthOfField.PINHOLE_GUIDES, DOF_TRACED);
+        count(out, Page.IMAGE, "depth-of-field", "dof.blades", RT + "dofBlades",
+                CausticaConfig.Rt.DepthOfField.BLADES, 0, 12, 1, Impact.LOW, DOF_POST);
+        scaled(out, Page.IMAGE, "depth-of-field", "dof.blade-rotation", RT + "dofBladeRotation",
+                CausticaConfig.Rt.DepthOfField.BLADE_ROTATION, 0, 180, 5, 1.0, Unit.DEGREES, Impact.LOW,
+                DOF_POST_BLADED);
         toggle(out, Page.IMAGE, "tonemap", "tonemap.look-enabled", RT + "look",
                 CausticaConfig.Rt.Tonemap.LOOK_ENABLED);
         toggle(out, Page.IMAGE, "sharpen", "sharpen.enabled", RT + "sharpen",
@@ -567,6 +660,8 @@ public final class CausticaSettings {
                 CausticaConfig.Rt.Hdr.UI_NITS, 80, 500, 5, 1.0, Unit.NITS, Impact.LOW, HDR_CAPABLE);
         cycled(out, Page.DISPLAY, "hdr", "hdr.peak-nits", RT + "hdrPeak", Cycle.HDR_PEAK,
                 CausticaConfig.Rt.Hdr.PEAK_NITS, Impact.LOW, HDR_CAPABLE);
+        count(out, Page.DISPLAY, "still", "still.samples", SETTING + "stillSamples",
+                CausticaConfig.Rt.Still.SAMPLES, 4, 1024, 4, Impact.LOW);
 
         // ---- Diagnostics ---------------------------------------------------------------------------
         scaled(out, Page.DIAGNOSTICS, "jitter", "composite.jitter-sign-x", SETTING + "jitterSignX",

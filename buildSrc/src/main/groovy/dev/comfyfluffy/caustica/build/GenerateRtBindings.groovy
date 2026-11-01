@@ -37,6 +37,7 @@ abstract class GenerateRtBindings extends DefaultTask {
                     RESERVOIR_SAMPLE_PREV: "reservoirSamplePrev",
                     RESERVOIR_SAMPLE_CUR: "reservoirSampleCur", VOLUME_DEBUG: "volumeDebug",
                     CLOUD_VOLUMES: "cloudVolumes",
+                    FOCUS_DEPTH_PREV: "focusDepthPrev", FOCUS_DEPTH_CUR: "focusDepthCur",
                     ENTITY_ALBEDO: "entityAlbedoTex", MATERIAL_SURFACE0: "materialSurface0Tex",
                     MATERIAL_NORMAL_AO: "materialNormalAoTex", MATERIAL_SURFACE1: "materialSurface1Tex"]],
             [prefix: "DISPLAY", source: "pipelines/display/main.comp.slang", resources: [
@@ -46,6 +47,8 @@ abstract class GenerateRtBindings extends DefaultTask {
             [prefix: "SHARPEN", source: "pipelines/sharpen/main.comp.slang", resources: [
                     OUTPUT: "outputImage", HDR_OUTPUT: "hdrOutputImage",
                     SOURCE: "sourceImage", HDR_SOURCE: "hdrSourceImage"]],
+            [prefix: "STILL", source: "pipelines/still/main.comp.slang", resources: [
+                    ACCUMULATOR: "accumulatorImage", SOURCE: "sourceImage", OUTPUT: "outputImage"]],
             [prefix: "DEBUG_PRESENT", source: "pipelines/debug_present/main.comp.slang", resources: [
                     OUTPUT: "outputImage", G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth",
                     G_MOTION: "gMotion", G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
@@ -55,6 +58,14 @@ abstract class GenerateRtBindings extends DefaultTask {
                     COLOR: "colorImage", BINS: "histBins", DEPTH: "depthImage", ALBEDO: "albedoImage"]],
             [prefix: "EXPOSURE_RESOLVE", source: "pipelines/exposure_resolve/main.comp.slang", resources: [
                     HIST_BINS: "histBins", IMAGE: "exposureImage", STATE: "stateBuf"]],
+            [prefix: "DOF_FOCUS", source: "pipelines/dof_focus/main.comp.slang", resources: [
+                    DEPTH: "focusDepth", METER: "focusMeter"]],
+            [prefix: "DOF_POST_GATHER", source: "pipelines/dof_post_gather/gather.comp.slang", resources: [
+                    FAR: "farImage", NEAR: "nearImage", HDR_FAR: "hdrFarImage", HDR_NEAR: "hdrNearImage",
+                    SOURCE: "sourceImage", HDR_SOURCE: "hdrSourceImage", FOCUS_DEPTH: "focusDepth"]],
+            [prefix: "DOF_POST_RECOMBINE", source: "pipelines/dof_post_recombine/recombine.comp.slang", resources: [
+                    OUTPUT: "outputImage", HDR_OUTPUT: "hdrOutputImage",
+                    FAR: "farImage", NEAR: "nearImage", HDR_FAR: "hdrFarImage", HDR_NEAR: "hdrNearImage"]],
             [prefix: "BLOOM", source: "pipelines/bloom/main.comp.slang", resources: [
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
             [prefix: "LENS_SOURCE", source: "pipelines/lens/source.comp.slang", resources: [

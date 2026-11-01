@@ -13,6 +13,17 @@ public struct ExposureHistPush {
     public float centerWeightFloor;
 };
 
+// The lens's own autofocus meter. It reads the centre window of the depth the frame just traced, so
+// everything here is in that image's own texels and in blocks.
+public struct DofFocusPush {
+    public int   originX;      // top-left texel of the window
+    public int   originY;
+    public int   extentX;      // window size in texels
+    public int   extentY;
+    public float nearBlock;    // the closest distance a tap may answer: the projection's near plane
+    public float farBlock;     // the far stop. Sky and everything past it answer this
+};
+
 public struct ExposureResolvePush {
     public float key;
     public float minEv;
@@ -153,4 +164,51 @@ public struct SharpenPush {
     // Detail gain on the 3x3 high pass: 0 reproduces the input, 1 adds the whole high-pass term back.
     // One gain serves both images because sRGB and PQ both encode into the same [0,1] code-value range.
     public float amount;
+};
+
+public struct StillPush {
+    // 0 = add this frame into the accumulator, 1 = store it as the run's first frame, 2 = divide the
+    // accumulator out into the 8-bit image. One dispatch carries both halves so the accumulator's layout
+    // has exactly one owner.
+    public int mode;
+    // 1 / the run's sample count. Only mode 2 reads it.
+    public float weight;
+};
+
+// One dispatch of the post-process depth of field's gather: the near and far accumulation for both
+// display channels, from the display mapper's compose pair. The lens here is a bookkeeping lens -- the
+// frame was already traced with a pinhole camera, and this pass defocuses its result -- so the fields
+// are the four numbers the circle-of-confusion math needs, not a camera state.
+public struct DofPostGatherPush {
+    public int hdrEnabled;      // 0 = fill the SDR pair only, 1 = also the PQ HDR pair
+    // The lens radius in blocks and the focal plane's axial distance in blocks: a surface at range s
+    // spreads over aperture * |1/s - 1/f| of the frame's tangent span, which is the same thin-lens
+    // answer the traced lens walks its rays with.
+    public float aperture;
+    public float focus;
+    // The tangent span one display pixel covers, 2 / (|m11| * displayHeight). Dividing the tangent-space
+    // blur by it turns every radius into display pixels, the unit the kernel and the cap work in.
+    public float tangentPerPixel;
+    // The widest circle of confusion, in display pixels of radius. The gather kernel is bounded by it:
+    // a post-process pass has no temporal accumulation to lean on, so a disc wider than the kernel can
+    // fill comes back under-sampled instead of coming back as noise.
+    public float maxCoc;
+    // The aperture's blade count, 0 = a circle, and its rotation in radians. Blades reshape the bokeh
+    // highlights; the coverage function renormalises the polygon to the circle's area, so the blades
+    // change the shape of the defocus without changing its brightness.
+    public int blades;
+    public float bladeRotation;
+    // focusDepth's texel count (render resolution) and the dispatch's own (half the display
+    // resolution). The depth lookup walks from this pass's half-res coordinates to the render-res
+    // depth image through both.
+    public float2 renderTexels;
+    public float2 halfTexels;
+};
+
+// The post-process depth of field's recombine: scales the gather's half-res images back up over the
+// compose pair, in place. It needs no lens state -- the gather already folded each pixel's defocus
+// into the alpha it stores -- only the sizes that walk between the two resolutions.
+public struct DofPostRecombinePush {
+    public int hdrEnabled;      // 0 = compose the SDR image only, 1 = also the PQ HDR image
+    public float2 halfTexels;   // the gather's dispatch size, half the display resolution
 };

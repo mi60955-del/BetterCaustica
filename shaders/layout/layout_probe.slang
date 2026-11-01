@@ -104,6 +104,25 @@ void probeSharpenPush(uint3 id : SV_DispatchThreadID) {
     }
 }
 
+[[vk::push_constant]] StillPush stillPushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeStillPush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(stillPushProbe.mode) + stillPushProbe.weight;
+    }
+}
+
+[[vk::push_constant]] DofFocusPush dofFocusPushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeDofFocusPush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(dofFocusPushProbe.originX + dofFocusPushProbe.extentY)
+                + dofFocusPushProbe.nearBlock + dofFocusPushProbe.farBlock;
+    }
+}
+
 [[vk::push_constant]] LensSourcePush lensSourcePushProbe;
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -119,5 +138,24 @@ void probeLensSourcePush(uint3 id : SV_DispatchThreadID) {
 void probeLensFlarePush(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0xFFFFFFFFu) {
         float sink = lensFlarePushProbe.starburst + float(lensFlarePushProbe.spikes);
+    }
+}
+
+[[vk::push_constant]] DofPostGatherPush dofPostGatherPushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeDofPostGatherPush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = dofPostGatherPushProbe.aperture + dofPostGatherPushProbe.maxCoc
+                + float(dofPostGatherPushProbe.blades) + dofPostGatherPushProbe.renderTexels.x;
+    }
+}
+
+[[vk::push_constant]] DofPostRecombinePush dofPostRecombinePushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeDofPostRecombinePush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(dofPostRecombinePushProbe.hdrEnabled) + dofPostRecombinePushProbe.halfTexels.y;
     }
 }

@@ -76,7 +76,9 @@ public static const int PARALLAX_STYLE_SHARP = 1;
 // worldPush.flags volumetric bits (Java mirrors them in RtComposite). Every bit is clear by default, so a
 // frame rendered before the volumetrics existed is bit-identical to one after: the flags gate every
 // volume.slang read, the WorldPush volume block rides along inert.
-public static const uint WORLD_FLAG_FOG = 1u << 7u;           // analytic/marched height fog
+// The world border's haze joins the height fog's medium instead of bringing its own bit: Java sets this
+// one when either is on, and every consumer that asks "is there air fog on this segment" gets both.
+public static const uint WORLD_FLAG_FOG = 1u << 7u;           // analytic/marched height fog + border haze
 public static const uint WORLD_FLAG_CLOUD = 1u << 8u;         // planar + volumetric cloud layer
 public static const uint WORLD_FLAG_SPRAY = 1u << 9u;         // water-surface spray band
 public static const uint WORLD_FLAG_VOLUME_SHADOW = 1u << 10u; // fog in-scatter's sun shadow ray
@@ -89,6 +91,20 @@ public static const uint WORLD_FLAG_VOLUME_DEBUG = 1u << 12u;  // write the volu
 public static const uint WORLD_FLAG_CLOUD_VOLUMETRIC = 1u << 13u;
 // Clear-air sun shafts (the god-ray layer that does not need the height fog to exist).
 public static const uint WORLD_FLAG_SHAFTS = 1u << 14u;
+// The cloud layer's shape source: up means the instance grid draws from the whole baked atlas
+// instead of the Cloud Type slider. Only volume.slang's density reads it; the level, the tiers and
+// the shadow probes are untouched by it.
+public static const uint WORLD_FLAG_CLOUD_RANDOM = 1u << 15u;
+// The render edge's fade (volume.slang's edge section). Deliberately independent of WORLD_FLAG_FOG: the
+// fade is a blend of the finished segment toward the sky, not a medium, so it works with every volumetric
+// switch off. The host still routes such a frame to the full raygen records, whose code carries it.
+public static const uint WORLD_FLAG_EDGE_FADE = 1u << 16u;
+// The lens's reflection-inclusive focus: while up, the depth image the autofocus meter reads carries the
+// distance to the reflected image on every pixel whose mirror lobe is what that pixel shows, instead of
+// the distance to the mirror surface that image sits behind. Raised only while the lens is metering (see
+// RtComposite), because the same image is the per-pixel blur ceiling's history and a manual focus has no
+// meter to serve.
+public static const uint WORLD_FLAG_DOF_REFLECTION = 1u << 17u;
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky
 // LUT bakes read sun/moon/look state from the same BDA slot the trace does, so there is exactly one
@@ -214,8 +230,8 @@ public struct WorldPush {
     // x coverage, y cloud base (rebased blocks), z layer thickness (block), w density multiplier.
     public float4   cloud0;
     // x the cloud shape index — which baked volume (RtCloudVolumes order) every instance of the
-    // layer renders; y wind azimuth (rad; the instance grid's drift direction — the drift itself is
-    // accumulated Java-side into cloud2.zw), z the per-instance scale/occupancy jitter strength, w
+    // layer renders; y the weather swell 0..1 (Rain Boost x storm — rain widens the footprints
+    // instead of lifting the coverage gate), z the per-instance scale/occupancy jitter strength, w
     // the sheet's fade distance (blocks; sheet-only — the shadow field never dissolves).
     public float4   cloud1;
     // xy the EXACT terrain origin in world blocks (fp32; the streak lattice is not
@@ -225,7 +241,8 @@ public struct WorldPush {
     public float4   cloud2;
     // x the cloud footprint in blocks (the Cloud Size dial; the instance grid spaces by it), y the
     // atlas's LAST shape index — the clamp for the shader's per-instance shape variety (0 while clouds
-    // are off), z unused, w the deck's ambient-term weight.
+    // are off), z the flow phase (seconds Java-accumulated on the wave clock behind the flow dial,
+    // wrapped to stay inside fp32's precise range), w the deck's ambient-term weight.
     public float4   cloudColor;
     // x rain level 0..1, y thunder level 0..1, z spray strength, w the previous frame's rain level
     // (temporal-stability work interpolates toward it rather than jumping on a weather change).
@@ -233,6 +250,22 @@ public struct WorldPush {
     // x march step count, y jitter strength 0..1, z max integration distance (block, 0 = ray tmax),
     // w reserved.
     public float4   volumeParams;
+    // ---- The world border's haze. x extinction (1/block; 0 = the feature is off, the same zero-when-inert
+    // invariant the rest of the block keeps), yzw reserved. It is a flat addition to the height fog's medium
+    // rather than a layer of its own: same albedo, same phase, same sun and sky terms, and the same flag, so
+    // it shares the fog's transmittance instead of composing a second one. yzw reserved because the ramp that
+    // produces x is a CPU-side scalar (see volume.slang's boundary section) and has nothing else to hand the
+    // shaders.
+    public float4   boundaryFog;
+    // ---- The render edge's fade. x peak coverage 0..1 (0 = the feature is off, the same zero-when-inert
+    // invariant the rest of the block keeps), y the distance from the EYE at which the fade begins, z the
+    // render edge itself — the distance at which the coverage reaches x, and past which there is no loaded
+    // geometry left to dissolve. yz are read only through x, so a zero x makes them inert however the CPU
+    // fills them.
+    // Not a medium: no density and no in-scatter ride here, because the coverage IS the blend weight toward
+    // the sky behind the ray (see volume.slang's edge-fade section). Its distances are measured from the
+    // camera, which is what makes a reflection of the far world carry the same fade the direct view does.
+    public float4   edgeFade;
     // ---- Water-volume block (the water medium's own scattering + the spray band). x turbidity, the
     // water's single-scatter fraction sigmaS/sigmaT in 0..1 (0 = the feature is off, the same
     // zero-when-inert invariant the rest of the block keeps); y the Henyey–Greenstein g of the
@@ -260,6 +293,24 @@ public struct WorldPush {
     // that display-referred colour into absolute radiance (the same emitter baseline ENTITY_PRIM_UNLIT
     // anchors on), because the path tracer accumulates radiance while vanilla adds to the framebuffer.
     public float4   glintParams;
+    // ---- Depth of field (the primary pass's thin lens). x is the lens radius in blocks, and 0 is the
+    // pinhole camera — the whole gate, since a zero radius leaves the aperture offset zero and the lens
+    // ray identical to the pinhole ray it is built from. y is the focus distance measured along the
+    // optical axis (blocks) from the lens plane, which is the near plane: what a lens focuses is a plane
+    // parallel to the sensor, so a pixel's focal point sits at y / dot(dir, axis) down its own pinhole
+    // ray. The host probes for that distance from the eye, a near plane's thickness away, which is far
+    // below the dial's step.
+    // z is the blur ceiling as a share of the frame's tangent span, in pixels of the finished frame times
+    // the span one of those pixels covers. A surface at axial depth s offsets itself by
+    // radius * |1/s - 1/focus| in that span, so the ceiling bounds the radius twice over: the host has
+    // already held the far field inside it when it wrote x (s >> focus leaves radius / focus), and the
+    // raygen holds each pixel's own surface inside it against the depth that pixel showed last frame.
+    // That second half is the switchable one, so z is 0 when `dof.per-pixel-cap` is off and the dial in x
+    // is the whole lens. The depth it reads is published either way, because the autofocus meter uses it.
+    // w is `dof.pinhole-guides`: nonzero re-walks this pixel's first segment on the pinhole ray so the
+    // reconstruction guides describe the surface this pixel is standing in front of rather than whichever
+    // point the aperture happened to sample this frame.
+    public float4   dof;
 };
 
 // Direction toward a celestial body sitting `angleRad` along its arc, tilted by the dimension's noon tilt.

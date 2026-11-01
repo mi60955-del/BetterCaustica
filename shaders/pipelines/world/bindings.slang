@@ -61,3 +61,11 @@ import world_common;
 // volume.slang fetch slices through it and lerp between adjacent layers themselves (2D-array filtering
 // is nearest along the layer axis).
 [[vk::binding(19, 0)]] public Sampler2DArray cloudVolumes;
+
+// The lens ceiling's per-pixel history: the last frame's pinhole view depth, which the next frame's
+// primary raygen reads before it builds its ray. Render resolution like the guides it sits beside, but it
+// is not a guide -- DLSS-RR never samples it, and it holds the axial distance the lens math needs rather
+// than the reversed-Z value RR reprojects with. A ping-pong pair for the same reason the reservoirs are
+// one: a thread reads a texel another frame's trace wrote, so the two sides must never be the same image.
+[[vk::binding(20, 0)]][format("r32f")] public RWTexture2D<float> focusDepthPrev;
+[[vk::binding(21, 0)]][format("r32f")] public RWTexture2D<float> focusDepthCur;

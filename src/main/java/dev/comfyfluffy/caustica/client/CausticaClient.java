@@ -5,6 +5,7 @@ import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import dev.comfyfluffy.caustica.rt.RtStillRender;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
@@ -86,6 +87,9 @@ public final class CausticaClient implements ClientModInitializer {
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
 			RtComposite.INSTANCE.resetExposureHistory();
+			// The world the accumulated samples were traced through is gone, so the run has nothing left to
+			// average; a saved run is already past this point and lands on its own tick.
+			RtStillRender.INSTANCE.cancel("the render state was invalidated");
 			// F3+A doubles as manual RT recovery after a latched failure: clear the composite's latch and
 			// the controller's, since either one alone still leaves the world on the vanilla path.
 			VanillaRenderController.requestRtRetry();

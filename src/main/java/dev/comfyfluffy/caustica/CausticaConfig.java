@@ -92,7 +92,8 @@ public final class CausticaConfig {
                         + " altitude, fog-base-y the absolute world height where the constant-density region\n"
                         + " ends. fog-anisotropy forward-scatters sunlight into beams, fog-albedo is the\n"
                         + " single-scatter albedo, fog-ambient the sky-light term's weight, and fog-shadow\n"
-                        + " gates the per-pixel sun shadow ray. Everything defaults to off.");
+                        + " gates the per-pixel sun shadow ray. The fog and the shafts default off; the\n"
+                        + " cloud layer ships on.");
         FILE.setComment("terrain",
                 " Controls terrain loading. Higher limits can load terrain faster but use more CPU and GPU time.");
         FILE.setComment("frame-generation",
@@ -136,6 +137,9 @@ public final class CausticaConfig {
                         + joinNumbers(Rt.Hdr.PEAK_NITS_STEPS) + ".");
         FILE.setComment("screenshots",
                 " exr-enabled saves an ACEScg EXR beside the normal F2 PNG while ray tracing is active.");
+        FILE.setComment("still",
+                " samples is how many frames the still-render hotkey sums into one PNG. Moving the\n"
+                        + " camera restarts the count.");
         FILE.setComment("composite",
                 " Per-frame render budget and the water surface: spp is rays per pixel, max-bounces the\n"
                         + " bounce depth, water-waves/-opacity/-wave-height/-wave-size/-wave-speed/-reflection\n"
@@ -613,7 +617,7 @@ public final class CausticaConfig {
              * tint-driven term so 0 leaves no residual absorption.
              */
             public static final FloatSetting WATER_OPACITY =
-                    clampedFloat("caustica.rt.waterOpacity", "composite.water-opacity", 1.0f, 0.0f, 4.0f);
+                    clampedFloat("caustica.rt.waterOpacity", "composite.water-opacity", 3.0f, 0.0f, 4.0f);
             /**
              * Strength of the spray band hugging the water surface: mist whose density follows the
              * wave crests' steepness. Rides the marched fog integrator, so it needs volumetric fog
@@ -688,9 +692,8 @@ public final class CausticaConfig {
 
         /**
          * Volumetric media in the air around the terrain: height fog first, with cloud and spray
-         * following their own phases. Every switch defaults to off, so a build that ignores this
-         * section renders exactly what one without it did — the volume shaders gate on flags the
-         * renderer only sets from these values.
+         * following their own phases. The fog and the shafts default off; the cloud layer ships on.
+         * The volume shaders gate on flags the renderer only sets from these values.
          */
         public static final class Volume {
             /**
@@ -782,7 +785,7 @@ public final class CausticaConfig {
              * body. Off leaves the sun term unoccluded — uniform bright fog with no god rays.
              */
             public static final BooleanSetting FOG_SHADOW =
-                    bool("caustica.rt.volume.fogShadow", "volume.fog-shadow", true);
+                    bool("caustica.rt.volume.fogShadow", "volume.fog-shadow", false);
             /**
              * The marched fog tier: steps the fog integral instead of using the closed form, so the
              * density can gather into FBM billows ({@link #FOG_NOISE}) and every march sample casts its
@@ -818,7 +821,7 @@ public final class CausticaConfig {
              */
             public static final IntSetting FOG_MARCH_STEPS =
                     clampedInt("caustica.rt.volume.fogMarchSteps", "volume.fog-march-steps",
-                            16, 4, 64);
+                            32, 4, 64);
             /**
              * Blue-noise jitter of the march samples, 0..1. 0 places every sample at its step's exact
              * midpoint (banding shows as the step edges); 1 scatters each sample uniformly inside its
@@ -844,6 +847,87 @@ public final class CausticaConfig {
             public static final FloatSetting FOG_SHADOW_FLOOR =
                     clampedFloat("caustica.rt.volume.fogShadowFloor", "volume.fog-shadow-floor",
                             0.10f, 0.0f, 0.95f);
+
+            /**
+             * The world border's haze: the air closes in as the camera comes near a world border. It is one
+             * flat extinction added to the height fog's own medium — same albedo, same phase, same sun and
+             * sky terms — so it works with {@link #FOG_ENABLED} off, and it needs a dimension with sky light
+             * for the same reason the fog does.
+             *
+             * <p>Off by default and inert wherever the border sits further out than
+             * {@link #BOUNDARY_FOG_RAMP}, which is the ordinary case: the default border is ~30 million
+             * blocks away. It reads the border the server sends, so a shrunk one
+             * (<c>/worldborder set 200</c>) is what brings it into view.
+             */
+            public static final BooleanSetting BOUNDARY_FOG_ENABLED =
+                    bool("caustica.rt.volume.boundaryFog", "volume.boundary-fog", false);
+            /**
+             * Extinction at the border itself, in 1/block, on the same scale as {@link #FOG_DENSITY}: 0.06
+             * leaves roughly 17 blocks of visibility at the wall. The veil reaches this value only at the
+             * border; {@link #boundaryExtinction} ramps it down across {@link #BOUNDARY_FOG_RAMP}.
+             */
+            public static final FloatSetting BOUNDARY_FOG_DENSITY =
+                    clampedFloat("caustica.rt.volume.boundaryFogDensity", "volume.boundary-fog-density",
+                            0.06f, 0.0f, 0.25f);
+            /**
+             * The band of camera-to-border distance the haze closes over, in blocks. A fixed dial rather than
+             * the border's own warning distance, because that one defaults to 5 blocks — too narrow to see
+             * coming, and the point of the effect is that the horizon goes long before the wall does.
+             */
+            public static final FloatSetting BOUNDARY_FOG_RAMP =
+                    clampedFloat("caustica.rt.volume.boundaryFogRamp", "volume.boundary-fog-ramp",
+                            8.0f, 8.0f, 1024.0f);
+
+            /**
+             * The haze's extinction for a camera {@code distanceToBorder} blocks from the nearest border
+             * plane: the full density at the wall, falling as the square across the ramp so the band's outer
+             * two thirds stay nearly clear and the veil announces itself instead of dimming the whole world.
+             * A negative distance — the camera outside the border — clamps to the peak rather than running
+             * the ramp backwards, and a distance at or beyond the ramp is exactly zero, which is what keeps
+             * the pushed lane inert for the border nobody walks to.
+             */
+            public static float boundaryExtinction(double distanceToBorder, float rampBlocks,
+                                                   float maxSigma) {
+                if (maxSigma <= 0.0f || rampBlocks <= 0.0f) {
+                    return 0.0f;
+                }
+                double over = Math.max(distanceToBorder, 0.0) / (double) rampBlocks;
+                if (over >= 1.0) {
+                    return 0.0f;
+                }
+                float f = 1.0f - (float) over;
+                return maxSigma * f * f;
+            }
+
+            /**
+             * The render distance's edge: distant terrain dissolves into the sky before the loaded world
+             * stops, so the hard stepped cliff at the horizon goes. Unlike {@link #BOUNDARY_FOG_ENABLED} it is
+             * not a medium — no density, no in-scatter, no light of its own — but a coverage that blends the
+             * finished pixel toward the sky behind it, measured from the EYE so a reflection of the far world
+             * carries the same fade the direct view does.
+             *
+             * <p>Off by default, and it needs sky light because the sky it dissolves into is the atmosphere's.
+             */
+            public static final BooleanSetting EDGE_FADE_ENABLED =
+                    bool("caustica.rt.volume.edgeFade", "volume.edge-fade", false);
+            /**
+             * How much of the farthest visible terrain has dissolved by the time the view reaches the render
+             * edge, 0..1. 0.9 leaves a tenth of the surface showing; 1.0 dissolves the boundary completely.
+             * This is the coverage the fade reaches AT the edge, and the shader ramps smoothly up to it from
+             * {@link #EDGE_FADE_START}, so it is the only dial for how far the edge goes and it keeps its
+             * meaning when the render distance changes.
+             */
+            public static final FloatSetting EDGE_FADE_OPACITY =
+                    clampedFloat("caustica.rt.volume.edgeFadeOpacity", "volume.edge-fade-opacity",
+                            0.30f, 0.0f, 1.0f);
+            /**
+             * How much of the render distance stays untouched, 0..1: the fade begins at this fraction of the
+             * way out and climbs across the rest. 0.5 keeps the near half of the view clear; 0 starts the
+             * dissolve at the eye, which thins the whole view rather than treating its edge.
+             */
+            public static final FloatSetting EDGE_FADE_START =
+                    clampedFloat("caustica.rt.volume.edgeFadeStart", "volume.edge-fade-start",
+                            0.95f, 0.0f, 0.95f);
 
             /**
              * Clear-air sun shafts: airlight that makes the sun's beams visible with the height fog
@@ -930,14 +1014,14 @@ public final class CausticaConfig {
              * sun legs are untouched — the md5 baseline survives.
              */
             public static final BooleanSetting CLOUD_ENABLED =
-                    bool("caustica.rt.volume.cloud", "volume.cloud", false);
+                    bool("caustica.rt.volume.cloud", "volume.cloud", true);
             /**
              * Fraction of the sky the coverage field claims, 0..1. 0 is an empty sky, 1 washes most
              * of the dome overcast; the field's soft threshold keeps edges cloud-shaped throughout.
              */
             public static final FloatSetting CLOUD_COVERAGE =
                     clampedFloat("caustica.rt.volume.cloudCoverage", "volume.cloud-coverage",
-                            0.4f, 0.0f, 1.0f);
+                            0.1f, 0.0f, 1.0f);
             /**
              * Absolute world height of the cloud plane (the sheet and the shadow field share it).
              * Already-rebased on the way into the shader like the fog base.
@@ -953,7 +1037,7 @@ public final class CausticaConfig {
              */
             public static final FloatSetting CLOUD_THICKNESS =
                     clampedFloat("caustica.rt.volume.cloudThickness", "volume.cloud-thickness",
-                            208.0f, 8.0f, 1024.0f);
+                            232.0f, 8.0f, 1024.0f);
             /**
              * Cloud footprint in blocks: the width of one instance's box, and the size the instance
              * grid spaces them at. This is the dial that makes a sky of small puffs or of large
@@ -962,14 +1046,14 @@ public final class CausticaConfig {
              */
             public static final FloatSetting CLOUD_SIZE =
                     clampedFloat("caustica.rt.volume.cloudSize", "volume.cloud-size",
-                            400.0f, 32.0f, 2048.0f);
+                            368.0f, 32.0f, 2048.0f);
             /**
              * Density multiplier on the optical depths: the shadow strength. 0 makes the sheet a
              * thin bright veil with no shadow; 1 casts full water-cloud-order shadows.
              */
             public static final FloatSetting CLOUD_DENSITY =
                     clampedFloat("caustica.rt.volume.cloudDensity", "volume.cloud-density",
-                            0.6f, 0.0f, 3.0f);
+                            0.4f, 0.0f, 3.0f);
             /**
              * How strongly the cloud layer gathers into weather systems with clear sky between them,
              * 0..1. 0 sprinkles instances uniformly across the grid; 1 clusters them into distinct
@@ -978,7 +1062,7 @@ public final class CausticaConfig {
              */
             public static final FloatSetting CLOUD_PATCHINESS =
                     clampedFloat("caustica.rt.volume.cloudPatchiness", "volume.cloud-patchiness",
-                            1.0f, 0.0f, 1.0f);
+                            0.5f, 0.0f, 1.0f);
             /** Cloud field drift speed, blocks per second, on the wave clock like the fog wind. */
             public static final FloatSetting CLOUD_WIND_SPEED =
                     clampedFloat("caustica.rt.volume.cloudWindSpeed", "volume.cloud-wind-speed",
@@ -988,13 +1072,22 @@ public final class CausticaConfig {
                     clampedFloat("caustica.rt.volume.cloudWindAngle", "volume.cloud-wind-angle",
                             0.0f, 0.0f, 360.0f);
             /**
+             * How fast the cloud bodies flow, 0..2: a warp scrolls through the baked shapes on the
+             * wave clock, so edges undulate and interiors billow instead of the whole sky sliding
+             * rigidly. The pattern rides the clouds' own drift — it changes the shapes, never the
+             * positions. 0 freezes the shapes; the wind's translate is all that remains.
+             */
+            public static final FloatSetting CLOUD_FLOW =
+                    clampedFloat("caustica.rt.volume.cloudFlow", "volume.cloud-flow",
+                            0.5f, 0.0f, 2.0f);
+            /**
              * Distance in blocks where the cloud sheet fully dissipates: crossings past it are not
              * rendered at all, and the fade begins at 60% of this range. Sheet-only — the shadow
              * field keeps working beyond it, since the layer still exists overhead.
              */
             public static final FloatSetting CLOUD_FADE_DISTANCE =
                     clampedFloat("caustica.rt.volume.cloudFadeDistance", "volume.cloud-fade-distance",
-                            5120.0f, 512.0f, 16384.0f);
+                            16384.0f, 512.0f, 16384.0f);
             /**
              * Render the cloud layer as a slab that is walked through instead of crossed once. Off is
              * the planar sheet and the md5 baseline; on, the default, replaces the sheet with the
@@ -1011,20 +1104,33 @@ public final class CausticaConfig {
              * stop changing the image. Only read while {@link #CLOUD_VOLUMETRIC} is on.
              */
             public static final IntSetting CLOUD_STEPS =
-                    clampedInt("caustica.rt.volume.cloudSteps", "volume.cloud-steps", 16, 8, 48);
+                    clampedInt("caustica.rt.volume.cloudSteps", "volume.cloud-steps", 24, 8, 48);
             /**
              * Which baked cloud volume the layer's instances render, 0..1 mapped across the shapes
              * RtCloudVolumes ships (small cumulus through the storm deck). The value itself is never
              * sent to the shaders: it travels as the selected shape's index in cloud1.x, and the
-             * mapping lives where the atlas lives so the two cannot drift apart.
+             * mapping lives where the atlas lives so the two cannot drift apart. Has no reader while
+             * {@link #CLOUD_RANDOM_STYLE} is on, which is why its control disappears then.
              */
             public static final FloatSetting CLOUD_TYPE =
-                    clampedFloat("caustica.rt.volume.cloudType", "volume.cloud-type", 0.2f, 0.0f, 1.0f);
+                    clampedFloat("caustica.rt.volume.cloudType", "volume.cloud-type", 0.85f, 0.0f, 1.0f);
 
             /**
-             * How much weather thickens the deck, 0..1. Rain lifts the coverage toward solid overcast and
-             * multiplies the density (darker shadows under a storm); thunder piles on top of rain. 0
-             * holds the sky exactly to what the coverage and density sliders say whatever the weather.
+             * Dress every instance from the whole baked atlas instead of from the Cloud Type slider.
+             * The draw is made per parent cell (4x4 instance cells), so a district shares one volume
+             * and the choice only changes where the weather already does; a per-cell draw put a
+             * different cloud against every instance wall and that seam read as a cut. The slider is
+             * hidden while this is on, because its value has no reader.
+             */
+            public static final BooleanSetting CLOUD_RANDOM_STYLE =
+                    bool("caustica.rt.volume.cloudRandomStyle", "volume.cloud-random-style", true);
+
+            /**
+             * How much weather thickens the deck, 0..1. Rain SWELLS every cloud's footprint toward
+             * tiling its grid cell — the sky closes by growth, not by sprinkling more instances —
+             * and multiplies the density (darker shadows under a storm); thunder piles on top of
+             * rain. 0 holds the sky exactly to what the coverage and density sliders say whatever
+             * the weather.
              */
             public static final FloatSetting CLOUD_RAIN_BOOST =
                     clampedFloat("caustica.rt.volume.cloudRainBoost", "volume.cloud-rain-boost",
@@ -1038,9 +1144,9 @@ public final class CausticaConfig {
                 return Math.clamp(rain + 0.35f * thunder, 0.0f, 1.0f);
             }
 
-            /** The coverage pushed for a weather: the slider's clear-sky value lifted toward overcast. */
-            public static float rainCoverage(float coverage, float storm, float boost) {
-                return Math.clamp(coverage + 0.45f * boost * storm, 0.0f, 1.0f);
+            /** The footprint swell pushed for a weather: growth, not instance count, decks the sky. */
+            public static float rainSwelling(float storm, float boost) {
+                return Math.clamp(boost * storm, 0.0f, 1.0f);
             }
 
             /** The density pushed for a weather: a thicker deck also shadows harder. */
@@ -1051,8 +1157,8 @@ public final class CausticaConfig {
             /**
              * The volumetric quality preset: 0..4 is Off / Low / Medium / High / Ultra. Reading it does
              * nothing on its own, and it is never applied at load — a hand-tuned configuration must not be
-             * rewritten by an update. It defaults to Off because the fog and the cloud layer are off on a
-             * fresh install, so the label states the truth. Selecting a tier WRITES the settings below, because a preset that only
+             * rewritten by an update. It defaults to Off because the fog is off on a fresh
+             * install (the cloud layer ships on), so the label states the truth. Selecting a tier WRITES the settings below, because a preset that only
              * overrode them inside the renderer would leave the switches on screen describing a frame
              * that is not the one being drawn. Tier 0 is the one tier with a hard requirement: it has to
              * render exactly like the renderer did before any of this existed.
@@ -1153,7 +1259,7 @@ public final class CausticaConfig {
              * the base march actually displaced.
              */
             public static final BooleanSetting PARALLAX_SHADOW =
-                    bool("caustica.rt.materials.parallaxShadow", "materials.parallax-shadow", false);
+                    bool("caustica.rt.materials.parallaxShadow", "materials.parallax-shadow", true);
             /** Run height-field parallax on entities as well as on terrain. */
             public static final BooleanSetting ENTITY_PARALLAX =
                     bool("caustica.rt.materials.entityParallax", "materials.entity-parallax", false);
@@ -1388,8 +1494,8 @@ public final class CausticaConfig {
             public static final IntSetting MULTI_FRAME_COUNT =
                     intAtLeast("caustica.rt.fg.multiFrameCount", "frame-generation.multi-frame-count", 1, 1);
             public static final StringSetting BACKEND = string("caustica.rt.fg.backend",
-                    "frame-generation.backend", DLSS,
-                    v -> BACKENDS.contains(v) ? v : DLSS);
+                    "frame-generation.backend", FSR,
+                    v -> BACKENDS.contains(v) ? v : FSR);
             public static final IntSetting DEBUG_VIEW =
                     intAtLeast("caustica.rt.fg.debugView", "frame-generation.debug-view", 0, 0);
 
@@ -1850,6 +1956,184 @@ public final class CausticaConfig {
         }
 
         /**
+         * Depth of field: the camera's pinhole becomes a thin lens, so surfaces off the focal plane
+         * blur by their circle of confusion. Two implementations share the focus, aperture and rack
+         * settings and are picked by {@link #MODE}:
+         *
+         * <p><em>Traced</em> (mode 1) makes the primary pass sample a point of the aperture instead
+         * of a point of the sensor and re-aims that ray at the plane it is focused on. Everything on
+         * that plane keeps the radiance the pinhole would have gathered; everything off it lands off
+         * its pixel by its circle of confusion, and the denoiser averages a run of aperture points
+         * into the disc. One sample per pixel per frame is the whole budget — the same contract the
+         * sun's square angular extent runs on, where per-frame shadow-ray jitter becomes a soft
+         * penumbra. Unlike every other image control this one changes what the trace sees rather than
+         * what happens to its result: the defocused light arrives through real geometry, reflects,
+         * refracts and scatters on the way in, and a pane of glass in front of the focal plane blurs
+         * for the same reason the wall behind it does.
+         *
+         * <p><em>Post</em> (mode 2) leaves the trace pinhole and defocuses the display mapper's
+         * result with a gather over the depth the primary pass published, so it costs no trace time,
+         * needs no denoiser to converge, and works on hardware DLSS-RR does not run on — at the price
+         * of gathering the defocus rather than tracing it: light that would have arrived from off
+         * pixel through the aperture (a blade edge inside the blur, a refracted wall behind the
+         * focal plane) is approximated by the gathered neighbourhood instead of rendered.
+         *
+         * <p>All settings are read per frame and rebuild nothing. Mode 0 pushes a zero radius, which
+         * is the raygen's own gate back to the pinhole camera.
+         */
+        public static final class DepthOfField {
+            /**
+             * Picks the implementation: 0 off, 1 the traced lens, 2 the post-process gather. A
+             * config written before the modes existed carried a {@code dof.enabled} boolean instead;
+             * its value migrates here once and the stale key is dropped, so a player who had the
+             * traced lens on keeps exactly that.
+             */
+            public static final IntSetting MODE =
+                    intChoice("caustica.rt.dof.mode", "dof.mode", migratedDofMode(), List.of(0, 1, 2));
+
+            /**
+             * The migration {@link #MODE}'s fallback reads: 1 when the legacy {@code dof.enabled}
+             * key was present and true, 0 otherwise. Runs before the setting constructor touches the
+             * file, so a config that already carries {@code dof.mode} never reaches the legacy path.
+             */
+            private static int migratedDofMode() {
+                if (fileNumber("dof.mode") != null) {
+                    return 0; // the file's own value wins; this fallback is not used
+                }
+                Boolean legacy = fileBoolean("dof.enabled");
+                if (legacy != null) {
+                    FILE.remove("dof.enabled");
+                }
+                return Boolean.TRUE.equals(legacy) ? 1 : 0;
+            }
+
+            /**
+             * Focus on whatever the centre of the view is looking at, by a CPU raycast along the camera's
+             * own axis, instead of at {@link #FOCUS_BLOCKS}. The probe is the only cheap answer to "how far
+             * away is the middle of this frame": the trace is one sample per pixel and cannot know until
+             * the next frame, and reading the depth guide back would stall the GPU for a number the player
+             * can dial instead.
+             */
+            public static final BooleanSetting AUTO_FOCUS =
+                    bool("caustica.rt.dof.autoFocus", "dof.auto-focus", true);
+
+            /**
+             * Whether the meter may focus on what a reflection shows instead of on the surface carrying it.
+             * A plane reflector images whatever it reflects as far behind itself as that thing is in front,
+             * so water at arm's length mirroring a mountain six blocks away is showing something nine blocks
+             * out, and focusing on the water is focusing on the wrong thing. With this on, a pixel whose
+             * mirror lobe is a real share of the light it sends back — a metal, a grazing water face, a
+             * polished floor seen edge-on — reports the reflected image's distance to the meter, and the
+             * plane racks onto whatever the reflection holds.
+             *
+             * <p>The distance is measured by the specular guide probe that already traces the mirror ray for
+             * DLSS-RR's motion vectors, so the feature costs no ray of its own; what changes is which
+             * distance that probe reports. Only autofocus reads it — a manual focus is a distance the player
+             * dials, and a reflected image cannot be dialled by eye, so the depth image every other reader
+             * gets stays the surface's. Off restores a meter that measures each pixel's own surface, which
+             * is the frame the lens focused on before this switch existed.
+             */
+            public static final BooleanSetting REFLECTION_FOCUS =
+                    bool("caustica.rt.dof.reflectionFocus", "dof.reflection-focus", true);
+
+            /**
+             * How far down the view axis the focal plane sits, in blocks. The plane is parallel to the
+             * sensor, which is what a lens focuses, so this is a distance along the axis rather than a
+             * radius around the eye. Used as the focus when {@link #AUTO_FOCUS} is off, and by the probe
+             * as the distance to fall back to when the axis reaches nothing.
+             */
+            public static final FloatSetting FOCUS_BLOCKS =
+                    clampedFloat("caustica.rt.dof.focusBlocks", "dof.focus-distance", 8.0f, 0.5f, 512.0f);
+
+            /**
+             * How long the focal plane takes to reach a new focus, as the time constant of its exponential
+             * glide: after this many seconds it has covered about 63% of the remaining distance and keeps
+             * closing. The target moves whenever the view axis finds a different surface, and a walk past
+             * a fence would fire the plane at every post without a glide; this dial decides whether the
+             * room snaps or breathes around the turn. The frame the feature is switched on starts at the
+             * target instead of gliding in from nothing.
+             */
+            public static final FloatSetting RACK_SECONDS =
+                    clampedFloat("caustica.rt.dof.rackSeconds", "dof.rack-time", 0.15f, 0.02f, 1.0f);
+
+            /**
+             * The lens's radius in blocks. One number sets how wide the lens opens: a surface at range
+             * spreads over radius / range of the frame's tangent span, so the focal plane is the only
+             * place that stays sharp and everything else softens by its distance from the lens rather than
+             * from that plane. 0.04 is a 4 cm lens — a few pixels of veil on the horizon at an eight-block
+             * focus. 0 is a pinhole camera and the frame is as sharp as it was without the feature.
+             */
+            public static final FloatSetting APERTURE =
+                    clampedFloat("caustica.rt.dof.aperture", "dof.aperture", 0.02f, 0.0f, 0.10f);
+
+            /**
+             * Whether the lens's blur is capped at all. Off leaves the dial as the only control, which is
+             * the physically correct camera: a surface's disc is as wide as the aperture makes it, so a
+             * wall half a block from the eye dissolves entirely and the horizon softens without limit as
+             * the focal plane comes close. On holds every layer inside {@link #MAX_BLUR_PIXELS}, because a
+             * disc wider than what one aperture point per frame can fill comes back from the denoiser as a
+             * mosaic rather than a blur.
+             */
+            public static final BooleanSetting BLUR_CAP =
+                    bool("caustica.rt.dof.blurCap", "dof.blur-cap", true);
+
+            /**
+             * The cap itself, in pixels of the finished frame: the widest circle of confusion any layer is
+             * allowed, foreground and horizon alike. The lens radius is narrowed per pixel against the
+             * depth that pixel showed last frame to hold to it, so lowering this trades blur for the
+             * denoiser's ability to resolve it; 14 is where a 4 cm lens stops turning a close wall into
+             * texel-scale blocks, and 4 keeps the frame nearly sharp while still closing the focal plane.
+             */
+            public static final FloatSetting MAX_BLUR_PIXELS =
+                    clampedFloat("caustica.rt.dof.maxBlurPixels", "dof.max-blur", 14.0f, 2.0f, 48.0f);
+
+            /**
+             * Whether the cap is applied per pixel as well as to the horizon. On reads the depth each pixel
+             * showed last frame out of the guide pass and narrows that pixel's lens to the disc the cap
+             * allows at that depth, which is what stops a close wall from dissolving into blocks of colour.
+             * Off leaves the horizon bound alone, so the only disc held to {@link #MAX_BLUR_PIXELS} is the
+             * one the focus distance itself sets: everything nearer the eye than the focal plane blurs by
+             * however wide the aperture asks, and the frame's foreground goes the way of a real lens held
+             * an inch from a fence. Traced mode only; the post-process gather always bounds its kernel at
+             * {@link #MAX_BLUR_PIXELS}, because it has no temporal accumulation to fill an unbounded disc.
+             */
+            public static final BooleanSetting PER_PIXEL_CAP =
+                    bool("caustica.rt.dof.perPixelCap", "dof.per-pixel-cap", true);
+
+            /**
+             * The post-process aperture's blade count: 0 is a circular aperture, 3 or more cuts the
+             * opening into that many straight blades and reshapes the bokeh highlights accordingly. The
+             * polygon is renormalised to the circle's area in the gather, so the blade count changes the
+             * shape of the defocus without changing its brightness. Post mode only.
+             */
+            public static final IntSetting BLADES =
+                    clampedInt("caustica.rt.dof.blades", "dof.blades", 6, 0, 12);
+
+            /**
+             * The post-process aperture polygon's rotation, in degrees. Only visible with
+             * {@link #BLADES} at 3 or more, and only in the bokeh highlights a point light throws, where
+             * the blades' orientation is what the eye reads. Post mode only.
+             */
+            public static final FloatSetting BLADE_ROTATION =
+                    clampedFloat("caustica.rt.dof.bladeRotation", "dof.blade-rotation", 45.0f, 0.0f, 180.0f);
+
+            /**
+             * Whether the buffers DLSS-RR reconstructs from describe what the pinhole ray hit rather than
+             * what the aperture point hit. On walks the first segment a second time per pixel on the
+             * pinhole ray, guides only, so normal, albedo, depth and motion vectors land on the surface
+             * this pixel is standing in front of: the reconstruction assumes a pinhole camera, and a lens
+             * sample moves its guides off the pixel every frame, which it reads as detail to paint over.
+             * Off saves that walk and lets the guides carry the aperture point, which softens the frame
+             * into a smear instead of a blur.
+             */
+            public static final BooleanSetting PINHOLE_GUIDES =
+                    bool("caustica.rt.dof.pinholeGuides", "dof.pinhole-guides", false);
+
+            private DepthOfField() {
+            }
+        }
+
+        /**
          * Display-referred sharpening of the finished display image.
          *
          * <p>What is being restored is the softness DLSS-RR's upscale leaves behind, and that softness exists
@@ -1876,7 +2160,7 @@ public final class CausticaConfig {
              * upscale's lost texel-scale detail without ringing on high-contrast edges.
              */
             public static final FloatSetting AMOUNT =
-                    clampedFloat("caustica.rt.sharpen.amount", "sharpen.amount", 0.5f, 0.0f, 2.0f);
+                    clampedFloat("caustica.rt.sharpen.amount", "sharpen.amount", 0.35f, 0.0f, 2.0f);
 
             private Sharpen() {
             }
@@ -1896,6 +2180,22 @@ public final class CausticaConfig {
                     bool("caustica.rt.screenshots.exr", "screenshots.exr-enabled", false);
 
             private Screenshots() {
+            }
+        }
+
+        /**
+         * The accumulated still render the hotkey runs: how many frames of one viewpoint it sums before it
+         * divides them out into the saved PNG.
+         */
+        public static final class Still {
+            /**
+             * Frames per run. The run averages what it gets, so this is the noise-reduction dial and the
+             * waiting time at the same time; a viewpoint change restarts the count without changing it.
+             */
+            public static final IntSetting SAMPLES =
+                    clampedInt("caustica.rt.still.samples", "still.samples", 528, 4, 1024);
+
+            private Still() {
             }
         }
 
