@@ -525,6 +525,7 @@ public struct SkyState {
     public float  horizonSoften;       // radians below the horizon over which the ground fades in
     public float  moonPhaseIndex;      // 0 full .. 4 new
     public float  skyLightFactor;      // 0 in a dimension with no sky light (Nether, End)
+    public float  weatherDim;          // rain/thunder multiplier on the sun, moon and atmosphere (1 = clear)
     public float3 dimensionSkyColor;   // linear BT.709 sky colour the dimension supplies instead
     public int    skybox;              // DimensionType.Skybox ordinal (SKYBOX_*)
     public float  flashIntensity;      // end flash, eased 0..1 (0 when absent or hidden)
@@ -594,6 +595,21 @@ public SkyState skyState(WorldPush push) {
     s.endFlashUv = push.endFlashUv;
     s.sunUv = push.sunUv;
     s.moonUv = push.moonUv;
+    // Weather dims the whole sky, not just the cloud deck. Vanilla's own lightmap follows
+    // (1 - 5/16·rain)·(1 - 5/16·thunder) with a 20% floor; mirroring that curve keeps a storm at the
+    // brightness players already expect from the game while the cloud layer's coverage/density lift does
+    // the shape of the overcast. Scaling the state's radiometric inputs — rather than the final dome —
+    // dims the NEE sun, the atmosphere LUT and the SH irradiance bake by the same factor, so no consumer
+    // can disagree about how dark the storm is. weather.z is the dial; 0 restores the clear sky.
+    float rainDim = 1.0 - (5.0 / 16.0) * saturate(push.weather.x);
+    float thunderDim = 1.0 - (5.0 / 16.0) * saturate(push.weather.y);
+    float weatherDim = 0.8 * rainDim * thunderDim + 0.2;
+    s.weatherDim = lerp(1.0, weatherDim, saturate(push.weather.z));
+    s.sunIlluminance *= s.weatherDim;
+    s.moonIlluminance *= s.weatherDim;
+    s.moonFullIlluminance *= s.weatherDim;
+    s.starLuminance *= s.weatherDim;
+    s.airglowLuminance *= s.weatherDim;
     return s;
 }
 

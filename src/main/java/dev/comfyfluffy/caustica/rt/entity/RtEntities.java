@@ -3,21 +3,16 @@ package dev.comfyfluffy.caustica.rt.entity;
 import com.mojang.blaze3d.vertex.PoseStack;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.mixin.ParticleAccessor;
 import dev.comfyfluffy.caustica.mixin.ParticleEngineAccessor;
 import dev.comfyfluffy.caustica.mixin.ParticleGroupAccessor;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.client.particle.EndRodParticle;
-import net.minecraft.client.particle.FireflyParticle;
-import net.minecraft.client.particle.FlameParticle;
-import net.minecraft.client.particle.GlowParticle;
-import net.minecraft.client.particle.LavaParticle;
 import net.minecraft.client.particle.Particle;
 import net.minecraft.client.particle.ParticleGroup;
 import net.minecraft.client.particle.ParticleRenderType;
 import net.minecraft.client.particle.SingleQuadParticle;
-import net.minecraft.client.particle.SoulParticle;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.culling.Frustum;
@@ -28,6 +23,7 @@ import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -215,19 +211,29 @@ public final class RtEntities {
     // Vanilla bakes the lightmap into a particle's vertex colour (particle.vsh multiplies its Color by
     // sample_lightmap), so lighting a billboard by N·L darkens exactly what vanilla draws brightest: a
     // torch flame hangs above its torch with its normal pointing at the camera, where ndl ≈ 0. The
-    // particles vanilla draws self-luminous are emitted from their own colour instead, at the package's
-    // emitter baseline; every other particle keeps RT direct/indirect lighting.
-    private static final List<Class<? extends Particle>> SELF_LUMINOUS_PARTICLES = List.of(
-            FlameParticle.class, SoulParticle.class, LavaParticle.class, EndRodParticle.class,
-            GlowParticle.class, FireflyParticle.class);
-
-    private static boolean selfLuminous(Particle particle) {
-        for (Class<? extends Particle> type : SELF_LUMINOUS_PARTICLES) {
-            if (type.isInstance(particle)) {
-                return true;
-            }
+    // particles vanilla draws self-luminous carry that fact in the light coordinates they draw with —
+    // getLightCoords injects block emission beyond the level lightmap sampled at the particle's block
+    // (withBlock(15) floors it for lava/soul flame/sculk charges, addSmoothBlockEmission ramps it over
+    // the particle's life for flame/glow/portal, the constant FULL_BRIGHT family returns a fixed value).
+    // The injected margin becomes the particle's emission; every other particle keeps RT direct/indirect
+    // lighting.
+    private static float particleSelfEmission(Minecraft mc, SingleQuadParticle particle, float partial) {
+        ClientLevel level = ((ParticleAccessor) particle).caustica$getLevel();
+        if (level == null) {
+            return 0f; // removed particle; the vanilla fallback light carries no block channel either
         }
-        return false;
+        ParticleAccessor accessor = (ParticleAccessor) particle;
+        int packed = accessor.caustica$getLightCoords(partial);
+        int ambient = LightCoordsUtil.getLightCoords(level, BlockPos.containing(
+                accessor.caustica$getX(), accessor.caustica$getY(), accessor.caustica$getZ()));
+        // The block-emission channel rides the low byte as a 0..240 lightmap-x coordinate (firefly
+        // emits up to 255, so clamp); the level lightmap itself — torch light, lava glow, emissive
+        // block states — is already part of the ambient baseline, and the RT scene lights that part.
+        int injected = Math.min(packed & 0xFF, LightCoordsUtil.FULL_BRIGHT & 0xFF) - (ambient & 0xFF);
+        if (injected <= 0) {
+            return 0f;
+        }
+        return Math.min(injected, 240) * (1f / 240f) * RtMaterialRegistry.defaultEmissionLuminanceCdM2();
     }
 
     /** Previous frame's particle center (rebase-space) + that frame's rebase origin, for the MV diff. */
@@ -1187,10 +1193,9 @@ public final class RtEntities {
                     int vertBefore = vb / 3;
                     particleScratch.clear();
                     sq.extract(particleScratch, cam, partial);
-                    // Emission lane for THIS particle (see SELF_LUMINOUS_PARTICLES): the hit shader emits
+                    // Emission lane for THIS particle (see particleSelfEmission): the hit shader emits
                     // this strength from the particle's own colour instead of lighting it.
-                    capture.currentEmission = selfLuminous(sq)
-                            ? RtMaterialRegistry.defaultEmissionLuminanceCdM2() : 0f;
+                    capture.currentEmission = particleSelfEmission(mc, sq, partial);
                     for (SingleQuadParticle.Layer layer : particleScratch.layers()) {
                         capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlasSafe(layer.textureAtlasLocation());
                         particleScratch.buildLayer(layer, particleCapture);

@@ -3,6 +3,7 @@
 // complete Std430DataLayout: field types, byte offsets, total size, matrix mode, and array counts.
 import world_common;
 import display_common;
+import rain;
 
 struct WorldPushLayoutProbe {
     WorldPush values[2]; // array stride is the complete, tail-padded WorldPush byte size
@@ -157,5 +158,25 @@ void probeDofPostGatherPush(uint3 id : SV_DispatchThreadID) {
 void probeDofPostRecombinePush(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0xFFFFFFFFu) {
         float sink = float(dofPostRecombinePushProbe.hdrEnabled) + dofPostRecombinePushProbe.halfTexels.y;
+    }
+}
+
+[[vk::push_constant]] RainPush rainPushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeRainPush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = rainPushProbe.intensity + rainPushProbe.length + rainPushProbe.brightness
+                + float(rainPushProbe.dropCount);
+    }
+}
+
+[[vk::push_constant]] StillDenoisePush stillDenoisePushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeStillDenoisePush(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(stillDenoisePushProbe.mode) + float(stillDenoisePushProbe.step)
+                + stillDenoisePushProbe.sigma + stillDenoisePushProbe.amount;
     }
 }

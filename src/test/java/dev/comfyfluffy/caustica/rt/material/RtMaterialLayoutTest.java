@@ -44,13 +44,13 @@ final class RtMaterialLayoutTest {
     void reflectedWorldPushConstantsIncludeLightBuffersFrameIndexAndMaterialScalars() {
         // 11 uint64_t addresses (world/table/material, 6 light buffers, path queue), frameIndex, and the
         // frame-constant scalars the material path reads: surface wetness, the parallax depth cap, the
-        // parallax layer budget, the packed material switches, and the parallax style. The last one took
-        // the trailing padding, so the block stays at 112 and still lands on its 8-byte alignment.
-        assertEquals(112, WorldPushConstantsData.BYTE_SIZE);
+        // parallax layer budget, the packed material switches, the parallax style, and the puddle field's
+        // anchor/coverage vec4 (which brings the block to its final 128-byte size).
+        assertEquals(128, WorldPushConstantsData.BYTE_SIZE);
         ByteBuffer data = ByteBuffer.allocateDirect(WorldPushConstantsData.BYTE_SIZE)
                 .order(ByteOrder.nativeOrder());
         new WorldPushConstantsData(1L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L, 11L, 12, 0.25f, 0.5f, 13, 15,
-                1).write(data);
+                1, new WorldPushConstantsData.Float4(16f, 17f, 0.75f, 0f)).write(data);
         assertEquals(4L, data.getLong(24));  // materialTableAddr
         assertEquals(5L, data.getLong(32));  // lightBufAddr
         assertEquals(9L, data.getLong(64));  // lightGridSpanAddr (last of the grid addresses)
@@ -62,6 +62,10 @@ final class RtMaterialLayoutTest {
         assertEquals(13, data.getInt(100));     // parallaxLayers
         assertEquals(15, data.getInt(104));     // materialToggles
         assertEquals(1, data.getInt(108));      // parallaxStyle
+        assertEquals(16f, data.getFloat(112));  // puddleParams.x (water anchor X)
+        assertEquals(17f, data.getFloat(116));  // puddleParams.y (water anchor Z)
+        assertEquals(0.75f, data.getFloat(120)); // puddleParams.z (puddle coverage)
+        assertEquals(0f, data.getFloat(124));   // puddleParams.w (reserved)
     }
 
     /**

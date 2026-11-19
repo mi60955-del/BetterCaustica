@@ -86,7 +86,6 @@ class ShaderConstantTest(unittest.TestCase):
             "WATER_SHAFT_STRUCTURE_FLOOR": shaft.SHADER_WATER_SHAFT_STRUCTURE_FLOOR,
             "FOG_SUN_BANDS": shaft.SHADER_FOG_SUN_BANDS,
             "FOG_MARCH_PROBE_STRATA": shaft.SHADER_FOG_MARCH_PROBE_STRATA,
-            "CLOUD_EXTINCTION": shaft.SHADER_CLOUD_EXTINCTION,
         }
         for name, value in mirrored.items():
             with self.subTest(constant=name):
@@ -214,11 +213,11 @@ class CostTest(unittest.TestCase):
 
     def test_budget_table_is_read_from_the_shader_constants(self):
         budget = dict((name, tuple(spend)) for name, *spend in shaft.probe_budget())
-        self.assertEqual(budget["analytic fog"], (shaft.SHADER_FOG_SUN_BANDS,) * 2)
-        self.assertEqual(budget["sun shafts"], (shaft.SHADER_SHAFT_STRATA,) * 2)
+        self.assertEqual(budget["analytic fog"], (shaft.SHADER_FOG_SUN_BANDS, 1))
+        self.assertEqual(budget["sun shafts"], (shaft.SHADER_SHAFT_STRATA, 1))
         self.assertEqual(budget["marched fog"],
                          (min(shaft.SHADER_FOG_MARCH_PROBE_STRATA,
-                              shaft.DEFAULT_FOG_MARCH_STEPS),) * 2)
+                              shaft.DEFAULT_FOG_MARCH_STEPS), 1))
         self.assertAlmostEqual(budget["sun shafts"][0] / budget["analytic fog"][0], 2.0, places=6)
 
     def test_measured_shaft_spend_is_eight_rays_per_pixel_whatever_the_medium(self):
@@ -229,7 +228,8 @@ class CostTest(unittest.TestCase):
                 hits = int(np.count_nonzero(image["hit"]))
                 self.assertGreater(hits, 0)
                 self.assertEqual(image["logs"]["shaft"].shadow_rays, 8 * hits)
-                self.assertEqual(image["logs"]["shaft"].cloud_field_evals, 8 * hits)
+                # One cloud-field evaluation for the whole stretch, not one per probe.
+                self.assertEqual(image["logs"]["shaft"].cloud_field_evals, hits)
 
     def test_measured_fog_count_is_four_per_pixel(self):
         med = shaft.Medium(fog_density=0.02)
@@ -237,8 +237,9 @@ class CostTest(unittest.TestCase):
         hits = int(np.count_nonzero(image["hit"]))
         sky = 48 * 27 - hits
         self.assertEqual(image["logs"]["fog"].shadow_rays, 4 * hits)
-        # The sky pixels take the unshadowed branch: no probes, one cloud evaluation at the camera.
-        self.assertEqual(image["logs"]["fog"].cloud_field_evals, 4 * hits + sky)
+        # The sky pixels take the unshadowed branch: no probes, one cloud evaluation at the camera. A
+        # shadowed segment rides one evaluation for all four bands.
+        self.assertEqual(image["logs"]["fog"].cloud_field_evals, hits + sky)
 
     def test_control_arm_traces_no_rays(self):
         """Forcing V to one must skip the trace entirely, or the control would cost what it refutes."""
@@ -278,13 +279,15 @@ class GatingTest(unittest.TestCase):
         self.assertIn("if (!CAUSTICA_VOLUME_PATH) {", primary)
         self.assertIn("if (CAUSTICA_VOLUME_PATH && fogOn) {", primary)
         self.assertIn("if (CAUSTICA_VOLUME_PATH && shaftOn) {", primary)
-        self.assertIn("if (CAUSTICA_VOLUME_PATH && medium.current.water && shaftOn) {", primary)
+        self.assertIn("if (CAUSTICA_VOLUME_PATH && medium.current.water) {", primary)
+        self.assertIn("if (shaftOn) {", primary)
         self.assertEqual(primary.count("shaftInScatter("), 2)
         self.assertEqual(primary.count("fogSegmentInScatter("), 2)
 
     def test_the_volume_free_raygens_are_built_with_the_define(self):
         gradle = BUILD.read_text(encoding="utf-8")
-        self.assertEqual(gradle.count("-DCAUSTICA_NO_VOLUME_PATH"), 3)
+        # One definition, shared by every lean record: ordinary, SER, probe-free and fast.
+        self.assertIn('def leanDefines = ["-DCAUSTICA_NO_VOLUME_PATH"]', gradle)
         for twin in ("primary_lean", "indirect_lean", "indirect_lean_ser"):
             self.assertIn(f"world/{twin}.rgen.spv", gradle)
 

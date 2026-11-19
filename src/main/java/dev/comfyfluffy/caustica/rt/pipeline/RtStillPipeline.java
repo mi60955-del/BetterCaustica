@@ -20,20 +20,20 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
 import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 
 /**
- * The accumulated still render's one pass: it sums a finished display frame into an fp32 accumulator, and
- * divides that accumulator out into an 8-bit image once the run holds every sample it asked for.
+ * The accumulated still render's one pass: it sums a scene-linear frame into an fp32 accumulator, and
+ * divides that accumulator out into the display-res half-float mean the display chain renders.
  *
  * <p>Adding and resolving share a pipeline because the accumulator is the pass's only state, and two
- * pipelines would each have to describe it. In the resolve the source slot is bound to the accumulator even
- * though nothing reads it: the descriptor layout needs a live view in every slot, and a run's accumulator is
- * the one image guaranteed still there when the resolve is recorded.
+ * pipelines would each have to describe it. In the resolve the source slot is bound to whatever the run
+ * last accumulated even though the resolve does not read it: the descriptor layout needs a live view in
+ * every slot, and that source is the one image guaranteed still there when the resolve is recorded.
  */
 public final class RtStillPipeline {
     /** Add this frame to the accumulator. */
     public static final int MODE_ADD = 0;
     /** Store this frame as the run's first sample, which is what keeps the accumulator never-cleared. */
     public static final int MODE_FIRST = 1;
-    /** Divide the accumulator by the sample count into the 8-bit image. */
+    /** Divide the accumulator by the sample count into the display-res half-float mean. */
     public static final int MODE_RESOLVE = 2;
 
     private static final String SHADER_DIR = "/bettercaustica/shaders/pipelines/still/";
@@ -122,16 +122,22 @@ public final class RtStillPipeline {
 
     /**
      * Runs one step over the whole accumulator. {@code weight} is {@code 1 / samples} and only the resolve
-     * reads it, so the adding dispatches pass zero.
+     * reads it, so the adding dispatches pass zero. {@code count} is how many samples the accumulator
+     * already holds: the add dispatch divides its running mean by it, the resolve derives the standard error
+     * of the mean from it, and the first sample of a run passes zero because it stores instead of adding.
+     * {@code legacy} selects the earlier estimator — a cap against the running mean, and no second moment in
+     * the alpha — for the whole run; it is latched when the run starts, since the two write different
+     * things into the same image.
      */
-    public void dispatch(VkCommandBuffer cmd, int width, int height, int mode, float weight) {
+    public void dispatch(VkCommandBuffer cmd, int width, int height, int mode, float weight, int count,
+                         int legacy) {
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "still accumulate")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipeline());
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipelineLayout(), 0,
                     stack.longs(gpu.descriptorSet()), null);
             ByteBuffer push = stack.malloc(PUSH_BYTES);
-            new StillPushData(mode, weight).write(push);
+            new StillPushData(mode, weight, count, legacy).write(push);
             VK10.vkCmdPushConstants(cmd, gpu.pipelineLayout(), VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

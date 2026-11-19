@@ -72,6 +72,7 @@ public final class RtFrameStats {
                     "frame.exposure",
                     "frame.dlssRr",
                     "frame.upscale",
+                    "frame.rain",
                     "frame.bloom",
                     "frame.displayMap",
                     "frame.sharpen",
@@ -91,7 +92,9 @@ public final class RtFrameStats {
                     "entityPackedBytes", "entityPackedPaddingBytes", "entityRetainedGeometryBytes",
                     "entityFrameListsWaits", "entityTableWaits", "entitySlotWaits",
                     "entityGraphicsWaitNanos", "entityMotionFlushes", "entityTableFlushes",
-                    "entityBlockEntityRetirements", "entitySlotRetirements", "entityTableRetirements"},
+                    "entityBlockEntityRetirements", "entitySlotRetirements", "entityTableRetirements",
+                    "dhLodRegionsDesired", "dhLodQueries", "dhLodQueryMicros", "dhLodBuildsCompleted",
+                    "dhLodPublished"},
             true);
 
     private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();

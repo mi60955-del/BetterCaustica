@@ -35,6 +35,8 @@ import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
 import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+import static org.lwjgl.vulkan.KHRPipelineExecutableProperties.VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+import static org.lwjgl.vulkan.KHRPipelineExecutableProperties.VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR;
@@ -157,7 +159,7 @@ public final class RtPipeline {
             binds.get(WORLD_BLOCK_ALBEDO).binding(WORLD_BLOCK_ALBEDO)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1).stageFlags(atlasStages);
-            for (int binding = WORLD_G_NORMAL; binding <= WORLD_G_SPEC_MOTION; binding++) {
+            for (int binding = WORLD_G_NORMAL; binding <= WORLD_G_SPEC_HIT_DIST; binding++) {
                 binds.get(binding).binding(binding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                         .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             }
@@ -201,17 +203,25 @@ public final class RtPipeline {
             binds.get(WORLD_RESERVOIR_SAMPLE_CUR).binding(WORLD_RESERVOIR_SAMPLE_CUR)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+            // The half-resolution indirect pair: the indirect raygen writes both, the upsample raygen
+            // reads both. Raygen stage only — no miss or hit shader touches them.
+            binds.get(WORLD_INDIRECT_HALF).binding(WORLD_INDIRECT_HALF)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
+            binds.get(WORLD_INDIRECT_HALF_DEPTH).binding(WORLD_INDIRECT_HALF_DEPTH)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             // Per-pixel volumetric diagnostics (debug views 10..13), written by the primary raygen only
             // when the frame's WorldPush carries WORLD_FLAG_VOLUME_DEBUG. Raygen-stage storage image like
             // the guides it sits beside.
             binds.get(WORLD_VOLUME_DEBUG).binding(WORLD_VOLUME_DEBUG)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
-            // The baked cloud-volume atlas: sampled by the miss shader (the sky's cloud tiers) and
-            // by the raygen (the NEE shadow probes, the fog sun legs, the debug views). Without this
-            // entry the layout's binding 19 is an empty slot the shaders still statically reference —
-            // the same undefined-descriptor device fault binding 17's entry documents above.
-            binds.get(WORLD_CLOUD_VOLUMES).binding(WORLD_CLOUD_VOLUMES)
+            // The cloud shape atlas: sampled by the miss shader (the sky's cloud decks) and by the
+            // raygen (the NEE shadow probes, the fog sun legs, the debug views). Without this entry
+            // the layout's binding 19 is an empty slot the shaders still statically reference — the
+            // same undefined-descriptor device fault binding 17's entry documents above.
+            binds.get(WORLD_CLOUD_NOISE).binding(WORLD_CLOUD_NOISE)
                     .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1)
                     .stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR);
@@ -383,14 +393,25 @@ public final class RtPipeline {
             // Depth 1: secondary shadow/visibility rays are issued sequentially from raygen (not
             // nested in closest-hit), so each traceRayEXT is depth 1 — no recursion budget needed.
             rtpci.get(0).sType$Default().pStages(stages).pGroups(groups).maxPipelineRayRecursionDepth(1).layout(layout);
+            int rtPipelineFlags = 0;
             if (RtDeviceBringup.ommEnabled()) {
-                rtpci.get(0).flags(VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT);
+                rtPipelineFlags |= VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
+            }
+            if (RtDeviceBringup.pipelineExecutableInfoEnabled()) {
+                // Keep what the driver compiled for this pipeline so RtPipelineStats can report its
+                // register counts. Inert unless the device feature was enabled at device creation.
+                rtPipelineFlags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR
+                        | VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+            }
+            if (rtPipelineFlags != 0) {
+                rtpci.get(0).flags(rtPipelineFlags);
             }
             LongBuffer pPipeline = stack.mallocLong(1);
             check(vkCreateRayTracingPipelinesKHR(vk, VK10.VK_NULL_HANDLE, VK10.VK_NULL_HANDLE, rtpci, null, pPipeline),
                     "vkCreateRayTracingPipelinesKHR");
             pipeline = pPipeline.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE, pipeline, label);
+            RtPipelineStats.dump(vk, pipeline, label);
 
             for (int g = 0; g < raygenCount; g++) {
                 VK10.vkDestroyShaderModule(vk, mGen[g], null);
@@ -508,6 +529,12 @@ public final class RtPipeline {
         writeStorageImage(WORLD_RESERVOIR_SAMPLE_CUR, sampleCurView);
     }
 
+    /** Bind the half-resolution indirect radiance and depth images. */
+    public void setIndirectHalfImages(long radianceView, long depthView) {
+        writeStorageImage(WORLD_INDIRECT_HALF, radianceView);
+        writeStorageImage(WORLD_INDIRECT_HALF_DEPTH, depthView);
+    }
+
     /** Bind the per-pixel volumetric debug image the primary raygen writes on debug frames. */
     public void setVolumeDebugImage(long imageView) {
         writeStorageImage(WORLD_VOLUME_DEBUG, imageView);
@@ -564,9 +591,9 @@ public final class RtPipeline {
     }
 
 
-    /** Bind the baked cloud-volume atlas (all cloud shapes, one 2D-array image) for volume.slang. */
-    public void setCloudVolumeAtlas(long imageView, long sampler) {
-        writeAtlasBinding(WORLD_CLOUD_VOLUMES, imageView, sampler);
+    /** Bind the procedural cloud stack's shape atlas (one wrapping, mip-mapped 2D image). */
+    public void setCloudNoiseTexture(long imageView, long sampler) {
+        writeAtlasBinding(WORLD_CLOUD_NOISE, imageView, sampler);
     }
 
     /** Bind this frame's atmosphere LUTs (see {@link RtSkyLut}); both share the LUT's own sampler. */

@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class VolumeFogTest {
     private static final Path WORLD_COMMON = Path.of("shaders/pipelines/world/world_common.slang");
     private static final Path VOLUME = Path.of("shaders/pipelines/world/volume.slang");
+    private static final Path MEDIUM = Path.of("shaders/pipelines/world/medium.slang");
     private static final Path COMPOSITE =
             Path.of("src/main/java/dev/comfyfluffy/caustica/rt/RtComposite.java");
     private static final Path PIPELINE =
@@ -285,20 +286,21 @@ final class VolumeFogTest {
                 "the shader must read the haze straight off the pushed lane, with no second gate");
         assertTrue(volume.contains("+ boundarySigma(worldPush) * t"),
                 "the closed form must price the flat term over the segment it is integrating");
-        assertTrue(volume.contains("sigmaT += boundarySigma(push);"),
+        assertTrue(volume.contains("float3 sigmaT = density * FOG_RAYLEIGH_COEFF + boundarySigma(push);"),
                 "sampleVolume must hand consumers the same medium the segments integrate");
-        assertTrue(volume.contains("float sigma = fogMarchDensity(worldPush, p) + sigmaB;"),
+        assertTrue(volume.contains("float3 sigmaT = density * FOG_RAYLEIGH_COEFF + sigmaB;"),
                 "the marched tier must add the haze after its own noise modulation, so the billows "
                         + "never scale the flat term");
-        assertTrue(volume.contains("if (sigma0 + sigmaB <= 0.0 || dot(albedo"),
+        assertTrue(volume.contains("if (density0 + sigmaB <= 0.0 || dot(albedo"),
                 "both tiers must run for a frame that carries only the haze, where the height profile "
                         + "is empty");
         assertTrue(volume.contains("float yTop = sigmaB > 0.0 ? 1.0e30"),
                 "the marched span clamp must stand down for a flat medium: it trims the stretch above "
                         + "the fog's significant band, and a flat term has no such band to stop at");
-        assertTrue(volume.contains("float sigma = sigma0;"),
-                "the sun legs must keep the height fog's own sigma — the flat term is left out on purpose");
-        assertTrue(volume.contains("return fogTransmittance(sigma, worldPush.fog0.z, worldPush.fog0.y,"),
+        assertTrue(volume.contains("* fogT_toSunRo(ro, celestialLight.dir, density0)"),
+                "the unshadowed sun leg must carry the height fog's own density — the flat term is left "
+                        + "out on purpose");
+        assertTrue(volume.contains("return fogTransmittanceRGB(density0, worldPush.fog0.z, worldPush.fog0.y,"),
                 "fogT_toSunRo must stay on the height profile alone, not the combined air depth");
         // The flag the haze rides, and where it is raised.
         assertTrue(composite.contains("boolean boundaryOn = CausticaConfig.Rt.Volume"
@@ -317,6 +319,83 @@ final class VolumeFogTest {
         assertTrue(primary.contains("float awayFromSurface = 1.0 - airT * (1.0 - coverage);"),
                 "the fog-dominated guide blend must combine the air transmittance with the edge fade's "
                         + "coverage, or a dissolving pixel keeps the surface's albedo guide");
+    }
+
+    /**
+     * The Rayleigh coefficient is the whole term: Photon's per-channel air, from_srgb(0.31, 0.67, 1.00)
+     * times the 0.5 its airmass integral folds in, carried through the push's Rec.709 -> ACEScg matrix.
+     * The shader literal and the Java conversion here are separate transcriptions of that one spec, so a
+     * drift in either would quietly change the hue the aerial perspective turns. The last check is what
+     * the term is FOR: at the default density the display-space e-folding distance is 4 km for blue and
+     * 51 km for red, which is why distance blues a landscape out instead of washing it grey.
+     */
+    @Test
+    void rayleighCoefficientCarriesThePhotonSpec() throws IOException {
+        String volume = Files.readString(VOLUME);
+        float[] coeff = shaderFloat3(volume, "FOG_RAYLEIGH_COEFF");
+        float peak = shaderFloat(volume, "FOG_RAYLEIGH_PEAK");
+        float mean = shaderFloat(volume, "FOG_RAYLEIGH_MEAN");
+
+        double[] srgb = {0.31, 0.67, 1.00};
+        double[] linear = new double[3];
+        for (int i = 0; i < 3; i++) {
+            linear[i] = (srgb[i] <= 0.04045 ? srgb[i] / 12.92
+                    : Math.pow((srgb[i] + 0.055) / 1.055, 2.4)) * 0.5;
+        }
+        double[][] toAcescg = {
+                {0.61309743, 0.33952314, 0.04737945},
+                {0.07019372, 0.91635388, 0.01345240},
+                {0.02061559, 0.10956977, 0.86981463},
+        };
+        double[] expected = new double[3];
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 3; j++) {
+                expected[i] += toAcescg[i][j] * linear[j];
+            }
+            assertEquals(expected[i], coeff[i], 1.0e-5,
+                    "channel " + i + " of the Rayleigh coefficient must be the Photon filter in ACEScg");
+        }
+        assertEquals(Math.max(expected[0], Math.max(expected[1], expected[2])), peak, 1.0e-5,
+                "the peak must be the largest channel: it bounds the marched tier's significant band");
+        assertEquals(0.2722287 * coeff[0] + 0.6740818 * coeff[1] + 0.0536895 * coeff[2], mean, 1.0e-5,
+                "the scalar proxy must be the coefficient's ACEScg luminance");
+
+        // Back to display space: the AP1 -> Rec.709 matrix, which is what the eye's channels integrate.
+        double[][] toRec709 = {
+                {1.70505, -0.62179, -0.08326},
+                {-0.13026, 1.14080, -0.01055},
+                {-0.02400, -0.12897, 1.15297},
+        };
+        double density = 0.0005;
+        double[] eFold = {51100.0, 9840.0, 4000.0};
+        for (int i = 0; i < 3; i++) {
+            double display = 0.0;
+            for (int j = 0; j < 3; j++) {
+                display += toRec709[i][j] * coeff[j];
+            }
+            assertEquals(linear[i], display, 1.0e-3,
+                    "channel " + i + " must come back to the Photon filter in display space");
+            assertEquals(eFold[i], 1.0 / (density * display), eFold[i] * 0.01,
+                    "the default density must buy the specified e-folding distance, channel " + i);
+        }
+    }
+
+    private static float[] shaderFloat3(String source, String name) {
+        Matcher m = Pattern.compile("float3 " + name + " = float3\\(([^)]*)\\);").matcher(source);
+        assertTrue(m.find(), name + " must be a float3 literal in volume.slang");
+        String[] parts = m.group(1).split(",");
+        assertEquals(3, parts.length, name + " must carry three channels");
+        float[] out = new float[3];
+        for (int i = 0; i < 3; i++) {
+            out[i] = Float.parseFloat(parts[i].trim().replaceAll("f$", ""));
+        }
+        return out;
+    }
+
+    private static float shaderFloat(String source, String name) {
+        Matcher m = Pattern.compile("float " + name + " = ([0-9.eE+-]+)f?;").matcher(source);
+        assertTrue(m.find(), name + " must be a float literal in volume.slang");
+        return Float.parseFloat(m.group(1));
     }
 
     /**
@@ -421,7 +500,8 @@ final class VolumeFogTest {
                 "the fade must scale what the segment returns, never add to it");
         assertTrue(indirect.contains("if (firstSegment) prefixL += fill; else L += fill;"),
                 "the shared bounce-0 segment must evaluate its fill once, or spp>1 counts it per sample");
-        assertTrue(primary.contains("float coverage = edgeFadeOn ? edgeFadeCoverage(ro, rd, payload.hitT)"),
+        assertTrue(primary.contains("float coverage = edgeFadeOn && (payload.flags & PAYLOAD_LOD) == 0u")
+                        && primary.contains("edgeFadeCoverage(ro, rd, payload.hitT)"),
                 "the guide blend must price the fade, or RR keeps the surface's albedo under a pixel that "
                         + "is mostly sky");
 
@@ -504,18 +584,48 @@ final class VolumeFogTest {
 
     // ---- Water-volume arithmetic (Java port of medium.slang's water branch + the water in-scatter) ----
 
-    /** Port of medium.slang's waterExtinction. */
-    private static float waterExtinction(float tint, float opacity) {
-        float floorR = 0.015f;
-        float floorG = 0.010f;
-        float floorB = 0.008f;
-        float density = 0.1f;
-        float baseR = floorR + density * (1.0f - Math.clamp(tint, 0.0f, 1.0f));
-        float baseG = floorG + density * (1.0f - Math.clamp(tint, 0.0f, 1.0f));
-        float baseB = floorB + density * (1.0f - Math.clamp(tint, 0.0f, 1.0f));
-        float mean = (baseR + baseG + baseB) / 3.0f;
-        float chromaScale = Math.min(opacity, 1.0f);
-        return mean * opacity; // the port tracks the achromatic mean; the chroma split cancels here
+    /** Port of medium.slang's waterExtinction: Photon's coefficient bent by a unit-mean biome hue. */
+    private static float[] waterExtinction(float tintR, float tintG, float tintB, float opacity) {
+        float[] absorption = {0.151676f, 0.087885f, 0.047682f};
+        float[] tint = {tintR, tintG, tintB};
+        float[] lift = new float[3];
+        float meanLift = 0.0f;
+        for (int i = 0; i < 3; i++) {
+            lift[i] = 1.0f - Math.clamp(tint[i], 0.0f, 1.0f);
+            meanLift += lift[i] / 3.0f;
+        }
+        float[] out = new float[3];
+        for (int i = 0; i < 3; i++) {
+            float hue = 1.0f + (lift[i] / Math.max(meanLift, 1.0e-3f) - 1.0f) * 0.6f;
+            out[i] = absorption[i] * hue * (Math.max(opacity, 0.0f) / 3.0f);
+        }
+        return out;
+    }
+
+    @Test
+    void waterAbsorptionSplitsChannelsLikePhoton() throws IOException {
+        String shader = Files.readString(MEDIUM);
+        assertTrue(shader.contains("public static const float3 WATER_ABSORPTION = "
+                + "float3(0.151676, 0.087885, 0.047682);"), "the water coefficient must stay authored");
+        // The default tint (a neutral blue body) is the coefficient itself: the hue weight is unit-mean,
+        // so a white line only shrinks each channel by the same amount and the ratio survives.
+        float[] d = waterExtinction(0.5f, 0.5f, 0.5f, 3.0f);
+        assertEquals(0.151676f, d[0], 1e-5f);
+        assertEquals(0.087885f, d[1], 1e-5f);
+        assertEquals(0.047682f, d[2], 1e-5f);
+        // Red is the fastest channel by roughly 3x, the property that makes depth read teal.
+        assertTrue(d[0] / d[2] > 2.8f && d[0] / d[2] < 3.6f, "red/blue split: " + (d[0] / d[2]));
+        // Halving the opacity halves every channel; zero opacity is clear water.
+        float[] half = waterExtinction(0.5f, 0.5f, 0.5f, 1.5f);
+        assertEquals(d[0] * 0.5f, half[0], 1e-6f);
+        float[] clear = waterExtinction(0.5f, 0.5f, 0.5f, 0.0f);
+        assertEquals(0.0f, clear[0] + clear[1] + clear[2], 0.0f);
+        // A brown swamp tint (little blue) leans the absorption onto blue, so the body browns instead of
+        // turning teal.
+        float[] swamp = waterExtinction(0.9f, 0.5f, 0.2f, 3.0f);
+        assertTrue(swamp[0] / swamp[2] < d[0] / d[2], "a brown tint must brown the absorption");
+        assertTrue(swamp[2] > d[2], "the tint must raise the channel it lacks");
+        assertTrue(swamp[0] > 0.0f && swamp[1] > 0.0f && swamp[2] > 0.0f, "no channel may go negative");
     }
 
     /** Bit position of a `WORLD_FLAG_*` constant in the shader source. */
@@ -538,10 +648,11 @@ final class VolumeFogTest {
     void volumeFlagBitsMatchShader() throws IOException {
         String shader = Files.readString(WORLD_COMMON);
         String java = Files.readString(COMPOSITE);
-        for (String flag : new String[]{"WORLD_FLAG_FOG", "WORLD_FLAG_CLOUD", "WORLD_FLAG_SPRAY",
+        for (String flag : new String[]{"WORLD_FLAG_FOG", "WORLD_FLAG_CLOUD", "WORLD_FLAG_WATER_FOG",
                 "WORLD_FLAG_VOLUME_SHADOW", "WORLD_FLAG_VOLUME_MARCH", "WORLD_FLAG_VOLUME_DEBUG",
-                "WORLD_FLAG_CLOUD_VOLUMETRIC", "WORLD_FLAG_SHAFTS", "WORLD_FLAG_CLOUD_RANDOM",
-                "WORLD_FLAG_EDGE_FADE", "WORLD_FLAG_DOF_REFLECTION"}) {
+                "WORLD_FLAG_CLOUD_VOLUMETRIC", "WORLD_FLAG_SHAFTS",
+                "WORLD_FLAG_EDGE_FADE", "WORLD_FLAG_DOF_REFLECTION", "WORLD_FLAG_CLOUD_OUTSCATTER",
+                "WORLD_FLAG_RR_DISABLED", "WORLD_FLAG_CLOUD_SHADOW"}) {
             assertEquals(shaderFlagBit(shader, flag), javaFlagBit(java, flag),
                     flag + " must sit on the same bit in world_common.slang and RtComposite");
         }
@@ -656,9 +767,9 @@ final class VolumeFogTest {
         assertTrue(volume.contains("clamp(worldPush.fog1.w, 0.0, 0.95)"),
                 "fogShadowFloor must clamp the fog1.w lane into the safe range");
         // The medium is the unthinned profile in both tiers.
-        assertTrue(volume.contains("float sigma = sigma0;"),
+        assertTrue(volume.contains("float3 transmittance = airTransmittance(ro, rd, t);"),
                 "the analytic tier must integrate the unthinned profile");
-        assertTrue(volume.contains("float sigmaEff = sigma;"),
+        assertTrue(volume.contains("float3 sigmaT = density * FOG_RAYLEIGH_COEFF + sigmaB;"),
                 "the march tier must integrate the unthinned profile");
         // The floor rides the sun legs, as a max() with the measured visibility.
         assertTrue(volume.contains("float sunVis = max(vis, fogShadowFloor());"),
@@ -684,324 +795,288 @@ final class VolumeFogTest {
     }
 
     /**
-     * The spray band's inertness: the shader's spray term returns zero whenever the spray flag is
-     * clear, and Java only raises that flag when the marched fog tier is running and the strength is
-     * non-zero — an analytic or spray-off frame pushes an inert weather.z, exactly the volume block's
+     * The water fog's inertness: the shader's water in-scatter returns zero while any of its three
+     * coefficients is zero, and Java only raises the flag when the switch is on and the fraction is
+     * non-zero — a water-fog-off frame pushes an inert water1 block, exactly the volume block's
      * zero-when-off doctrine.
      */
     @Test
-    void sprayBandGating() throws IOException {
+    void waterFogGating() throws IOException {
         String volume = Files.readString(VOLUME);
-        assertTrue(volume.contains("if ((push.flags & WORLD_FLAG_SPRAY) == 0u)"),
-                "sprayDensity must return zero while the spray flag is clear");
+        assertTrue(volume.contains(
+                "if (sigmaT <= 0.0 || sigmaS <= 0.0 || t <= RAY_TMIN)"),
+                "waterSegmentInScatter must return zero without a medium to integrate");
         String composite = Files.readString(COMPOSITE);
         assertTrue(composite.contains(
-                "boolean sprayOn = fogMarchOn && CausticaConfig.Rt.Composite.WATER_SPRAY.value() > 0f"),
-                "the spray flag must sit behind the marched fog tier and a non-zero strength");
-        assertTrue(composite.contains("sprayOn ? CausticaConfig.Rt.Composite.WATER_SPRAY.value()"),
-                "the weather.z spray lane must be zero while the spray flag is down");
+                "boolean waterFogOn = CausticaConfig.Rt.Composite.WATER_FOG.value()"),
+                "the water fog flag must sit behind its own switch and a non-zero fraction");
+        assertTrue(composite.contains(
+                "new Float4(waterFogOn ? CausticaConfig.Rt.Composite.WATER_FOG_DENSITY.value() : 0f,"),
+                "the water1.x lane must be zero while the water fog is off");
+        assertTrue(composite.contains("| WORLD_FLAG_WATER_FOG | WORLD_FLAG_VOLUME_DEBUG"),
+                "the water fog must route a frame to the raygen records that integrate it");
     }
 
     /**
-     * The cloud layer's numeric contracts, ported from volume.slang's instance-grid model: the
-     * occupancy gate never leaves [0, 1], stays empty at coverage 0 and saturates to a full grid
-     * toward overcast; the shadow transmittance sits in (0, 1], is monotone non-increasing in both
-     * sampled density and density multiplier, equals exactly 1 at zero density, and stands down for a
-     * horizon-grazing body; the multi-scatter octave stack returns exactly 1 at tau 0 and decays
-     * monotonically; the atlas layer index stays inside the shape's own layer band. These are the
-     * invariants every consumer (sheet, NEE, fog sun legs) silently leans on.
+     * Numeric contracts of the procedural cloud stack, ported from volume.slang: the coverage mask is
+     * a bounded isosurface (never a smooth wash), the vertical profile closes the body at both its
+     * flat base and its domed crown, the shadow transmittance sits in (0, 1] and stands down for a
+     * horizon-grazing body, and the powder weight is monotone in the sample's own density. Every
+     * consumer of the stack — the walk, the planar crossings, the NEE sun legs, the fog shafts — leans
+     * on these properties without re-deriving them.
      */
     @Test
-    void cloudLayerInvariants() {
-        // Java port of the occupancy gate: roll < saturate(c * (1 + patchiness * (cluster*2-1))),
-        // pinned open at coverage >= 0.95. The grid must be empty at coverage 0, never hold more
-        // than the coverage asks for, and be entirely full near 1.
-        for (float c = 0.0f; c <= 1.0f + 1.0e-6f; c += 0.1f) {
-            for (float patch = 0.0f; patch <= 1.0f + 1.0e-6f; patch += 0.25f) {
-                for (float cluster = 0.0f; cluster <= 1.0f + 1.0e-6f; cluster += 0.125f) {
-                    float gate = c >= 0.95f
-                            ? 2.0f
-                            : Math.clamp(c * (1.0f + patch * (cluster * 2.0f - 1.0f)), 0.0f, 1.0f);
-                    assertTrue(gate >= 0.0f && gate <= 2.0f,
-                            "the occupancy gate must stay bounded at c=" + c);
-                    if (c <= 1.0e-6f) {
-                        assertEquals(0.0f, gate, 1.0e-9f,
-                                "coverage 0 must leave every grid cell empty");
+    void cloudStackInvariants() {
+        final double bias = 0.10;
+        final double fineWeight = 1.30;
+        final double largeWeight = 0.60;
+        final double softness = 0.20;
+        for (double big = 0.0; big <= 1.0 + 1.0e-9; big += 0.25) {
+            for (double fine = 0.0; fine <= 1.0 + 1.0e-9; fine += 0.25) {
+                double mask = largeWeight * big + fineWeight * fine + bias;
+                double previous = Double.NEGATIVE_INFINITY;
+                for (double cov = 0.2; cov <= 2.0 + 1.0e-9; cov += 0.2) {
+                    double q = Math.min(1.0, Math.max(0.0,
+                            ((cov - mask) / Math.sqrt(Math.max(cov, 1.0e-3))) / softness));
+                    double shape = q * q * (3.0 - 2.0 * q);
+                    assertTrue(shape >= 0.0 && shape <= 1.0,
+                            "the shape must be a bounded isosurface at cov=" + cov + " mask=" + mask);
+                    if (mask >= cov) {
+                        assertClose("a mask past the coverage clears the sky", 0.0, shape, 1.0e-9);
                     }
-                    if (c >= 0.95f) {
-                        assertEquals(2.0f, gate, 1.0e-9f,
-                                "near-full coverage must fill the whole grid");
-                    } else {
-                        assertTrue(gate <= c * (1.0f + patch) + 1.0e-6f,
-                                "the gate may not exceed the coverage times its cluster swing");
-                    }
+                    assertTrue(shape >= previous - 1.0e-9,
+                            "raising coverage must never remove a body");
+                    previous = shape;
                 }
             }
         }
 
-        // Java port of cloudShadowTransmittance's tau = d * density * 0.22 * thickness / sunY.
-        final float extinction = 0.22f;
-        for (float thickness : new float[]{0.5f, 12.0f, 64.0f}) {
-            for (float densityMult : new float[]{0.0f, 0.5f, 1.0f, 3.0f}) {
-                float previous = Float.MAX_VALUE;
-                for (float d = 0.0f; d <= 1.0f + 1.0e-6f; d += 0.01f) {
-                    float tau = d * densityMult * extinction * thickness / 0.6f;
-                    float t = (float) Math.exp(-tau);
-                    assertTrue(t > 0.0f && t <= 1.0f + 1.0e-6f,
-                            "shadow transmittance must sit in (0, 1] at d=" + d
-                                    + " density=" + densityMult + " thickness=" + thickness);
-                    assertTrue(t <= previous + 1.0e-9f,
-                            "shadow transmittance must not grow with density at d=" + d);
-                    previous = t;
-                    if (d <= 1.0e-6f) {
-                        assertEquals(1.0f, t, 1.0e-9f,
-                                "zero sampled density must cast no shadow at all");
-                    }
+        // Java port of the cumulus vertical profile (shape = 1 inside the body).
+        final double tallness = 232.0 * 0.56;
+        final double baseRound = 26.0;
+        final double topPower = 2.2;
+        double previousInterior = -1.0;
+        for (double above = 0.0; above <= tallness + 1.0e-9; above += tallness / 20.0) {
+            double below = tallness - above;
+            double bottom = 1.0 - Math.pow(1.0 - Math.min(Math.max(below / baseRound, 0.0), 1.0), 5.0);
+            double top = 1.0 - Math.pow(1.0 - Math.min(Math.max(above / tallness, 0.0), 1.0), topPower);
+            double interior = Math.max(1.0 - 1.0 + top * bottom, 0.0);
+            assertTrue(interior >= 0.0 && interior <= 1.0,
+                    "the profile must be a bounded vertical weight at above=" + above);
+            assertClose("the crown must close on itself", 0.0, interiorAt(tallness, tallness, baseRound, topPower), 1.0e-9);
+            assertClose("the flat base must close on itself", 0.0, interiorAt(0.0, tallness, baseRound, topPower), 1.0e-9);
+            previousInterior = interior;
+        }
+        assertTrue(previousInterior >= 0.0, "the crown's profile must be bounded");
+        assertTrue(interiorAt(tallness * 0.5, tallness, baseRound, topPower) > 0.5,
+                "the interior of the deck must be solid");
+
+        // Java port of cloudShadowTransmittance's slant-thickened column and its elevation gate.
+        for (double density = 0.0; density <= 1.0 + 1.0e-9; density += 0.1) {
+            for (double sunY = 0.01; sunY <= 1.0 + 1.0e-9; sunY += 0.1) {
+                double denom = Math.max(sunY, 0.02);
+                double tau = density * 0.5 * tallness / denom;
+                double gate = smoothstep(0.0, 0.06, sunY);
+                double t = 1.0 + (Math.exp(-tau) - 1.0) * gate;
+                assertTrue(t >= 0.0 && t <= 1.0 + 1.0e-9,
+                        "the shadow transmittance must be a transmittance at density=" + density);
+                if (density == 0.0) {
+                    assertClose("a clear sky casts no shadow", 1.0, t, 1.0e-9);
                 }
             }
         }
+        assertClose("the horizon gate must stand the shadow field down", 1.0,
+                1.0 + (Math.exp(-1.0) - 1.0) * smoothstep(0.0, 0.06, 0.0), 1.0e-9);
 
-        // Java port of cloudSelfShadow: energy-normalised octaves, so tau = 0 returns exactly 1.
-        for (float tau = 0.0f; tau <= 12.0f; tau += 0.25f) {
-            float sum = 0.0f;
-            float weightSum = 0.0f;
-            float weight = 1.0f;
-            for (int i = 0; i < 3; i++) {
-                sum += weight * (float) Math.exp(-tau * Math.pow(2.0, -i));
-                weightSum += weight;
-                weight *= 0.5f;
-            }
-            float self = sum / weightSum;
-            assertTrue(self > 0.0f && self <= 1.0f + 1.0e-6f,
-                    "the multi-scatter stack must sit in (0, 1] at tau=" + tau);
-            if (tau <= 1.0e-6f) {
-                assertEquals(1.0f, self, 1.0e-6f, "tau 0 must be exactly unshadowed");
-            }
+        // Java port of cloudPowder: the thin rim keeps the strong forward lobe, the solid interior
+        // does not, and the weight saturates rather than growing without bound.
+        double previousPowder = -1.0;
+        for (double shape = 0.0; shape <= 1.0 + 1.0e-9; shape += 0.05) {
+            double powder = Math.min(Math.exp(-4.0 * Math.exp(-4.0 * shape)) * 3.5, 1.0);
+            assertTrue(powder > 0.0 && powder <= 1.0,
+                    "the powder weight must be bounded at shape=" + shape);
+            assertTrue(powder >= previousPowder - 1.0e-9,
+                    "a denser sample must not lose the powder weight");
+            previousPowder = powder;
         }
+        assertClose("the powder weight must saturate inside the body", 1.0, previousPowder, 1.0e-9);
+    }
 
-        // The atlas layer index: layerF is clamped to RES-1.001 so the hand-made trilinear's second
-        // tap stays inside the shape's own layer band (never a neighbour shape's first layer). The
-        // shader's own vertical01 < 0 || > 1 gate means the arithmetic only ever sees [0, 1].
-        final float res = 128.0f;
-        for (float v = 0.0f; v <= 1.0f + 1.0e-6f; v += 0.01f) {
-            float layerF = Math.min(v * (res - 1.0f), res - 1.001f);
-            float l0 = (float) Math.floor(layerF);
-            assertTrue(l0 >= 0.0f && l0 + 1.0f <= res - 1.0f + 1.0e-3f,
-                    "the layer pair must stay inside the shape's band at v=" + v);
-        }
+    /** cloudCumulusDensity's interior density at a height `above` the deck's top. */
+    private static double interiorAt(double above, double tallness, double baseRound, double topPower) {
+        double below = tallness - above;
+        double bottom = 1.0 - Math.pow(1.0 - Math.min(Math.max(below / baseRound, 0.0), 1.0), 5.0);
+        double top = 1.0 - Math.pow(1.0 - Math.min(Math.max(above / tallness, 0.0), 1.0), topPower);
+        return Math.max(top * bottom, 0.0);
+    }
+
+    private static double smoothstep(double a, double b, double x) {
+        double q = Math.min(1.0, Math.max(0.0, (x - a) / (b - a)));
+        return q * q * (3.0 - 2.0 * q);
     }
 
     /**
-     * The cloud tier's wiring, end to end: Java raises WORLD_FLAG_CLOUD behind the sky-light gate
-     * and fills the cloud0/cloud1 lanes (lane-anchored — the v15 regression pushed a floor into a
-     * look-alike lane nothing read), the sky miss shader renders the sheet and blends it over the
-     * sky, every celestial NEE site multiplies the cloud shadow, and all three sun legs (analytic
-     * fog, marched fog, underwater) read the same field. The fog-void fill rides the same miss
-     * shader, gated on a fog that is actually rendering.
+     * The cloud stack's wiring, end to end: Java raises WORLD_FLAG_CLOUD behind the sky-light gate and
+     * fills the four cloud lanes, the world pipeline binds the wrapping noise atlas, the shader builds
+     * FOUR decks from one shape field, and the six public consumers keep the signatures the raygen,
+     * the miss shader and the debug pass call them by. The fog sun legs and every NEE site still
+     * multiply the
+     * stack's shadow field, so a clouded sun dims identically everywhere.
      */
     @Test
-    void cloudTierGatingAndConsumers() throws IOException {
+    void cloudStackGatingAndConsumers() throws IOException {
         String volume = Files.readString(VOLUME);
         String skyMiss = Files.readString(Path.of("shaders/pipelines/world/sky.rmiss.slang"));
         String indirect = Files.readString(Path.of("shaders/pipelines/world/indirect.rgen.slang"));
         String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
         String composite = Files.readString(COMPOSITE);
+        String bindings = Files.readString(Path.of("shaders/pipelines/world/bindings.slang"));
+        String worldCommon = Files.readString(WORLD_COMMON);
+        String pipeline = Files.readString(PIPELINE);
 
-        // Flag assembly: behind the sky-light gate, like the fog but independent of every fog switch.
+        // The host's flag assembly and the four pushed lanes.
         assertTrue(composite.contains(
                         "boolean cloudOn = CausticaConfig.Rt.Volume.CLOUD_ENABLED.value() && skyLit"),
                 "the cloud flag must sit behind the sky-light gate");
-        assertTrue(composite.contains("flags |= WORLD_FLAG_CLOUD"),
-                "Java must raise WORLD_FLAG_CLOUD when the cloud layer is enabled");
-
-        // Lane pushes, anchored by their neighbours so a look-alike Float4 cannot swallow them.
-        // Coverage is the slider's own value — rain swells the footprints instead of lifting the
-        // gate, so the count stays what the dial says in any weather.
+        assertTrue(composite.contains("flags |= WORLD_FLAG_CLOUD")
+                        && composite.contains("flags |= WORLD_FLAG_CLOUD_SHADOW"),
+                "Java must raise both the visible-layer and the shadow-field flags");
+        assertTrue(composite.contains(
+                        "boolean cloudShadowActive = CausticaConfig.Rt.Volume.CLOUD_SHADOW.value()\n"
+                                + "                    && cloudFieldUsable"
+                                + " && (cloudVisible || (cameraLooksDown() && shadowReachOk));"),
+                "the shadow field must follow its own switch");
+        assertTrue(composite.contains("cloudOn = cloudVisible || cloudShadowActive;"),
+                "turning shadows off must not take the visible deck with it");
         assertTrue(composite.contains(
                         "new Float4(cloudOn ? CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value() : 0f,\n"
                                 + "                            CausticaConfig.Rt.Volume.CLOUD_ALTITUDE"
                                 + ".value() - terrain.blockY,"),
-                "the cloud0 lanes must be pushed behind the cloudOn gate (coverage first, rebased base second)");
-        // The baked shape's index rides cloud1.x (mapped from the 0..1 slider across the atlas's
-        // shape count), the weather swell cloud1.y, the instance jitter strength cloud1.z, the fade
-        // cloud1.w; the drift itself is Java-accumulated into cloud2.zw (the v15 lesson: anchor the
-        // lane by its neighbours).
-        assertTrue(composite.contains(
-                        "new Float4(cloudOn\n"
-                                + "                                    ? (float) Math.round(CausticaConfig.Rt.Volume"
-                                + ".CLOUD_TYPE.value()\n"
-                                + "                                            * (cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0))\n"
-                                + "                                    : 0f,\n"
-                                + "                            cloudOn ? CausticaConfig.Rt.Volume"
-                                + ".rainSwelling(storm, cloudRainBoost) : 0f,\n"
-                                + "                            cloudOn ? CausticaConfig.Rt.Volume"
-                                + ".CLOUD_PATCHINESS.value() : 0f,\n"
-                                + "                            cloudOn ? CausticaConfig.Rt.Volume"
-                                + ".CLOUD_FADE_DISTANCE.value() : 0f),"),
-                "cloud1 must carry the shape index, the weather swell, the jitter strength and the "
-                        + "fade, with the drift gone to cloud2");
-        // The volumetric tier's two own lanes: the step count rides volumeParams.w beside the fog
-        // march's lanes, and the type mix rides cloud1.x. Both are zero while the tier is off.
-        assertTrue(composite.contains(
-                        "                            0f,\n"
-                                + "                            volumetricCloudOn\n"
-                                + "                                    ? (float) CausticaConfig.Rt.Volume"
-                                + ".CLOUD_STEPS.value() : 0f),"),
-                "the volumetric step count must ride volumeParams.w, gated on the tier's own switch");
-        assertTrue(!composite.contains("cloudOn ? CausticaConfig.Rt.Volume.CLOUD_WIND_SPEED.value()"),
-                "the cloud wind speed must feed the Java drift accumulator, not a shader lane");
+                "the cloud0 lanes must push the slider's coverage first and the rebased cumulus base second");
+        String configSource = Files.readString(CONFIG);
+        assertTrue(configSource.contains(
+                        "bool(\"caustica.rt.volume.cloudShadow\", \"volume.cloud-shadow\", true)"),
+                "cloud shadows must be a switch of their own, on by default");
+        String settingsSource = Files.readString(SETTINGS);
+        assertTrue(settingsSource.contains("\"volume.cloud-shadow\"")
+                        && settingsSource.contains("CausticaConfig.Rt.Volume.CLOUD_SHADOW"),
+                "the switch must be on the Sky page");
+        assertTrue(composite.contains("cloudOn ? cloudCoverageBoost : 0f,")
+                        && configSource.contains("public static float rainCoverage(float storm, float boost)"),
+                "the weather's coverage lift must ride cloud1.y, not be folded into the slider's lane");
+        assertTrue(composite.contains("cloudOn ? cloudFlowClock : 0f, 1f)")
+                        && composite.contains("CLOUD_SIZE_REFERENCE"),
+                "the size scale and the flow phase must ride cloudColor.x and cloudColor.z");
+        // The three quality dials ride the block's spare lanes, each gated on the consumer that reads
+        // it: the sun-leg count on the volumetric tier, the detail dial on the active field, the
+        // shadow count on the shadow field. Zero is the shader's clamp-to-1 inert default, so an off
+        // consumer pushes nothing and the default frame is the shipped single-tap, detail-on one.
+        assertTrue(composite.contains("volumetricCloudOn\n"
+                        + "                                    ? (float) CausticaConfig.Rt.Volume.CLOUD_LIGHT_STEPS.value() : 0f,")
+                        && volume.contains("int steps = int(clamp(push.cloud1.x, 1.0, 8.0));"),
+                "the sun-leg sample count must ride cloud1.x, zero unless the volumetric tier runs");
+        assertTrue(composite.contains("cloudOn ? (CausticaConfig.Rt.Volume.CLOUD_DETAIL.value() ? 1f : 0f) : 0f,")
+                        && volume.contains("bool detailOn = worldPush.cloudColor.y > 0.5;")
+                        && volume.contains("float2 curl = cloudCurl(fineAddr / l.detailTile) * CLOUD_FINE_CURL;")
+                        && volume.contains("if (!eroded || !detailOn) {"),
+                "the detail dial must ride cloudColor.y and cut only the erosion pass: the cumulus shape "
+                        + "field's curl stays unconditional, so the shadow the deck casts does not move "
+                        + "under a close-view switch");
+        assertTrue(composite.contains("cloudShadowActive\n"
+                        + "                                    ? (float) CausticaConfig.Rt.Volume.CLOUD_SHADOW_STEPS.value() : 0f,")
+                        && volume.contains("int steps = int(clamp(worldPush.volumeParams.z, 1.0, 4.0));")
+                        && volume.contains("tau += (densitySum / float(steps)) * l.density * l.tallness / denom;"),
+                "the shadow sample count must ride volumeParams.z and average the leg's profile, "
+                        + "1 keeping the shipped mid-plane estimate's exact arithmetic");
+        assertTrue(configSource.contains(
+                        "clampedInt(\"caustica.rt.volume.cloudLightSteps\", \"volume.cloud-light-steps\", 1, 1, 8)")
+                        && configSource.contains("bool(\"caustica.rt.volume.cloudDetail\", \"volume.cloud-detail\", true)")
+                        && configSource.contains(
+                        "clampedInt(\"caustica.rt.volume.cloudShadowSteps\", \"volume.cloud-shadow-steps\", 1, 1, 4)"),
+                "the three quality dials must default to the shipped single-tap, detail-on frame");
+        assertTrue(settingsSource.contains("\"volume.cloud-light-steps\"")
+                        && settingsSource.contains("\"volume.cloud-detail\"")
+                        && settingsSource.contains("\"volume.cloud-shadow-steps\""),
+                "the three quality dials must sit on the Sky page");
         assertTrue(composite.contains(
                         "new Float4((float) terrain.blockX, (float) terrain.blockZ,\n"
                                 + "                            (float) cloudDriftX, (float) cloudDriftZ),"),
-                "the cloud field must anchor on the EXACT terrain origin (no mod-4096 wrap: the "
-                        + "instance grid has no period) plus the Java-accumulated drift");
-        // The baked-volume field: one hash-grid instance lookup, the atlas fetch (hand-lerped across
-        // layers, because 2D-array filtering is nearest along the layer axis), and the shape index
-        // read straight out of cloud1.x into the atlas layer base.
-        assertTrue(volume.contains("float cloudInstanceDensity(WorldPush push, float2 driftedXZ, float vertical01)"),
-                "every cloud consumer must read the one instance-grid density");
-        assertTrue(volume.contains("cloudVolumes.SampleLevel(")
-                        && volume.contains("shape = clamp(floor(push.cloud1.x)")
-                        && volume.contains("float layer = shape * CLOUD_VOLUME_RES + l0;"),
-                "the density must fetch the atlas layer of the shape the grid selected");
-        // The shape is drawn per PARENT cell, and the random-style bit switches the source from the
-        // slider to the whole atlas. A per-cell hash put a new volume against every instance wall,
-        // which is a seam the density itself does not have.
-        assertTrue(volume.contains("float2 parentId = floor(cellId / 4.0);")
-                        && volume.contains("float shapeRoll = cloudGridHash(parentId, 97.0);")
-                        && volume.contains("if ((push.flags & WORLD_FLAG_CLOUD_RANDOM) != 0u) {")
-                        && volume.contains("shape = clamp(floor(shapeRoll * (lastShape + 1.0)), 0.0, lastShape);"),
-                "the shape must be drawn per parent cell, from the atlas when the random style is on");
-        assertTrue(volume.contains("float2 cellId = floor(driftedXZ / cell);")
-                        && volume.contains("float2 drifted = pos.xz + sunDir.xz * t + worldPush.cloud2.xy + worldPush.cloud2.zw;"),
-                "the instance grid must sample through the exact anchor and the drift");
-        // The deck's light must be the derived celestial for body AND colour, with the level kept on the
-        // pushed look constant: a literal physical level at a one-degree sun is a rounding error, which
-        // left the deck black instead of burning. The colour is a FRACTION of the derived chromaticity —
-        // at full strength a one-degree sunset colour is an impossible light at that level, and the ACES
-        // highlight roll-off turned the deck khaki. The constant is ramped by the sun's elevation (next
-        // assertion): cloudLightTint is unit-luminance, so a flat level has nothing to fall off with.
-        assertTrue(volume.contains("CelestialLight light = dominantCelestialLight(state, transmittanceLut);")
-                        && volume.contains("float3 lightIll = lightLevel * cloudLightTint(light.illuminance);")
-                        && volume.contains("public static const float CLOUD_LIGHT_TINT = 0.5;")
-                        && volume.contains("return lerp(float3(1.0, 1.0, 1.0), chroma, CLOUD_LIGHT_TINT);"),
-                "the cloud tiers must take the light's colour from the derived body, trimmed, and its "
-                        + "level from the pushed constant");
-        // The level rides the sun's elevation. cloudLightTint is unit-luminance by construction, so a
-        // flat level held the deck at full brightness right down to the horizon and then dropped the
-        // whole term in the frame the moon took over (128000 -> 5). The ramp must reach zero before
-        // that handoff, which is why CLOUD_LEVEL_ZERO_ALT sits just below the handoff elevation.
-        assertTrue(volume.contains("float cloudDaylightLevel(float sunDirY) {")
-                        && volume.contains("CLOUD_LEVEL_ZERO_ALT = -0.012")
-                        && volume.contains("lightLevel *= cloudDaylightLevel(state.sunDir.y);"),
-                "the deck's direct level must fade with the sun's elevation before the moon handoff");
-        assertTrue(volume.contains("skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI")
-                        && volume.contains("clamp(push.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;")
-                        && volume.contains("max(cloudSelfShadow(tauSun * CLOUD_AMBIENT_OCCLUSION),")
-                        && volume.contains("CLOUD_AMBIENT_FLOOR);"),
-                "the deck's ambient must be the sky's hemisphere irradiance, with the weight clamped so "
-                        + "a lane slip cannot relight the sky");
-        // The slab's self-shadow runs the multi-scatter octave stack (energy-normalised, so tau = 0
-        // still gives exactly 1): a single-scatter deck reads blue-grey by day and black at night.
-        assertTrue(volume.contains("float selfT = cloudSelfShadow(tauSelf);")
-                        && volume.contains("public float cloudSelfShadow(float tau)")
-                        && volume.contains("sum += weight * exp(-tau * exp2(-float(i)));")
-                        && volume.contains("CLOUD_ALBEDO * opacity * (phase * lightIll * selfT + ambient)"),
-                "the sheet's self-shadow must use the energy-normalised multi-scatter octaves");
-        // The instance grid's anti-repetition and clustering structure: quarter-turn + mirror poses
-        // out of one texture, and a parent-cell hash that gathers instances into weather systems.
-        assertTrue(volume.contains("float turn = floor(pose * 3.999);")
-                        && volume.contains("if (frac(pose * 7.31) < 0.5) {"),
-                "instances must rotate and mirror their volume so one texture dresses the sky");
-        assertTrue(volume.contains("float cluster = lerp(")
-                        && volume.contains("cloudGridHash(pf, 83.0), cloudGridHash(pf + float2(1.0, 0.0), 83.0), pu.x)")
-                        && volume.contains("push.cloud0.x >= 0.95"),
-                "the patchiness must cluster instances via bilinearly smoothed parent-cell hashes "
-                        + "(a binary per-block hash drew straight grid-aligned fronts across the sky), "
-                        + "saturating near full cover");
-        // The volumetric tier's light march: the baked shape's own occlusion toward the body, feeding
-        // the same multi-scatter stack the sheet's column estimate uses.
-        assertTrue(volume.contains("float cloudLightTau(WorldPush push, float3 p, float3 lightDir, float boxH)")
-                        && volume.contains("float tauSun = cloudLightTau(push, p, lightDir, boxH) * push.cloud0.w;"),
-                "the march tier must light its samples through a secondary march of the baked field");
+                "the field must anchor on the EXACT terrain origin plus the Java-accumulated drift");
+        assertTrue(!composite.contains("CLOUD_TYPE") && !composite.contains("CLOUD_RANDOM_STYLE")
+                        && !composite.contains("cloudVolumes"),
+                "the baked-shape slider, the random-style flag and the atlas must be gone");
 
-        // The sheet-only dissipation: the fade reads cloud1.w, clamps to a sane minimum, and the
-        // shadow field deliberately never reads it.
-        assertTrue(volume.contains("float fadeDist = max(push.cloud1.w, 64.0);"),
-                "the sheet's fade distance must ride the cloud1.w lane with a sane floor");
-        assertTrue(volume.contains("float opacity = (1.0 - exp(-tau)) * fade;")
-                        && volume.contains("cloudT = 1.0 - opacity;"),
-                "the fade must dissolve the sheet's opacity (radiance and occlusion together) — "
-                        + "fading the radiance alone left a black band where grazing tau had "
-                        + "saturated the transmittance to 0");
-        assertTrue(volume.contains("1.0 - smoothstep(fadeDist * 0.6, fadeDist, t)"),
-                "the sheet must fade over the last 40% of the dissipation range");
-        assertTrue(volume.contains(
-                "float tau = density * worldPush.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / denom;"),
-                "cloudShadowTransmittance must price the column every tier prices, free of the fade "
-                        + "distance and of the thickness dial");
-        // The shadow fades with the sun instead of switching off at 2.87 degrees: that switch put a
-        // one-frame step on every surface the deck shaded, and the tau it blends is clamped at the
-        // same floor so the leg stays finite as the gate closes.
-        assertTrue(volume.contains("float shadowGate = smoothstep(0.0, 0.06, sunDir.y);")
-                        && volume.contains("float denom = max(sunDir.y, 0.02);")
-                        && volume.contains("return lerp(1.0, exp(-tau), shadowGate);"),
-                "the cloud shadow must fade out with the sun's elevation rather than switching off");
+        // The binding and the generated constant describe ONE wrapping 2D atlas.
+        assertTrue(bindings.contains("[[vk::binding(19, 0)]] public Sampler2D cloudNoise;"),
+                "the world set must bind one 2D noise atlas at slot 19");
+        assertTrue(pipeline.contains("WORLD_CLOUD_NOISE")
+                        && pipeline.contains("setCloudNoiseTexture"),
+                "the pipeline must expose the noise atlas's binding under its new name");
+        assertTrue(!worldCommon.contains("WORLD_FLAG_CLOUD_RANDOM")
+                        && !worldCommon.contains("atlas's LAST shape index"),
+                "the push block must not describe retired lanes or flags");
 
-        // The sheet: the miss shader imports the volume module, renders the planar in-scatter, and
-        // blends it over everything behind it — in-scatter on top, transmittance over the sky.
-        assertTrue(skyMiss.contains("import volume;"),
-                "the sky miss shader must import the cloud field's module");
-        assertTrue(skyMiss.contains("planarCloudSkyInScatter(worldPush, WorldRayOrigin(), dir, state,"),
-                "the sky miss shader must render the planar sheet from the pushed plane");
+        // Four decks, one shape language, no instances and no baked volumes.
+        assertTrue(volume.contains("public static const int CLOUD_LAYER_COUNT = 4;")
+                        && volume.contains("public static const int CLOUD_CIRRUS = 3;"),
+                "the stack must be four decks");
+        assertTrue(volume.contains("CloudLayer cloudLayerOf(WorldPush push, int index) {")
+                        && volume.contains("float coverage = clamp(push.cloud0.x + push.cloud1.y, 0.0, 2.5);")
+                        && volume.contains("float sizeScale = clamp(push.cloudColor.x, 0.25, 4.0);"),
+                "every deck must resolve from the same coverage, weather and size lanes");
+        assertTrue(volume.contains("float cloudCoverageMask(float big, float fine, float cov, float patchiness) {")
+                        && volume.contains("CLOUD_MASK_BIAS")
+                        && volume.contains("CLOUD_SHAPE_SOFTNESS"),
+                "every deck must clear the one biased, narrow isosurface");
+        assertTrue(volume.contains("float cloudCumulusDensity(CloudLayer l, float3 p, float2 wind, float lod, bool eroded,")
+                        && volume.contains("float cloudSheetDensity(CloudLayer l, float3 p, float2 wind, float lod) {")
+                        && volume.contains("float2 cloudCurl(float2 p) {"),
+                "the two cumulus decks and the two sheets must be implemented, cirrus with a curl warp");
+        assertTrue(volume.contains("float2 uv = (p.xz + p.y * float2(0.0, 193.0)) * (1.0 / 512.0);"),
+                "the erosion field's vertical offset must be continuous, not a per-cell row jump");
+        assertFalseStaleCloud(volume);
+
+        // The six public consumers keep the call signatures every stage was written against.
+        assertTrue(volume.contains("public float cloudShadowTransmittance(float3 pos, float3 sunDir) {")
+                        && volume.contains("public float cloudCoverageWorld(float2 rebasedXZ) {")
+                        && volume.contains("public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,")
+                        && volume.contains("public float3 cloudSegmentOutScatter(WorldPush push, float3 ro, float3 rd, SkyState state,")
+                        && volume.contains("public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,")
+                        && volume.contains("public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd) {")
+                        && volume.contains("public float cloudBoxMid(WorldPush push) {"),
+                "the stack's public surface must keep the signatures the other stages call");
+        assertTrue(volume.contains("for (int index = CLOUD_LOW; index <= CLOUD_ALTO; index++)"),
+                "the ground shadow field must price the cumulus and altostratus decks, not the cirrus");
+        assertTrue(volume.contains("float shadowGate = smoothstep(0.0, 0.06, sunDir.y);"),
+                "the shadow field must fade out with the sun's elevation rather than switching off");
+        assertTrue(volume.contains("if ((worldPush.flags & WORLD_FLAG_CLOUD_SHADOW) == 0u || worldPush.cloud0.x <= 0.0) {"),
+                "the shadow field must return exactly 1 while it is off");
+
+        // The consumers outside volume.slang are unchanged.
         assertTrue(skyMiss.contains("color = cloudL + cloudT * color;"),
-                "the sheet must attenuate the sky behind it, not just add on top");
-        assertTrue(skyMiss.contains("if (!endSky) {"),
-                "the sheet must not render over an end-sky dome");
+                "the sky miss shader must composite the stack over the dome");
+        assertTrue(indirect.contains("vis *= cloudShadowTransmittance(p, lightDir);")
+                        && indirect.contains("vis *= cloudShadowTransmittance(shadowOrigin, lightDir);"),
+                "both celestial NEE sites must pick up the stack's shadow");
+        assertTrue(volume.contains("* cloudShadowTransmittance(ro, celestialLight.dir));")
+                        && volume.contains("cloudShadow = cloudShadowTransmittance(ro + rd * midDepth, celestialLight.dir);")
+                        && volume.contains("cloudShadowTransmittance(ro + rd * (0.5 * (t0 + t1)), sunDir)")
+                        && volume.contains("shaftDepthAtWeight(sigma, reach, SHAFT_STRATA / 2)")
+                        && volume.contains("* (vis * legT * cloudShadowTransmittance(p, celestialLight.dir));"),
+                "every sun leg must read the same shadow field, once per segment rather than per stratum");
+        assertTrue(primary.contains("cloudDensity = cloudCoverageWorld(ro.xz + rd.xz * tPlane);")
+                        && primary.contains("cloudShadow = cloudShadowTransmittance(ro, celestialLight.dir);"),
+                "the volume debug image must fill both cloud lanes");
+    }
 
-        // The fog-void fill: mirrored dome only while some air fog actually renders — the height profile
-        // or the border's haze, since either one is air standing in front of the sky.
-        assertTrue(skyMiss.contains(
-                        "(worldPush.flags & WORLD_FLAG_FOG) != 0u"),
-                "the below-horizon void fill must gate on a fog that is actually rendering");
-        assertTrue(skyMiss.contains(
-                        "(worldPush.fog0.x > 0.0 || worldPush.boundaryFog.x > 0.0)"),
-                "the void fill must also cover a border-only frame, where the height profile is empty "
-                        + "and the haze is the only thing between the eye and the space floor");
-        assertTrue(skyMiss.contains("float3 domeDir = fogVoidFill && dir.y < 0.0"),
-                "the void fill must mirror below-horizon dome lookups only");
-
-        // Consumers: both NEE sites and all three sun legs multiply the same shadow field.
-        assertTrue(indirect.contains("vis *= cloudShadowTransmittance(p, lightDir);"),
-                "the terrain celestial NEE must pick up the cloud shadow");
-        assertTrue(indirect.contains("vis *= cloudShadowTransmittance(shadowOrigin, lightDir);"),
-                "the particle celestial NEE must pick up the cloud shadow");
-        assertTrue(volume.contains("* cloudShadowTransmittance(ro, celestialLight.dir));"),
-                "the analytic fog's unshadowed sun leg must pick up the cloud shadow");
-        assertTrue(volume.contains("cloudShadowTransmittance(probe, celestialLight.dir));"),
-                "the analytic fog's per-stratum sun legs must pick up the cloud shadow");
-        assertTrue(volume.contains("stratumCloud = cloudShadowTransmittance(p, sunDir);")
-                        && volume.contains("* (sunVis * sunFogT * stratumCloud);"),
-                "the marched fog's stratum probe must measure the cloud shadow once per stratum and "
-                        + "its sun leg must consume that measurement");
-        // The underwater sun leg is the shaft layer now, and it carries the cloud shadow per probe —
-        // the same field the terrain NEE reads, so a clouded sun thins the water shafts too.
-        assertTrue(volume.contains(
-                        "sun += vis * (weight * cloudShadowTransmittance(p, celestialLight.dir));"),
-                "the underwater sun leg must pick up the cloud shadow");
-
-        // The shadow field's own gate: exactly 1 while clouds are off, so every multiply above
-        // keeps the cloud-off frame bit-identical.
-        assertTrue(volume.contains(
-                        "if ((worldPush.flags & WORLD_FLAG_CLOUD) == 0u || worldPush.cloud0.x <= 0.0) {\n"
-                                + "        return 1.0;"),
-                "cloudShadowTransmittance must return exactly 1 while the cloud layer is off");
-
-        // The debug image's cloud lanes (b coverage, a shadow) live.
-        assertTrue(primary.contains("cloudDensity = cloudCoverageWorld(ro.xz + rd.xz * tPlane);"),
-                "the volume debug image must fill the cloud coverage lane");
-        assertTrue(primary.contains("cloudShadow = cloudShadowTransmittance(ro, celestialLight.dir);"),
-                "the volume debug image must fill the cloud shadow lane");
+    /** No identifier from the retired baked-volume field may survive in the new implementation. */
+    private static void assertFalseStaleCloud(String volume) {
+        for (String stale : new String[]{"cloudInstanceDensity(", "cloudAtlasSample(", "cloudVolumes",
+                "CLOUD_VOLUME_RES", "cloudGridHash(", "cloudDistrictShape(", "cloudSelfShadow(",
+                "cloudLightTau(", "CLOUD_COLUMN_DEPTH", "CLOUD_BOX_SPAN"}) {
+            assertTrue(!volume.contains(stale),
+                    "the retired baked-volume field must not leave " + stale + " behind");
+        }
     }
 
     /**
@@ -1033,7 +1108,7 @@ final class VolumeFogTest {
                 "the generated record must keep cloud2 before cloudColor");
 
         int cloud2Call = composite.indexOf("new Float4((float) terrain.blockX, (float) terrain.blockZ,");
-        int cloudColorCall = composite.indexOf("new Float4(CausticaConfig.Rt.Volume.CLOUD_SIZE.value(),");
+        int cloudColorCall = composite.indexOf("new Float4(Math.clamp(CausticaConfig.Rt.Volume.CLOUD_SIZE.value() / CLOUD_SIZE_REFERENCE,");
         assertTrue(cloud2Call > 0 && cloudColorCall > 0,
                 "both cloud lanes must appear at the call site");
         assertTrue(cloud2Call < cloudColorCall,
@@ -1051,7 +1126,8 @@ final class VolumeFogTest {
         assertTrue(volumeParamsArg > 0 && hazeArg > volumeParamsArg,
                 "the generated record must keep boundaryFog after volumeParams");
         int hazeCall = composite.indexOf("new Float4(boundarySigma, 0f, 0f, 0f)");
-        int waterVolumeCall = composite.indexOf("new Float4(0f, 0.6f, 1.5f,");
+        int waterVolumeCall = composite.indexOf(
+                "new Float4(waterFogOn ? CausticaConfig.Rt.Composite.WATER_FOG_DENSITY.value() : 0f,");
         assertTrue(hazeCall > 0 && waterVolumeCall > hazeCall,
                 "the call site must pass the haze lane before the water-volume block, matching the "
                         + "generated record order");
@@ -1090,107 +1166,69 @@ final class VolumeFogTest {
     }
 
     /**
-     * The volumetric cloud tier's numeric contracts and wiring. The layer is the SAME body the planar
-     * tier prices — same base, same instance field, and the column's optical depth still reads off
-     * cloud0.z — so the invariants that matter are
-     * that the walk's fade dissolves its OPACITY rather than its glow (the v17 black-band lesson, which
-     * a walk reaches just as easily as a single crossing), that the expensive path is reachable only
-     * from a primary ray while continuation rays get the cheap mean, and that the baked volume's shape
-     * reaches the walk through one clamped, hand-lerped atlas fetch per sample.
+     * The volumetric tier walks every deck the ray meets, front to back, rather than pricing one slab.
+     * What has to hold is the SAME field as the planar tier (so the two degrade into each other), the
+     * fade dissolving the layer's OPACITY and not just its glow (the v17 black-band lesson), the
+     * cheap column gate ahead of the expensive fetches, the light leg reading the same shape, and the
+     * walk being reserved for the primary ray while continuation rays get the mean extinction.
      */
     @Test
     void volumetricCloudTierInvariants() throws IOException {
         String volume = Files.readString(VOLUME);
         String skyMiss = Files.readString(Path.of("shaders/pipelines/world/sky.rmiss.slang"));
-        String composite = Files.readString(COMPOSITE);
 
-        // The walk samples the shared instance field: one field, three consumers, so the deck the
-        // player sees casts the shadow they see. Its vertical coordinate rides the instance box
-        // (standing on the cloud base), and the density is exactly zero outside any instance's window.
-        boolean hasWalkV = volume.contains("float v = (p.y - boxBottom) / boxH;");
-        boolean hasWalkDensity = volume.contains("float density = cloudInstanceDensity(push,\n"
-                + "                p.xz + push.cloud2.xy + push.cloud2.zw, v);");
-        assertTrue(hasWalkV && hasWalkDensity,
-                "the volumetric slab must be built from the same instance field the NEE and fog legs read"
-                        + " (v=" + hasWalkV + ", density=" + hasWalkDensity
-                        + ", length=" + volume.length() + ")");
-        // The instance boxes give a cloud a body rather than a sheet: CLOUD_BOX_ASPECT of its
-        // footprint tall, standing on the base so the baked flat bottom is the layer's base. The
-        // walk's extinction is scaled by CLOUD_TAU_ASPECT over the live height, so a taller box
-        // changes the shape without changing the column optical depth cloud0.z prices.
-        assertTrue(volume.contains("float cloudSpan(WorldPush push) {\n"
-                        + "    return clamp(push.cloudColor.x, 32.0, 2048.0);")
-                        && volume.contains("return clamp(push.cloud0.z, 8.0, 1024.0);")
-                        && volume.contains("float cloudBoxBottom(WorldPush push) {\n    return push.cloud0.y;")
-                        && volume.contains("CLOUD_COLUMN_DEPTH / cloudBoxHeight(push)")
-                        && volume.contains("float boxBottom = cloudBoxBottom(push);")
-                        && volume.contains("steps = clamp(ceil((t1 - t0) / max(boxH / CLOUD_STEPS_PER_THICKNESS, 1.0)),"),
-                "the walk must intersect an instance box sized only by the Cloud Size lane, with the "
-                        + "slab's thickness entering the column through the extinction scale");
-        assertTrue(volume.contains("float radius = pow(cc.x * cc.x * cc.x + cc.y * cc.y * cc.y, 1.0 / 3.0);")
-                        && volume.contains("float window = 1.0 - smoothstep(0.96, 1.12, radius);")
-                        && volume.contains("if (window <= 0.0) {"),
-                "an instance's density must be exactly zero outside its rounded window (a plain box "
-                        + "window read as square cards)");
-        // The atlas fetch lerps two adjacent layers by hand (2D-array filtering is nearest along the
-        // layer axis) and clamps the pair inside the shape's own band, so a top-of-slab sample can
-        // never read the next shape's first layer.
-        assertTrue(volume.contains(
-                        "float layerF = min(vertical01 * (CLOUD_VOLUME_RES - 1.0), CLOUD_VOLUME_RES - 1.001);")
-                        && volume.contains("float a = cloudVolumes.SampleLevel(float3(local.x, local.y, layer), 0.0).r;")
-                        && volume.contains("return lerp(a, b, layerF - l0) * window;"),
-                "the density fetch must hand-lerp two clamped atlas layers");
-        // The grid cell grows with the slab so the footprint always fits: a thick slab means bigger
-        // clouds AND proportionally bigger gaps, from the same field and the same constants.
-        assertTrue(volume.contains("float cloudGridCell(WorldPush push) {")
-                        && volume.contains("return max(CLOUD_GRID_CELL, cloudSpan(push) / CLOUD_BOX_SPAN);"),
-                "the instance cell must grow with the slab, holding the thickness-proportional footprint");
+        assertTrue(volume.contains("bool cloudLayerSpan(CloudLayer l, float3 ro, float3 rd, float tMax, out float t0, out float t1) {")
+                        && volume.contains("if (!cloudLayerSpan(l, ro, rd, fadeDist, t0, t1)) {"),
+                "the walk must bracket each deck's crossing before spending a step on it");
+        assertTrue(volume.contains("bool upward = rd.y >= 0.0;")
+                        && volume.contains("int index = upward ? n : CLOUD_LAYER_COUNT - 1 - n;"),
+                "the stack must composite front to back in whichever order the ray meets the decks");
+        assertTrue(volume.contains("float ideal = ceil(spans[n] / CLOUD_MARCH_STEP);")
+                        && volume.contains("float share = budget * spans[n] / max(spanSum, 1.0e-3);")
+                        && volume.contains("steps = clamp(min(ideal, share), 4.0, budget);"),
+                "the two cumulus decks must share the step budget in proportion to the span each catches; "
+                        + "a five-block sheet needs a crossing");
+        assertTrue(volume.contains("void cloudMarchLayer(WorldPush push, int index, float3 ro, float3 rd, float t0, float t1,")
+                        && volume.contains("float3 cloudPlanarStack(WorldPush push, float3 ro, float3 rd, SkyState state, float tMax,"),
+                "the walk and the crossings must both be served by the stack's own helpers");
+        assertTrue(volume.contains("if (cloudMaskLarge(worldPush.cloud1.z) * big + CLOUD_MASK_BIAS >= l.coverage) {")
+                        && volume.contains("float cloudCumulusMaskBig(CloudLayer l, float3 p, float2 wind, float lod, out float2 warp) {")
+                        && volume.contains("cloudCumulusDensity(l, p, wind, lod, true, warp, big)")
+                        && volume.contains("float cloudMaskLarge(float patchiness) {")
+                        && volume.contains("float cloudMaskFine(float patchiness) {"),
+                "one cheap column fetch must reject empty sky before the profile and the light leg, and "
+                        + "the fetch the rejection made must be the one the density reads");
+        assertTrue(volume.contains("float absorbed = (1.0 - exp(-tauCell)) * fade;")
+                        && volume.contains("L += T * absorbed * radiance;")
+                        && volume.contains("T *= 1.0 - absorbed;"),
+                "dissipation must dissolve the layer's opacity, radiance and transmittance together");
+        assertTrue(volume.contains("float cloudSunTau(WorldPush push, int index, CloudLayer l, float3 p, float2 wind, float3 ro,")
+                        && volume.contains("int steps = int(clamp(push.cloud1.x, 1.0, 8.0));")
+                        && volume.contains("float tap = cloudLayerDensity(push, index, lp, wind, cloudLod(length(lp - ro), l.detailTile),\n"
+                        + "                false) * l.density * dt;")
+                        && volume.contains("float3 lp = p + sunDir * ((float(i) + 0.5) * dt);"),
+                "the light leg must read the same shape field the view ray walked, clipped to the slab "
+                        + "and sampled at each sub-segment's midpoint — the Cloud Light Steps dial, "
+                        + "1 being the single midpoint tap the tier shipped with");
+        assertTrue(volume.contains("float cloudPhase4(float cosTheta, float powder) {")
+                        && volume.contains("float powder = cloudPowder(shape);")
+                        && volume.contains("float sunMask = 1.0 - exp(-tauSun / CLOUD_LIGHT_DEPTH_SCALE);")
+                        && volume.contains("float beer = 6.28 * exp(-5.0 * sunMask);")
+                        && volume.contains("CLOUD_LIGHT_DEPTH_SCALE"),
+                "the four-lobe powder phase and the normalised multi-scatter gain must light every sample");
+        assertTrue(volume.contains("if (push.volumeParams.w < 1.0) {")
+                        && volume.contains("return cloudPlanarStack(push, ro, rd, state, 1.0e12, cloudT);"),
+                "an off tier must fall through to the planar crossings");
+        assertTrue(volume.contains("float fadeDist = max(push.cloud1.w, 64.0) * (l.kind == 0 ? 1.0 : CLOUD_SHEET_FADE_MULT);"),
+                "the high sheets must ride a longer fade than the cumulus decks");
 
-        // The walk: steps come from volumeParams.w behind the shader's own floor, and the fade dissolves
-        // opacity with the radiance following it at the same scale (the v17 lesson).
-        assertTrue(volume.contains("float steps = clamp(push.volumeParams.w, CLOUD_STEP_MIN, 96.0);"),
-                "the walk must read its step count from the pushed lane and honour the alias floor");
-        assertTrue(volume.contains("float opacity = (1.0 - T) * fade;")
-                        && volume.contains("cloudT = 1.0 - opacity;")
-                        && volume.contains("return L * fade;"),
-                "the walk's fade must dissolve the slab's opacity, radiance and occlusion together");
-        assertTrue(volume.contains("float jitter = frac(interleaveGradientNoise(pix)")
-                        && volume.contains("+ float(push.frameIndex) * 0.6180339887);"),
-                "the walk's dither must be a pixel-fixed pattern advanced one golden-ratio stride per "
-                        + "frame — a per-frame re-roll is a signal the denoiser cannot accumulate");
-        // The light march: the baked shape's own occlusion toward the body, graded through the
-        // multi-scatter octaves; the ambient leg rides the same tau softened. It is a bounded few
-        // taps with an early-out, not an unbounded walk — a grazing sun would otherwise march the
-        // whole sky per in-cloud sample.
-        assertTrue(volume.contains("float tauSun = cloudLightTau(push, p, lightDir, boxH) * push.cloud0.w;")
-                        && volume.contains("float3 sunT = cloudSelfShadow(tauSun);")
-                        && volume.contains("float ambT = max(cloudSelfShadow(tauSun * CLOUD_AMBIENT_OCCLUSION),")
-                        && volume.contains("public static const float CLOUD_AMBIENT_OCCLUSION = 0.20;"),
-                "each sample's light must come from a march through the baked field, with the "
-                        + "multi-scatter octave stack on top and the ambient leg softened");
-        assertTrue(volume.contains("for (int s = 0; s < CLOUD_LIGHT_STEPS; s++) {")
-                        && volume.contains("if (tau > 4.0) {"),
-                "the light march must be a bounded few taps that early-outs once the stack saturates");
-        // The phase must carry the Beer-Powder term AND the multi-scatter share that keeps the lobe's own
-        // two orders of magnitude from drawing one deck white on one side of the sky and black on the other.
-        assertTrue(volume.contains("hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));")
-                        && volume.contains("float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE")
-                        && volume.contains("public static const float CLOUD_SCATTER_FLOOR = 0.15;")
-                        && volume.contains("public static const float CLOUD_SCATTER_LOBE = 0.85;"),
-                "the samples must carry the plan's Beer-Powder phase term, compressed onto the isotropic "
-                        + "multi-scatter share");
-
-        // Tier routing: the flag is separate from the base cloud bit, only a primary ray walks the slab,
-        // and a continuation ray pays the cheap mean extinction instead.
-        assertTrue(skyMiss.contains("if ((worldPush.flags & WORLD_FLAG_CLOUD_VOLUMETRIC) != 0u) {")
-                        && skyMiss.contains("cloudL = volumetricCloudInScatter(worldPush, WorldRayOrigin(), dir, state,")
+        // Only the primary ray pays for a walk; reflections and bounces get the mean extinction.
+        assertTrue(skyMiss.contains("cloudL = volumetricCloudInScatter(worldPush, WorldRayOrigin(), dir, state,")
                         && skyMiss.contains("cloudT = volumetricCloudTransmittanceFast(worldPush, WorldRayOrigin(), dir);"),
-                "the miss shader must route between the volumetric walk and the cheap extinction, keyed "
-                        + "on the tier's own flag");
-        assertTrue(skyMiss.contains("if (showCelestial) {"),
                 "only the primary ray may pay for the walk; continuation rays get the mean extinction");
-        assertTrue(volume.contains("public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd)"),
+        assertTrue(volume.contains("public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd) {"),
                 "the extinction-only path must exist for continuation rays");
+        assertFalseStaleCloud(volume);
     }
 
     /**
@@ -1205,22 +1243,19 @@ final class VolumeFogTest {
         String config = Files.readString(CONFIG);
         String settings = Files.readString(SETTINGS);
 
-        // The tier table, Java ported: (cloud, cloudVolumetric, fog, fogShadow, fogMarch, spray) for
+        // The tier table, Java ported: (cloud, cloudVolumetric, fog, fogShadow, fogMarch, waterFog) for
         // tiers 0..4.
         boolean[][] on = new boolean[5][];
         int[] steps = new int[5];
-        float[] spray = new float[5];
         for (int t = 0; t <= 4; t++) {
-            on[t] = new boolean[]{t >= 1, t >= 2, t >= 3, t >= 3, t >= 2, t >= 4, t >= 1, t >= 4};
+            on[t] = new boolean[]{t >= 1, t >= 2, t >= 3, t >= 2, t >= 4, t >= 1};
             steps[t] = t == 2 ? 12 : (t == 4 ? 40 : 24);
-            spray[t] = t >= 4 ? 0.5f : 0.0f;
         }
         // Off clears everything: clouds, the volumetric tier, the fog layer and its shadow, and the water
-        // medium's scattering (which is what the underwater in-scatter is gated on).
+        // body's in-scatter.
         for (boolean b : on[0]) {
             assertTrue(!b, "tier 0 must clear every volumetric switch");
         }
-        assertEquals(0.0f, spray[0], 0.0f, "tier 0 must clear the surface spray band");
         // Monotone: a higher tier never takes an effect away, and the last one has everything on.
         for (int t = 1; t <= 4; t++) {
             for (int k = 0; k < on[t].length; k++) {
@@ -1233,8 +1268,8 @@ final class VolumeFogTest {
         }
         assertTrue(steps[2] < steps[3] && steps[3] < steps[4],
                 "the march budgets must climb with the tier");
-        assertTrue(on[2][5] == false && on[4][5],
-                "the sprayed fog band belongs to the marched tier, not to the analytic one");
+        assertTrue(on[0][5] == false && on[1][5],
+                "the water body's in-scatter arrives with the first tier above Off");
 
         // The table is data in the config, and the write is a total function of it rather than a list of
         // spells at each call site.
@@ -1244,11 +1279,11 @@ final class VolumeFogTest {
                 "the tier table must be data, with the write derived from it");
         for (String member : new String[]{"CLOUD_ENABLED.set(", "CLOUD_VOLUMETRIC.set(", "CLOUD_STEPS.set(",
                 "FOG_ENABLED.set(", "FOG_SHADOW.set(", "FOG_MARCH.set(", "FOG_MARCH_STEPS.set(",
-                "CausticaConfig.Rt.Composite.WATER_SPRAY.set("}) {
+                "CausticaConfig.Rt.Composite.WATER_FOG.set("}) {
             assertTrue(config.contains(member), "applyQuality must write " + member);
         }
         // The choice list rejects a hand-edited config rather than letting an out-of-range tier through.
-        assertTrue(config.contains("intChoice(\"caustica.rt.volume.quality\", \"volume.quality\", 0, QUALITY_TIERS)"),
+        assertTrue(config.contains("intChoice(\"caustica.rt.volume.quality\", \"volume.quality\", 1, QUALITY_TIERS)"),
                 "the tier must be a choice list, so a hand-edited value cannot land outside the table");
 
         // The side effect belongs to the option, not to whichever screen is open: both hosts funnel every
@@ -1256,31 +1291,30 @@ final class VolumeFogTest {
         assertTrue(settings.contains("CausticaConfig.Rt.Volume.QUALITY.tomlPath().equals(option.path())")
                         && settings.contains("CausticaConfig.Rt.Volume.applyQuality(option.integer().get());"),
                 "selecting the preset must write the other settings through the shared afterChange funnel");
-        // Declared as a count with value keys, which is what makes the tiers read as words on both hosts.
-        assertTrue(settings.contains("\"volume.quality\", RT + \"volumeQuality\",")
-                        && settings.contains("RT + \"volumeQuality.\""),
-                "the tiers must be a named integer choice");
+        // Declared as a count whose caption is a readback of the switches, so the name is what the page
+        // currently spells rather than what was last clicked.
+        assertTrue(settings.contains("countWithReadout(out, Page.VOLUME, \"preset\", \"volume.quality\",")
+                        && settings.contains("CausticaConfig.Rt.Volume.currentTier()"),
+                "the preset row must read its label back from the individual dials");
+        assertTrue(config.contains("public static int currentTier() {")
+                        && config.contains("return -1;"),
+                "a mix that spells no tier must be reportable as Custom");
     }
 
     /**
-     * Two behaviours that make the deck a weather system rather than a decal: rain thickens it, and
-     * the layer reads one baked shape whose index the type slider selects. The thickening closes the
-     * sky by swelling the instances' footprints (cloud1.y) rather than lifting the coverage gate, so
-     * the count stays what the slider says; the density lift stays Java-side and pushed, which is
-     * what keeps every consumer - sheet, walk, shadow field, NEE, fog legs - on the same numbers.
-     * The test ports those formulas and pins the wiring on both sides of the push, and pins the
-     * shape index's path from the slider to the atlas layer base.
+     * Weather and field evolution on a procedural stack: rain closes the sky by ADDING to the shape
+     * threshold (the bodies grow into each other), the density lift stays Java-side so every consumer
+     * reads one number, and the wind, the flow phase and the size scale ride three independent lanes.
+     * The numeric ports pin the monotone/identity behaviour; the source assertions pin the wiring on
+     * both sides of the push.
      */
     @Test
-    void cloudWeatherThickeningAndFieldEvolution() throws IOException {
+    void cloudWeatherAndFlow() throws IOException {
         String config = Files.readString(CONFIG);
         String composite = Files.readString(COMPOSITE);
         String volume = Files.readString(VOLUME);
 
-        // Java port of the pushed formulas. Identity at no weather and at boost 0 - the two cases that
-        // have to reproduce the pre-feature sky bit for bit - monotone in weather, clamped at full
-        // swell, and thunder stacking on rain rather than replacing it. Coverage does not appear:
-        // the weather never lifts it.
+        // Java ports of stormLevel, rainCoverage and rainDensity.
         float[] boosts = {0.0f, 0.35f, 0.6f, 1.0f};
         for (float boost : boosts) {
             for (int rainPct = 0; rainPct <= 10; rainPct++) {
@@ -1288,90 +1322,55 @@ final class VolumeFogTest {
                     float rain = rainPct / 10f;
                     float thunder = thunderPct / 10f;
                     float storm = Math.clamp(rain + 0.35f * thunder, 0.0f, 1.0f);
-                    float swell = Math.clamp(boost * storm, 0.0f, 1.0f);
-                    float den = 0.06f * (1.0f + 1.6f * boost * storm);
+                    float coverageLift = 0.4f * Math.clamp(boost * storm, 0.0f, 1.0f);
+                    float density = 1.0f * (1.0f + 1.6f * boost * storm);
+                    assertTrue(coverageLift >= 0.0f && coverageLift <= 0.4f,
+                            "the coverage lift must be bounded");
+                    assertTrue(density >= 1.0f, "weather must never thin the deck");
                     if (rain == 0f && thunder == 0f) {
-                        assertClose("no weather must leave the swell alone", 0.0f, swell, 1.0e-6f);
-                        assertClose("no weather must leave the density alone", 0.06f, den, 1.0e-6f);
+                        assertClose("no weather must leave the coverage alone", 0.0f, coverageLift, 1.0e-6f);
+                        assertClose("no weather must leave the density alone", 1.0f, density, 1.0e-6f);
                     }
-                    assertTrue(swell >= 0.0f && den >= 0.06f,
-                            "weather must never thin the deck (swell=" + swell + " den=" + den + ")");
-                    assertTrue(swell <= 1.0f, "the swell must clamp at full");
-                    // thunder only ever adds: a thunderstorm is at least as thick as the same rain alone
                     float stormNoThunder = Math.clamp(rain, 0.0f, 1.0f);
-                    float swellNoThunder = Math.clamp(boost * stormNoThunder, 0.0f, 1.0f);
-                    assertTrue(swell >= swellNoThunder - 1.0e-6f,
-                            "thunder must not reduce the swell");
+                    assertTrue(coverageLift >= 0.4f * Math.clamp(boost * stormNoThunder, 0.0f, 1.0f) - 1.0e-6f,
+                            "thunder must not reduce the coverage lift");
                 }
             }
         }
-        // boost 0 is the second identity: any weather, no thickening.
-        assertClose("boost 0 must hold the swell to zero", 0.0f,
-                Math.clamp(0.0f * 1.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
-        assertClose("boost 0 must hold the density to the slider", 0.06f,
-                0.06f * (1.0f + 1.6f * 0.0f * 1.0f), 1.0e-6f);
-        // a full storm at full boost saturates the swell and near-triples the shadow strength
-        assertClose("a full storm at full boost saturates the swell", 1.0f,
-                Math.clamp(1.0f * 1.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
-        assertClose("a full storm at full boost multiplies the density by 2.6", 0.06f * 2.6f,
-                0.06f * (1.0f + 1.6f * 1.0f * 1.0f), 1.0e-6f);
+        assertClose("boost 0 must hold the coverage to the slider", 0.0f,
+                0.4f * Math.clamp(0.0f * 1.0f, 0.0f, 1.0f), 1.0e-6f);
+        assertClose("a full storm at full boost multiplies the density by 2.6", 2.6f,
+                1.0f * (1.0f + 1.6f * 1.0f * 1.0f), 1.0e-6f);
 
-        // The formulas live in the config as pure functions and the push reads them, so no consumer can
-        // re-derive a different answer.
         assertTrue(config.contains("public static float stormLevel(float rain, float thunder)")
-                        && config.contains("public static float rainSwelling(float storm, float boost)")
+                        && config.contains("public static float rainCoverage(float storm, float boost)")
                         && config.contains("public static float rainDensity(float density, float storm, float boost)"),
                 "the weather formulas must be pure functions in the config");
-        assertTrue(composite.contains("CausticaConfig.Rt.Volume.rainSwelling(")
+        assertTrue(composite.contains("CausticaConfig.Rt.Volume.rainCoverage(storm, cloudRainBoost)")
                         && composite.contains("CausticaConfig.Rt.Volume.rainDensity(")
                         && composite.contains("CausticaConfig.Rt.Volume.stormLevel(rainLevel, thunderLevel)"),
-                "the push must carry the weather swell and the lifted density");
-        // The coverage lane must be the slider's own value: no weather lift may re-enter it.
-        assertTrue(composite.contains("new Float4(cloudOn ? CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value() : 0f,"),
-                "the coverage lane must push the slider's value untouched by the weather");
-        assertTrue(!composite.contains("rainCoverage("),
-                "the old coverage lift must be gone with the count-driven weather");
+                "the push must carry the coverage lift and the lifted density");
+        assertTrue(composite.contains("new Float4(cloudOn ? CausticaConfig.Rt.Volume.CLOUD_COVERAGE.value() : 0f,")
+                        && volume.contains("float coverage = clamp(push.cloud0.x + push.cloud1.y, 0.0, 2.5);"),
+                "the slider must stay in cloud0.x and the shader must add the weather's share once");
+        assertTrue(!config.contains("rainSwelling") && !volume.contains("swellFull"),
+                "the old footprint swell must be gone with the instance grid");
 
-        // The deck closes by growth: the swell widens the footprint toward the size that tiles the
-        // cell, and the occupancy gate must not read the weather at all — rain may widen the
-        // admitted clouds, never admit new ones.
-        assertTrue(volume.contains("float swell = lerp(1.0, swellFull * 1.15, clamp(push.cloud1.y, 0.0, 1.0));"),
-                "the weather swell must grow the footprints toward tiling the cell");
-        assertTrue(volume.contains("float gate = push.cloud0.x >= 0.95 ? 2.0\n"
-                        + "            : saturate(push.cloud0.x * (1.0 + push.cloud1.z * (cluster * 2.0 - 1.0)));"),
-                "the occupancy gate must not read the weather swell — the count is the slider's, "
-                        + "in any weather");
-        assertTrue(volume.contains("float2 fp = r / (span * scale * swell);"),
-                "the swell must widen the footprint in the one place every consumer reads");
-
-        // The bodies flow on the pushed phase: a warp scrolls the sampled shape inside its fixed
-        // footprint, accumulated Java-side on the clamped wave clock behind the flow dial.
-        assertTrue(volume.contains("float2 warp = (cloudFlowNoise(fp * 3.0")
-                        && volume.contains("float2 local = fp + 0.5 + warp * CLOUD_FLOW_AMPLITUDE;"),
-                "the flow must warp the sampled shape, not the footprint or the gate");
+        assertTrue(volume.contains("float2 flow = float2(worldPush.cloudColor.z * 1.7, -worldPush.cloudColor.z * 1.1);")
+                        && volume.contains("float2 fineWind = flow - wind * 0.6;"),
+                "the flow phase must scroll the fine detail, never the body's position");
         assertTrue(composite.contains("cloudFlowClock = (cloudFlowClock + waveClockStep")
-                        && composite.contains("CausticaConfig.Rt.Volume.CLOUD_FLOW.value()"),
-                "the flow phase must accumulate on the clamped wave clock behind the flow dial");
-        assertTrue(composite.contains("cloudOn ? cloudFlowClock : 0f, 1f),"),
-                "the flow phase must ride cloudColor.z, gated on the cloudOn lane");
-
-        // The baked-volume layer's evolution rides cloudColor.z as a flow phase — the shape index and
-        // the Cloud Size footprints keep their lanes, and the old procedural-field accumulator is gone.
-        assertTrue(!volume.contains("f.evolve")
-                        && volume.contains("clamp(push.cloudColor.x, 32.0, 2048.0)"),
-                "cloudColor.x carries the Cloud Size lane, not an evolution phase: the shader must read "
-                        + "it as the instance footprint and nothing else");
-        assertTrue(!composite.contains("cloudEvolve") && !composite.contains("CLOUD_EVOLVE_SPEED"),
-                "the evolution accumulator must be gone with the procedural field");
-        assertTrue(composite.contains("(RtCloudVolumes.SHAPE_COUNT - 1))")
-                        || composite.contains("cloudVolumes.shapeCount() - 1"),
-                "the shape index must be mapped across the atlas's shape count");
-        assertTrue(volume.contains("float layer = shape * CLOUD_VOLUME_RES + l0;")
-                        && composite.contains("new Float4(CausticaConfig.Rt.Volume.CLOUD_SIZE.value(),\n"
-                                + "                            cloudVolumes != null ? cloudVolumes.shapeCount() - 1 : 0f,\n"
-                                + "                            cloudOn ? cloudFlowClock : 0f, 1f),"),
-                "the shape index must reach the atlas as the layer base, with the atlas's last shape "
-                        + "index riding cloudColor.y and the flow phase riding cloudColor.z");
+                        && composite.contains("cloudOn ? cloudFlowClock : 0f, 1f),"),
+                "the flow phase must accumulate on the clamped wave clock and ride cloudColor.z");
+        assertTrue(volume.contains("float sizeScale = clamp(push.cloudColor.x, 0.25, 4.0);")
+                        && volume.contains("CLOUD_LOW_FIELD_TILE * sizeScale"),
+                "cloudColor.x must scale every deck's tiles, and nothing else");
+        assertTrue(volume.contains("return (push.cloud2.xy + push.cloud2.zw) * l.windScale;"),
+                "the wind must be one world-space drift, sheared per deck");
+        assertTrue(!composite.contains("CLOUD_TYPE") && !composite.contains("CLOUD_RANDOM_STYLE")
+                        && !composite.contains("cloudVolumes.shapeCount()")
+                        && !volume.contains("CLOUD_VOLUME_RES"),
+                "the baked-shape slider, the random-style flag and the atlas must have no readers");
     }
 
     // ---- Sun shafts (air and water) -------------------------------------------------------------------
@@ -1454,46 +1453,57 @@ final class VolumeFogTest {
                 "the default density/reach must stay short of saturation, got " + shipped);
     }
 
-    /**
-     * The water column's only volumetric term is the shaft layer, on a medium of its own. The old
-     * turbidity-driven pair — a sky-lit ambient and a single-probe sun leg — is gone, and with it the
-     * milky water and the scattering fraction that had to be on for the water to have any body.
+/**
+     * The water column carries two terms, and they stay separable: the body's own in-scatter (its glow)
+     * and the structure-gated shaft layer (its beams). The in-scatter is a closed form over a constant
+     * medium, so it needs no march; the shafts run on a medium of their own, so a player can want beams
+     * without the milky water. Losing either one is what this pins.
      */
     @Test
-    void underwaterColumnIsTheShaftLayer() throws IOException {
+    void waterColumnCarriesInScatterAndShafts() throws IOException {
         String volume = Files.readString(VOLUME);
-        assertTrue(!volume.contains("waterSegmentInScatter"),
-                "the old water volume function must be gone, not left as dead code");
-        assertTrue(!volume.contains("WATER_AMBIENT_SURFACE"),
-                "the water ambient constant must be gone with the ambient term");
-        assertTrue(!volume.contains("sigmaS / sigmaT"),
-                "nothing may still scale a water term by a scattering fraction");
+        assertTrue(volume.contains("public float3 waterSegmentInScatter("),
+                "the body's own in-scatter must be integrated");
+        assertTrue(volume.contains("public static const float WATER_AMBIENT_SURFACE"),
+                "the surface's transmission for downward sky light is the ambient term's entry factor");
+        assertTrue(volume.contains("sigmaS / sigmaT"),
+                "the sun term must scale by the scattering fraction, so it cannot invent energy");
+        assertTrue(volume.contains("float sigmaS = (medium.scattering.r + medium.scattering.g"),
+                "the coefficients come from the medium, not from a second derivation");
         // The lobe is capped and the gate keeps a floor: without the cap a grazing look at the surface
         // goes white, without the floor the gate's product is a hairline band.
         assertTrue(volume.contains("phase = min(phase, worldPush.waterShaft.y);"),
                 "the underwater lobe must be capped by the pushed ceiling");
         assertTrue(volume.contains("structure = lerp(WATER_SHAFT_STRUCTURE_FLOOR, 1.0, structure);"),
                 "the underwater gate must keep a floor");
-        assertTrue(volume.contains("float fogT = underwater ? 1.0 : airTransmittance(ro, rd, reach);"),
+        assertTrue(volume.contains(
+                        "float fogT = underwater ? 1.0 : luminance(airTransmittance(ro, rd, reach));"),
                 "the air fog must not attenuate the underwater term, and on the air side the veil that "
-                        + "swallows a beam is the whole medium — height profile and border haze together");
+                        + "swallows a beam is the whole medium - height profile and border haze together");
         assertTrue(volume.contains("vis *= exp(-sigma * probe.waterHitT);"),
                 "every underwater probe must carry its own Beer-Lambert up to the surface");
         assertTrue(volume.contains("caustic = waterWaves"),
                 "the surface focus must ride the wave field while it is on");
-        // Both call sites run the layer directly on the water medium, with no scattering fraction.
+        // Both call sites run the two terms on the water medium: the shared prefix on the primary pass,
+        // the first-segment prefix on the indirect one.
         String indirect = Files.readString(Path.of("shaders/pipelines/world/indirect.rgen.slang"));
         String primary = Files.readString(Path.of("shaders/pipelines/world/primary.rgen.slang"));
         for (String source : new String[]{indirect, primary}) {
-            assertTrue(source.contains("medium.current.water && shaftOn")
-                            || source.contains("medium.current.water && firstSegment && shaftOn && firstSample"),
-                    "the water term must gate on the water medium and the shaft switch only");
+            assertTrue(source.contains("medium.current.water"),
+                    "the water terms must gate on the water medium");
+            assertTrue(source.contains("waterSegmentInScatter(ro, rd,"),
+                    "the body's in-scatter must be called on the water segment");
             assertTrue(source.contains("worldPush.waterShaft.x"),
-                    "the water term must integrate the dedicated water medium");
+                    "the shaft layer must integrate the dedicated water medium");
+            assertTrue(source.contains("if (waterFogOn) {"),
+                    "the in-scatter must gate on its own flag");
         }
         String config = Files.readString(CONFIG);
         assertTrue(!config.contains("WATER_TURBIDITY"),
-                "the scattering setting is gone with the effect it drove");
+                "the retired turbidity setting must not come back");
+        assertTrue(config.contains("clampedFloat(\"caustica.rt.waterFogDensity\", "
+                        + "\"composite.water-fog-density\","),
+                "the in-scatter's scattering fraction needs its own setting");
         assertTrue(config.contains("clampedFloat(\"caustica.rt.volume.waterShaftDensity\", "
                         + "\"volume.water-shaft-density\","),
                 "the dedicated water medium needs its own density setting");

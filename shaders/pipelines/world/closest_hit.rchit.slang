@@ -48,6 +48,60 @@ static const float WET_ALBEDO_SCALE = 0.55;
 // rain hits most.
 static const float WET_GRAZING_FLOOR = 0.45;
 
+// Standing water. The puddle field is a world-anchored noise lattice, so it stays put as the terrain
+// rebase shifts; the anchor's 4096-block modulus is this lattice's exact period, and both octaves wrap in
+// it, which makes the wrap invisible. 8-block cells keep one body of water village-sized while the
+// second octave roughens its outline instead of leaving round blobs.
+static const float PUDDLE_CELL = 8.0;
+static const float PUDDLE_WRAP = 4096.0 / PUDDLE_CELL; // 512 cells per axis
+static const float PUDDLE_ROUGHNESS = 0.015;
+static const float PUDDLE_F0 = 0.02;      // water's ((1.33 - 1) / (1.33 + 1))^2
+static const float PUDDLE_ALBEDO_SCALE = 0.55;
+static const float PUDDLE_EDGE = 0.07;
+
+// Dave Hoskins' hash on a wrapped 2D lattice. The period is in CELLS, so the same function serves both
+// octaves with their own wrap.
+float puddleCellHash(float2 cell, float period) {
+    cell -= period * floor(cell / period);
+    float3 p3 = frac(float3(cell.x, cell.y, cell.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float puddleNoise(float2 q, float period) {
+    float2 i = floor(q);
+    float2 f = frac(q);
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(
+        lerp(puddleCellHash(i + float2(0.0, 0.0), period),
+             puddleCellHash(i + float2(1.0, 0.0), period), f.x),
+        lerp(puddleCellHash(i + float2(0.0, 1.0), period),
+             puddleCellHash(i + float2(1.0, 1.0), period), f.x),
+        f.y);
+}
+
+/**
+ * How much standing water covers this hit, 0..1. Only level ground pools: a slope sheds its water, and
+ * the second octave makes the shoreline irregular so a puddle does not read as a decal circle. Coverage
+ * lowers the threshold; soak keeps a drizzle from laying a mirror before the ground is actually wet.
+ */
+float puddleMask(float3 geometricNormal, float3 hitPos) {
+    float coverage = pc.puddleParams.z;
+    if (coverage <= 0.0) {
+        return 0.0;
+    }
+    float pool = smoothstep(0.62, 0.92, saturate(geometricNormal.y));
+    float soak = smoothstep(0.55, 0.95, pc.wetness);
+    if (pool <= 0.0 || soak <= 0.0) {
+        return 0.0;
+    }
+    float2 q = (hitPos.xz + pc.puddleParams.xy) / PUDDLE_CELL;
+    float field = puddleNoise(q, PUDDLE_WRAP) * 0.65
+            + puddleNoise(q * 2.0 + 19.0, PUDDLE_WRAP * 2.0) * 0.35;
+    float threshold = 0.78 - 0.5 * saturate(coverage);
+    return pool * soak * smoothstep(threshold, threshold + PUDDLE_EDGE, field);
+}
+
 static const float RAY_CONE_MIN_WIDTH = 1.0e-5;
 static const float RAY_CONE_MIN_TEXEL_FOOTPRINT = 1.0e-4;
 static const float RAY_CONE_MAX_LOD = 12.0;
@@ -444,7 +498,7 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
         float3 geometricNormal, float3 p0, float3 p1, float3 p2,
         float2 uv0, float2 uv1, float2 uv2, float3 vdir,
         float fallbackRoughness, float fallbackMetalness, float fallbackEmission, bool allowSss,
-        float parallaxDepth) {
+        float parallaxDepth, bool allowPuddles) {
     Surface surface;
     surface.normal = geometricNormal;
     surface.roughness = fallbackRoughness;
@@ -564,6 +618,22 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
         float absorption = saturate(wet * sqrt(porosity) * (1.0 - surface.metalness));
         surface.albedoScale = lerp(float3(1.0, 1.0, 1.0),
                 float3(WET_ALBEDO_SCALE, WET_ALBEDO_SCALE, WET_ALBEDO_SCALE), absorption);
+    }
+    // Standing water is a surface of its own, not a stronger film: it hides the substrate's normal map,
+    // takes the water's own roughness and Fresnel, and darkens the ground through the water column.
+    // Emissive grounds and anything outside the solid opaque path (glass, foliage cutouts, entities)
+    // never pool, for the same reason the film skips an emitter.
+    float puddle = allowPuddles && surface.emission <= 0.0
+            ? puddleMask(geometricNormal, WorldRayOrigin() + WorldRayDirection() * RayTCurrent())
+            : 0.0;
+    if (puddle > 0.0) {
+        surface.roughness = lerp(surface.roughness, PUDDLE_ROUGHNESS, puddle);
+        surface.metalness = lerp(surface.metalness, 0.0, puddle);
+        surface.f0 = lerp(surface.f0, float3(PUDDLE_F0, PUDDLE_F0, PUDDLE_F0), puddle);
+        surface.normal = normalize(lerp(surface.normal, geometricNormal, puddle));
+        surface.sss = lerp(surface.sss, 0.0, puddle);
+        surface.albedoScale *= lerp(float3(1.0, 1.0, 1.0),
+                float3(PUDDLE_ALBEDO_SCALE, PUDDLE_ALBEDO_SCALE, PUDDLE_ALBEDO_SCALE), puddle);
     }
     return surface;
 }
@@ -813,7 +883,8 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
                 header.params.x, header.params.y, glintPrim ? 0.0 : pr.normal.w, material == MATERIAL_OPAQUE,
-                (pc.materialToggles & MATERIAL_TOGGLE_ENTITY_PARALLAX) != 0u ? pc.parallaxDepth : 0.0);
+                (pc.materialToggles & MATERIAL_TOGGLE_ENTITY_PARALLAX) != 0u ? pc.parallaxDepth : 0.0,
+                false);
         n = surface.normal;
         // Entity albedo UVs are the texture's own, so the parallax-displaced local UV is already the
         // coordinate to re-fetch at. The end portal is procedural — its colour comes from the layer
@@ -899,6 +970,49 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // Water prims keep tint.w == 1, converted to the packed material enum below.
     uint pid = PrimitiveIndex() + sec.triBase[GeometryIndex()];
     TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[pid];
+
+    // Distant Horizons LOD cells: flat-colour axis-aligned boxes stamped by RtDhLodScene's mesher.
+    // Branching on the sentinel BEFORE the material-table dereference is what lets LOD geometry live in
+    // the same section table / BLAS / SBT records as traced terrain — no extra table, instance bit or
+    // hit record. Shading mirrors the opaque/water paths it replaces, minus everything a texture brings:
+    // the albedo IS the DH column colour (already sRGB bytes), the normal is the box face, there is no
+    // parallax/normal/spec map, and the motion vector is zero because cells are world-static.
+    if (pr.materialId == MATERIAL_ID_LOD) {
+        float3 lodVdir = -WorldRayDirection();
+        float3 lodN = normalize(pr.normal.xyz);
+        bool lodEntering = dot(WorldRayDirection(), lodN) < 0.0;
+        if (dot(lodN, lodVdir) < 0.0) {
+            lodN = -lodN;
+        }
+        float3 lodTint709 = srgbToLinear(pr.tint.rgb);
+        payload.hitT = RayTCurrent();
+        payload.motionPrev = half3(0.0h, 0.0h, 0.0h); // static terrain: camera-only motion vector
+        if (pr.tint.w > 0.5) {
+            // LOD water: a thin dielectric sheet in the opaque bucket. tint.w == 1 keeps the same marker
+            // the traced-water path uses; Fresnel + sky/sun reflection with no medium below (the column
+            // under it IS the water, and at these distances the body's absorption is the fog's job).
+            packAlbedo(payload, bt709ToAcesCg(lodTint709));
+            packNormal(payload, lodN);
+            payload.f0 = half3(0.02h, 0.02h, 0.02h); // ((1.33-1)/(1.33+1))^2, a calm far-field sheet
+            payloadSetPacked(payload, MATERIAL_WATER, 0.02, 0.0, 0.0, 0.0, 1.33, 1.0,
+                    EMISSION_SOURCE_NONE);
+            payloadSetDielectric(payload, MATERIAL_WATER, lodEntering);
+            payload.flags |= PAYLOAD_DIELECTRIC_THIN | PAYLOAD_LOD;
+        } else {
+            // LOD terrain: pure diffuse matte. normal.w carries the DH column's block-light level 0..1,
+            // running the same heuristic-emission curve the traced path uses, so a distant village
+            // glows at night through the look package's existing luminance mapping.
+            float lodEmission = pr.normal.w;
+            packAlbedo(payload, bt709ToAcesCg(lodTint709));
+            packNormal(payload, lodN);
+            payload.f0 = half3(0.04h, 0.04h, 0.04h);
+            payloadSetPacked(payload, MATERIAL_OPAQUE, 1.0, 0.0, lodEmission, 0.0, 1.0, 0.0,
+                    lodEmission > 0.0 ? EMISSION_SOURCE_HEURISTIC : EMISSION_SOURCE_NONE);
+            payloadSetDielectric(payload, MATERIAL_OPAQUE, lodEntering);
+            payload.flags |= PAYLOAD_LOD;
+        }
+        return;
+    }
     MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
     float3 n = normalize(pr.normal.xyz);
     float3 tint = pr.tint.rgb;
@@ -951,7 +1065,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         Surface glassSurface = evaluateMaterial(materialHeader, uv, blockLod, glassAlbedo, n,
                 tp0, tp1, tp2, uv0, uv1, uv2, vdir,
                 materialHeader.params.x, materialHeader.params.y, stateEmission, false,
-                pc.parallaxDepth);
+                pc.parallaxDepth, false);
         n = glassSurface.normal;
         // Follow the parallax-displaced UV with the albedo, or the pane's texture would stay pinned to
         // the flat plane while its shading moved. The alpha that decides the transmission filter comes
@@ -1016,7 +1130,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     Surface surface = evaluateMaterial(materialHeader, uv, blockLod, unpackAlbedo(payload), n,
             tp0, tp1, tp2, uv0, uv1, uv2, vdir,
             materialHeader.params.x, materialHeader.params.y, emission, nonSolid,
-            pc.parallaxDepth);
+            pc.parallaxDepth, !nonSolid && material == MATERIAL_OPAQUE);
     n = surface.normal;
     // Parallax moved the sample point, so both the payload albedo and the breaking overlay's decal base
     // have to come from the displaced UV rather than the flat one sampled above. Water is excluded: it

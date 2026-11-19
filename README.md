@@ -16,8 +16,15 @@ changes while the renderer is being built.
 
 Maintained by island_i. On top of upstream Caustica:
 
-- Volumetric fog and clouds, with heterogeneous volume noise, weather-driven
-  cloud thickening, nine baked cloud shapes and volume quality presets
+- Volumetric fog and a four-deck procedural cloud stack (low cumulus, towering
+  cumulus, altostratus and curl-warped cirrus), with heterogeneous volume noise,
+  weather-driven thickening, cloud out-scatter and volume quality presets
+- Rain streaks drawn into the traced frame, with weather darkening, a surface
+  that soaks while it rains and dries afterwards, and puddles on level ground
+- A water-body medium that absorbs per channel, with underwater sun shafts
+  running on its own scattering
+- Distant Horizons LOD: DH's far terrain meshed into the traced scene, so the
+  horizon follows DH's render distance instead of the vanilla one
 - Sun shafts (clear-air god rays) independent of the volumetric fog, with
   separate underwater beam controls (off by default to save frame time)
 - Sharpening and lens flare post effects
@@ -31,8 +38,12 @@ Maintained by island_i. On top of upstream Caustica:
 - Mod Menu and Sodium Config API entry points for the settings screen
 - An in-game ray-tracing toggle (F9 by default)
 - An accumulated still render (F10 by default): the frames you are looking at
-  are averaged into one PNG at the display resolution while the game keeps
-  running, with DLSS-RR and frame generation left exactly as configured
+  are averaged into one PNG while the game keeps running — endlessly if you
+  like, at a resolution of its own, with a denoiser — with DLSS-RR and frame
+  generation left exactly as configured
+- An indirect radiance cache and indirect light subsampling for the indirect
+  lighting, both off by default
+- Xaero's Minimap waypoint markers handed the world matrix of the traced pass
 
 The ray-tracing core, DLSS support and the ACES HDR pipeline are upstream's.
 
@@ -52,7 +63,9 @@ Upstream Caustica (this fork's builds are not published there):
 ## Features
 
 - Vulkan hardware path-traced world rendering
-- Volumetric fog, baked volumetric clouds and clear-air/underwater sun shafts
+- Volumetric fog, procedural volumetric clouds, a water-body medium and clear-air/underwater sun shafts
+- Rain streaks, weather darkening, surface wetness that soaks and dries, and puddles
+- Distant Horizons far terrain meshed into the traced scene as LOD geometry
 - Post effects: sharpening, lens flare, bloom strength and AgX tone controls
 - DLSS Ray Reconstruction support, including transparent-layer and guide fixes
 - Frame Generation through DLSS (NVIDIA, experimental) or FSR (any Vulkan 1.3 device)
@@ -61,7 +74,7 @@ Upstream Caustica (this fork's builds are not published there):
   recycled texture slots
 - Parallax height mapping with sharp/smooth styles and self-shadowing
 - LabPBR-style material support
-- OMM (Opacity Micro-Map) + SER (Shader Execution Reordering) optimizations
+- SER (Shader Execution Reordering) for coherent secondary rays
 - In-game ray-tracing toggle and Mod Menu / Sodium Config screens
 
 ## Requirements
@@ -72,6 +85,7 @@ Upstream Caustica (this fork's builds are not published there):
 - HDR-capable display and OS HDR mode for HDR output
 - On Linux, an HDR-capable Wayland compositor and a native Wayland session for HDR output
 - Install LabPBR resource pack like [SPBR](https://modrinth.com/resourcepack/spbr) for better visuals
+- Optional: install [Distant Horizons](https://modrinth.com/mod/distanthorizons) for the LOD of the far terrain
 
 ## Installation
 
@@ -90,7 +104,8 @@ Upstream Caustica (this fork's builds are not published there):
 6. Open Video Settings to adjust the renderer options, or press F9 to toggle ray
    tracing in-game (rebindable under Controls → Caustica). Press F10 to average
    the configured number of frames into one screenshot in `screenshots/`; hold
-   the camera still while it runs, and press the key again to drop the run.
+   the camera still while it runs, and press the key again to drop the run (with
+   Endless Still Render on, that press finishes and saves it instead).
 
 BetterCaustica installs in place of upstream Caustica: the two jars share the
 `caustica` system-property namespace, so remove Caustica first.
@@ -144,7 +159,7 @@ license terms. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - [x] Volumetric fog and clouds (this fork)
 - [ ] NRD denoising for non-NVIDIA GPUs
 - [x] FSR frame generation for non-NVIDIA GPUs (this fork)
-- [ ] LOD
+- [x] LOD (this fork)
 - [x] ReSTIR emitter resampling
 - [ ] ReSTIR temporal reservoir reuse (built and toggleable; so far it measures
       noisier than resampling from scratch, so its value is unproven)

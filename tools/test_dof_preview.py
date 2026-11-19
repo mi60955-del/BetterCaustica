@@ -102,6 +102,8 @@ class MirrorsItsSources(unittest.TestCase):
         rack = group(r'"caustica\.rt\.dof\.rackSeconds", "dof\.rack-time", ([\d.]+)f',
                      CONFIG, "the default focus time")
         self.assertAlmostEqual(float(rack.group(1)), dof.FOCUS_RACK_SECONDS, places=6)
+        landing = group(r"RACK_LANDING = ([\d.]+)f", DEPTH_OF_FIELD, "the rack's landing rate")
+        self.assertAlmostEqual(float(landing.group(1)), dof.RACK_LANDING, places=6)
 
     def test_the_host_clamps_the_dial_by_the_horizon_ceiling(self):
         # The preview's lens_radius_blocks is these lines and nothing else: the dialled radius, clamped by
@@ -514,14 +516,29 @@ class FocusRack(unittest.TestCase):
         self.assertTrue(all(a >= b for a, b in zip(seen, seen[1:])), "the rack overshot or oscillated")
         self.assertLess(abs(seen[-1] - 2.0), 0.05)
 
-    def test_a_longer_focus_time_eases_the_plane_in(self):
-        # The dial is the glide's time constant: one constant covers 63% of the distance, and a longer
-        # one must arrive later at every step.
-        one_tau = dof.rack_focus(8.0, 2.0, 0.2, 0.2)
-        self.assertAlmostEqual(one_tau, 8.0 - 6.0 * (1.0 - math.exp(-1.0)), places=9)
+    def test_the_dial_is_the_time_the_plane_arrives(self):
+        # The dial names a duration, not a time constant: one dial of time leaves the plane on target, half
+        # of it is already nine tenths of the defocus, and a longer dial must arrive later at every step.
+        self.assertLess(abs(dof.rack_focus(8.0, 2.0, 0.2, 0.2) - 2.0), 0.02)
+        self.assertLess(dof.rack_focus(8.0, 2.0, 0.1, 0.2), 2.2)
         quick = dof.rack_focus(8.0, 2.0, 1.0 / 60.0, 0.05)
         slow = dof.rack_focus(8.0, 2.0, 1.0 / 60.0, 0.8)
         self.assertTrue(2.0 < quick < slow, f"the focus time dial inverted: {quick} vs {slow}")
+
+    def test_is_symmetric_between_the_two_directions(self):
+        # Blocks are not symmetric and dioptres are: a pull that took a hundredth of a second one way and a
+        # second the other way is the same dial read two ways.
+        def frames(from_blocks, to_blocks):
+            start = 1.0 / from_blocks
+            goal = abs(1.0 / to_blocks - start)
+            current = from_blocks
+            for frame in range(1, 601):
+                current = dof.rack_focus(current, to_blocks, 1.0 / 60.0)
+                if abs(1.0 / current - start) >= 0.95 * goal:
+                    return frame
+            return -1
+        self.assertEqual(frames(64.0, 3.0), frames(3.0, 64.0),
+                         "the rack takes a different time each way")
 
     def test_is_frame_rate_independent(self):
         by_frame = 8.0

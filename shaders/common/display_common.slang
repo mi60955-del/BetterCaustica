@@ -168,11 +168,37 @@ public struct SharpenPush {
 
 public struct StillPush {
     // 0 = add this frame into the accumulator, 1 = store it as the run's first frame, 2 = divide the
-    // accumulator out into the 8-bit image. One dispatch carries both halves so the accumulator's layout
-    // has exactly one owner.
+    // accumulator out into the display-res mean. One dispatch carries both halves so the accumulator's
+    // layout has exactly one owner.
     public int mode;
     // 1 / the run's sample count. Only mode 2 reads it.
     public float weight;
+    // How many samples the accumulator already holds when this dispatch runs: mode 0 uses it as the
+    // divisor of the running mean its second-moment update is written against, and mode 2 uses it as the
+    // count the standard error of the mean is derived from. Mode 1 never reads it.
+    public int count;
+    // Nonzero sums with the earlier estimator: each sample is capped at eight times the pixel's running
+    // mean, and the alpha carries no second moment. Zero is the current one, which clamps nothing and
+    // records the measured noise the display filter gates its taps with. A run picks one and keeps it.
+    public int legacy;
+};
+
+public struct StillDenoisePush {
+    // 0 = demodulate the mean by its albedo, 1 = one a-trous step over the residual, 2 = remodulate it.
+    public int mode;
+    // Tap spacing in texels for mode 1: the run walks 1, 2, 4 so three steps reach a 16-texel support
+    // without a 33x33 kernel.
+    public int step;
+    // How many times the pixel's own measured noise a tap may differ by before it fades out. The spread
+    // comes from the scene image's alpha, so one value serves the whole frame; this dial is what widens or
+    // tightens the kernel on top of it.
+    public float sigma;
+    // Strength dial: 0 leaves the input untouched, 1 takes the whole kernel.
+    public float amount;
+    // Nonzero gates taps against a fixed fraction of the local level — sigma of 1/sqrt(N) — instead of the
+    // spread the still pass measured. That is what the earlier estimator's filter did, and a run that sums
+    // with the cap has no measured spread to hand it.
+    public int measured;
 };
 
 // One dispatch of the post-process depth of field's gather: the near and far accumulation for both
@@ -198,6 +224,21 @@ public struct DofPostGatherPush {
     // change the shape of the defocus without changing its brightness.
     public int blades;
     public float bladeRotation;
+    // The cat-eye's strength, 0..1: how much the barrel eclipses the aperture for bundles arriving
+    // toward the frame's edges. Off-axis the entrance pupil is the aperture stop and the barrel's
+    // opening drawn over each other, the opening displaced toward the frame's centre, and their
+    // overlap is the bokeh highlight's shape -- the aperture's own round arc on the centre-facing
+    // side, the outer side bitten into by the barrel, deepening to the crescent a wide-open lens
+    // puts on corner highlights. The gather's weighted means renormalise whatever remains, so the
+    // strength reshapes the defocus without changing its brightness. 0 keeps the opening the same
+    // shape everywhere.
+    public float catEye;
+    // The field swirl's strength, 0..1: off-axis astigmatism stretches the bokeh tangentially around
+    // the frame's centre, growing with the square of the field angle so the axis stays round and the
+    // corners stretch hardest. The gather warps the disc back into the aperture's circular frame,
+    // which only narrows its radial extent, and its weighted mean renormalises what remains. 0 keeps
+    // every highlight circular.
+    public float swirl;
     // focusDepth's texel count (render resolution) and the dispatch's own (half the display
     // resolution). The depth lookup walks from this pass's half-res coordinates to the render-res
     // depth image through both.

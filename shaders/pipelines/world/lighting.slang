@@ -241,6 +241,11 @@ public void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint p
 public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
                      float rough, bool twoSided, float sss, inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
+    // The light buffer is published asynchronously with the light hierarchy: on the frames before the
+    // first light is published it is null, and dereferencing it would fault the device.
+    if (worldPush.lightCount == 0u || pc.lightBufAddr == 0ull) {
+        return r;
+    }
     LightGridCell gridCell;
     int3 gridCellCoord;
     float3 gridLookup = hitPos;
@@ -481,7 +486,7 @@ public Reservoir risSpatial(Reservoir cur, uint2 pix, float depth, float3 hitPos
 // the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
 // sample's side of the surface.
 public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                      float3 F0, float rough, bool twoSided, float sss) {
+                      float3 F0, float rough, bool twoSided, float sss, int hitDepth) {
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -499,9 +504,14 @@ public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, flo
     float3 origin = hitPos + side * n * SURF_BIAS;
     float3 toL = s.pos - origin;
     float dist = length(toL);
-    // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
-    VisibilityResult shadow = visibility(origin, toL / dist, dist * 0.999);
-    float3 vis = shadow.transmittance;
+    // Deeper vertices may skip the ray: their emitter light is indirect and dim, so losing its
+    // occlusion reads as slightly leaked far-bounce glow, while each traced ray stalls the whole warp.
+    float3 vis = float3(1.0);
+    if (worldPush.shadowSkipDepth == 0u || uint(max(hitDepth, 0)) < worldPush.shadowSkipDepth) {
+        // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
+        VisibilityResult shadow = visibility(origin, toL / dist, dist * 0.999);
+        vis = shadow.transmittance;
+    }
     return contrib * vis * s.W;
 }
 
@@ -509,3 +519,287 @@ public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, flo
 //   bit 0 (0x01) — secondary rays: shadows, GI bounces, reflections.
 //   bit 1 (0x02) — the primary camera ray.
 // Terrain / entities / block entities keep 0xFF (both bits). Particles use 0x02: primary-visible
+
+#ifndef CAUSTICA_NO_PROBE_PATH
+// --- Indirect radiance probes -------------------------------------------------------------
+// Camera-centred world-space L1 SH grid. A probe stores the radiance leaving the surface it sits on,
+// refreshed every frame from that surface's own screen pixel; the indirect walk samples the grid at its
+// first indirect vertex, so the second and later bounces of a camera path cost one trilinear gather
+// instead of another traced continuation. The grid keeps two copies: the frame writes the copy opposite
+// worldPush.probeParity and every query reads the copy probeParity names, so a path never sees a probe
+// that this frame has only half refreshed.
+
+public static const uint PROBE_DIM_X = 48u;
+public static const uint PROBE_DIM_Y = 16u;
+public static const uint PROBE_DIM_Z = 48u;
+public static const uint PROBE_COUNT = PROBE_DIM_X * PROBE_DIM_Y * PROBE_DIM_Z;
+public static const uint PROBE_BYTES = 64u;
+// Radiance is stored in the pre-exposure units outImage holds, so a query can add it to the walk as it is.
+public static const float PROBE_SH_C0 = 0.282095;
+public static const float PROBE_SH_C1 = 0.488603;
+
+public struct ProbeSH {
+    public float4 shR;
+    public float4 shG;
+    public float4 shB;
+    // x confidence 0..1, y unused, z the frame of the last accepted sample, w unused.
+    public float4 meta;
+};
+
+float probeShChannel(float4 sh, float3 n) {
+    return sh.x * PROBE_SH_C0 + PROBE_SH_C1 * dot(sh.yzw, float3(n.y, n.z, n.x));
+}
+
+float3 probeShRadiance(ProbeSH probe, float3 n) {
+    // A single-direction EMA leaves the L1 lobe free to go negative on the side the sample did not see;
+    // the gather below clamps instead of subtracting light.
+    return max(float3(probeShChannel(probe.shR, n),
+                      probeShChannel(probe.shG, n),
+                      probeShChannel(probe.shB, n)), float3(0.0));
+}
+
+// A probe slot is addressed by world cell, not by window position: the same cell always lands in the
+// same slot, so moving the camera does not reassign contents already stored. Slots wrap modulo the grid
+// dims, and meta.y carries the cell tag so a slot reused by a cell one period away is rejected instead
+// of answering with another place's radiance.
+uint probeSlotOf(int3 cell) {
+    int3 dims = int3(int(PROBE_DIM_X), int(PROBE_DIM_Y), int(PROBE_DIM_Z));
+    int3 m = cell % dims;
+    m = m + int3(m.x < 0 ? dims.x : 0, m.y < 0 ? dims.y : 0, m.z < 0 ? dims.z : 0);
+    return uint(m.z) * PROBE_DIM_X * PROBE_DIM_Y + uint(m.y) * PROBE_DIM_X + uint(m.x);
+}
+
+uint probeTagOf(int3 cell) {
+    return (uint(cell.x + 512) & 1023u) | ((uint(cell.y + 512) & 1023u) << 10)
+            | ((uint(cell.z + 512) & 1023u) << 20);
+}
+
+// First cell of the camera window, in the same rebased space the probes and paths use.
+int3 probeWindowBase() {
+    float cellSize = max(worldPush.probeOrigin.w, 1.0e-3);
+    return int3(int(floor(worldPush.probeOrigin.x / cellSize + 0.5)),
+                int(floor(worldPush.probeOrigin.y / cellSize + 0.5)),
+                int(floor(worldPush.probeOrigin.z / cellSize + 0.5)));
+}
+
+// Refresh the probe this pixel owns. Only the first PROBE_COUNT pixels of the dispatch take part; the
+// rest return immediately. The probe is valid when its centre projects inside the frame and lands on the
+// surface the depth guide reports there, which rejects probes inside geometry or outside the view.
+public void updateProbeCache(uint2 pix, uint2 dimensions) {
+    if (worldPush.probeEnabled == 0u) {
+        return;
+    }
+    uint probeIndex = uint(pix.y) * dimensions.x + uint(pix.x);
+    if (probeIndex >= PROBE_COUNT) {
+        return;
+    }
+    uint3 offset = uint3(probeIndex % PROBE_DIM_X,
+                         (probeIndex / PROBE_DIM_X) % PROBE_DIM_Y,
+                         probeIndex / (PROBE_DIM_X * PROBE_DIM_Y));
+    int3 cell = probeWindowBase() + int3(offset);
+    float cellSize = max(worldPush.probeOrigin.w, 1.0e-3);
+    float3 probePos = worldPush.probeOrigin.xyz + (float3(offset) + 0.5) * cellSize;
+
+    // Ping-pong: the write half is the one no query is reading this frame, and the previous contents it
+    // blends with are the same half's own last write.
+    uint writeHalf = worldPush.probeParity != 0u ? 0u : PROBE_COUNT;
+    uint readHalf = worldPush.probeParity != 0u ? PROBE_COUNT : 0u;
+    uint slot = probeSlotOf(cell);
+    uint64_t writeAddr = worldPush.probeGridAddr
+            + uint64_t((writeHalf + slot) * PROBE_BYTES);
+    uint64_t readAddr = worldPush.probeGridAddr
+            + uint64_t((readHalf + slot) * PROBE_BYTES);
+    ProbeSH previous = ConstPtr<ProbeSH>(readAddr)[0];
+    // A wrapped slot may hold a cell one period away; its radiance must not seed this cell's average.
+    if (uint(previous.meta.y) != probeTagOf(cell)) {
+        previous = ProbeSH(float4(0.0), float4(0.0), float4(0.0), float4(0.0, 0.0, 0.0, 0.0));
+    }
+
+    bool valid = false;
+    float3 radiance = float3(0.0);
+    float3 towardEye = float3(0.0, 1.0, 0.0);
+    // curViewProj is camera-relative, so the probe is projected from its offset to the eye.
+    float4 clip = mul(worldPush.curViewProj, float4(probePos - worldPush.camOffset, 1.0));
+    if (clip.w > 1.0e-4) {
+        float2 uv = clip.xy / clip.w * 0.5 + 0.5;
+        if (all(uv >= 0.0) && all(uv < 1.0)) {
+            uint2 screenPix = uint2(clamp(uv * float2(dimensions), float2(0.0),
+                                          float2(dimensions) - 1.0));
+            // The probe is valid when the surface the pixel shows sits within a cell and a half of it:
+            // that is the neighbourhood whose radiance a probe at this corner can speak for. A raw depth
+            // comparison would be meaningless here, because the probe sits up to a cell off the surface
+            // and reversed-Z depth is not linear in distance.
+            float2 ndc = (float2(screenPix) + 0.5) / float2(dimensions) * 2.0 - 1.0;
+            float4 surfaceH = mul(worldPush.invViewProj, float4(ndc, gDepth[screenPix], 1.0));
+            float3 surface = surfaceH.xyz / surfaceH.w;
+            if (length(surface - (probePos - worldPush.camOffset)) <= cellSize * 3.0) {
+                radiance = outImage[screenPix].rgb * (1.0 / max(worldPush.preExposure, 1.0e-6));
+                towardEye = normalize(worldPush.camOffset - probePos);
+                valid = true;
+            }
+        }
+    }
+
+    float confidence = previous.meta.x;
+    if (valid) {
+        // First sighting snaps harder so a probe lights up within a few frames; after that the refresh
+        // is slow enough to average the pixel's own noise.
+        float alpha = confidence < 0.05 ? 0.5 : 0.125;
+        float4 basis = float4(PROBE_SH_C0, PROBE_SH_C1 * towardEye.yzx);
+        ProbeSH updated;
+        updated.shR = previous.shR * (1.0 - alpha) + radiance.r * basis * alpha;
+        updated.shG = previous.shG * (1.0 - alpha) + radiance.g * basis * alpha;
+        updated.shB = previous.shB * (1.0 - alpha) + radiance.b * basis * alpha;
+        updated.meta = float4(min(1.0, confidence + 0.25), asfloat(probeTagOf(cell)),
+                float(worldPush.frameIndex), 0.0);
+        Ptr<ProbeSH>(writeAddr)[0] = updated;
+    } else if (float(worldPush.frameIndex) - previous.meta.z > 120.0) {
+        // Age-based expiry: a probe is only stale once nothing has refreshed it for two seconds.
+        // Decaying on every missed screen projection would erase the ray fill's confidence, because
+        // every probe has exactly one screen owner and unseen probes always miss that projection.
+        ProbeSH decayed = previous;
+        decayed.meta.x = confidence * 0.9;
+        Ptr<ProbeSH>(writeAddr)[0] = decayed;
+    }
+}
+
+// Trilinear gather of the eight probes around p, evaluated against n. The sum is confidence-weighted,
+// so a texel whose probes are stale or absent pulls the result toward the live path instead of the
+// cache.
+public float3 sampleProbeRadiance(float3 p, float3 n, out float confidence) {
+    confidence = 0.0;
+    if (worldPush.probeEnabled == 0u) {
+        return float3(0.0);
+    }
+    float cellSize = max(worldPush.probeOrigin.w, 1.0e-3);
+    float3 grid = (p - worldPush.probeOrigin.xyz) / cellSize - 0.5;
+    int3 base = int3(floor(grid));
+    float3 frac = grid - float3(base);
+    int3 windowBase = probeWindowBase();
+    uint readBase = worldPush.probeParity != 0u ? PROBE_COUNT : 0u;
+
+    float3 sum = float3(0.0);
+    float weights = 0.0;
+    for (int dz = 0; dz < 2; dz++) {
+        for (int dy = 0; dy < 2; dy++) {
+            for (int dx = 0; dx < 2; dx++) {
+                int3 corner = base + int3(dx, dy, dz);
+                if (any(corner < int3(0)) || corner.x >= int(PROBE_DIM_X)
+                        || corner.y >= int(PROBE_DIM_Y) || corner.z >= int(PROBE_DIM_Z)) {
+                    continue;
+                }
+                float3 weight = float3(dx != 0 ? frac.x : 1.0 - frac.x,
+                                       dy != 0 ? frac.y : 1.0 - frac.y,
+                                       dz != 0 ? frac.z : 1.0 - frac.z);
+                float w = weight.x * weight.y * weight.z;
+                if (w <= 0.0) {
+                    continue;
+                }
+                int3 worldCell = windowBase + corner;
+                uint index = probeSlotOf(worldCell);
+                ProbeSH probe = ConstPtr<ProbeSH>(worldPush.probeGridAddr
+                        + uint64_t((readBase + index) * PROBE_BYTES))[0];
+                if (uint(probe.meta.y) != probeTagOf(worldCell)) {
+                    continue;
+                }
+                float probeConfidence = clamp(probe.meta.x, 0.0, 1.0);
+                sum += probeShRadiance(probe, n) * (w * probeConfidence);
+                weights += w * probeConfidence;
+            }
+        }
+    }
+    confidence = weights;
+    return weights > 1.0e-4 ? sum / weights : float3(0.0);
+}
+
+// True when p lies inside the probe grid. The cutoff uses this instead of a confidence test: a
+// per-lane confidence threshold makes neighbouring lanes disagree, and a wave that keeps one
+// tracing lane pays for the whole continuation anyway. Grid membership changes only across cells,
+// so lanes in a warp usually agree and the break actually removes work.
+public bool probeGridContains(float3 p) {
+    float3 grid = (p - worldPush.probeOrigin.xyz) / max(worldPush.probeOrigin.w, 1.0e-3);
+    return all(grid >= float3(0.0)) && all(grid < float3(float(PROBE_DIM_X), float(PROBE_DIM_Y), float(PROBE_DIM_Z)));
+}
+
+// Amortized probe-ray fill.
+//
+// The screen-space writeback can only refresh probes whose projected pixel is visible, and most
+// bounce-1 vertices sit on surfaces the camera cannot see. A small, rotating subset of rays therefore
+// samples the grid directly from the probe centres: each frame traces PROBE_RAY_COUNT rays spread over
+// the grid, so every probe is revisited once per PROBE_COUNT / PROBE_RAY_COUNT frames. The samples are
+// isotropic (a probe in air has no hemisphere), shaded with the same emitter NEE the path vertex uses,
+// and folded into the same ping-pong half as the screen writeback.
+public static const uint PROBE_RAY_COUNT = 2048u;
+public static const float PROBE_RAY_GAIN = 4.0;
+
+public void fillProbeRay(uint2 pix, uint2 dimensions) {
+    if (worldPush.probeEnabled == 0u) {
+        return;
+    }
+    uint pixelIndex = uint(pix.y) * dimensions.x + uint(pix.x);
+    if (pixelIndex < PROBE_COUNT || pixelIndex >= PROBE_COUNT + PROBE_RAY_COUNT) {
+        return;
+    }
+    uint raySlot = pixelIndex - PROBE_COUNT;
+    uint probeIndex = (raySlot + uint(worldPush.frameIndex) * PROBE_RAY_COUNT) % PROBE_COUNT;
+    uint3 offset = uint3(probeIndex % PROBE_DIM_X,
+                         (probeIndex / PROBE_DIM_X) % PROBE_DIM_Y,
+                         probeIndex / (PROBE_DIM_X * PROBE_DIM_Y));
+    int3 cell = probeWindowBase() + int3(offset);
+    float cellSize = max(worldPush.probeOrigin.w, 1.0e-3);
+    float3 probePos = worldPush.probeOrigin.xyz + (float3(offset) + 0.5) * cellSize;
+
+    uint seed = probeIndex * 9781u + uint(worldPush.frameIndex) * 6271u + 17u;
+    seed = pcg(seed);
+    float2 u = float2(rndf(seed), rndf(seed));
+    float cosTheta = u.x * 2.0 - 1.0;
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = u.y * 6.28318530718;
+    float3 dir = float3(sinTheta * cos(phi), cosTheta, sinTheta * sin(phi));
+
+    traceRadiance(CULL_SECONDARY, probePos, 0.0, dir, 10000.0, true, 0.0, 0.0, false);
+    float3 radiance;
+    if (payload.hitT < 0.0) {
+        radiance = payloadSky();
+    } else {
+        float3 hitPos = probePos + dir * payload.hitT;
+        float3 albedo = payloadAlbedo();
+        radiance = albedo * payloadEmission();
+        if (payloadMaterial() == MATERIAL_OPAQUE) {
+            float3 n = payloadNormal();
+            float rough = payloadRoughness();
+            float metal = payloadMetalness();
+            float3 diffAlb = albedo * (1.0 - metal);
+            float3 p = hitPos + n * SURF_BIAS;
+            uint proposalSeed = seed ^ (probeIndex * 2654435761u);
+            proposalSeed = pcg(proposalSeed);
+            Reservoir reservoir = risInitial(p, n, -dir, dir, diffAlb, payload.f0, rough,
+                    false, 0.0, seed, proposalSeed);
+            radiance += shadeReservoir(reservoir, p, n, -dir, dir, diffAlb, payload.f0, rough,
+                    false, 0.0, 0);
+        }
+    }
+
+    uint writeHalf = worldPush.probeParity != 0u ? 0u : PROBE_COUNT;
+    uint readHalf = worldPush.probeParity != 0u ? PROBE_COUNT : 0u;
+    uint probeSlot = probeSlotOf(cell);
+    uint64_t writeAddr = worldPush.probeGridAddr + uint64_t((writeHalf + probeSlot) * PROBE_BYTES);
+    uint64_t readAddr = worldPush.probeGridAddr + uint64_t((readHalf + probeSlot) * PROBE_BYTES);
+    ProbeSH previous = ConstPtr<ProbeSH>(readAddr)[0];
+    if (uint(previous.meta.y) != probeTagOf(cell)) {
+        previous = ProbeSH(float4(0.0), float4(0.0), float4(0.0), float4(0.0, 0.0, 0.0, 0.0));
+    }
+    ProbeSH updated;
+    // The screen writeback stores one radiance direction per probe and the query weights it by about
+    // 1/pi; averaging isotropic directions cancels that dipole term, so the ray samples carry the
+    // reciprocal of the query kernel's self-response to keep both fills on one scale.
+    float4 basis = float4(PROBE_SH_C0, PROBE_SH_C1 * dir.yzx);
+    float alpha = previous.meta.x < 0.05 ? 0.5 : 0.2;
+    updated.shR = lerp(previous.shR, radiance.r * basis * PROBE_RAY_GAIN, alpha);
+    updated.shG = lerp(previous.shG, radiance.g * basis * PROBE_RAY_GAIN, alpha);
+    updated.shB = lerp(previous.shB, radiance.b * basis * PROBE_RAY_GAIN, alpha);
+    updated.meta = float4(min(1.0, previous.meta.x + 0.2), asfloat(probeTagOf(cell)),
+            float(worldPush.frameIndex), 0.0);
+    Ptr<ProbeSH>(writeAddr)[0] = updated;
+}
+#endif

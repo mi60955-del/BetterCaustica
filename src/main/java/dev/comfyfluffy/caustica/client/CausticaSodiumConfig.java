@@ -20,6 +20,7 @@ import net.caffeinemc.mods.sodium.api.config.structure.ModOptionsBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.OptionBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.OptionGroupBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.OptionPageBuilder;
+import net.caffeinemc.mods.sodium.api.config.structure.StatefulOptionBuilder;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
@@ -103,6 +104,25 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
         }
     }
 
+    // Ordered against CausticaConfig.Rt.DepthOfField.MODES; the ordinal is the stored number.
+    // Package-private so the test can pin the two together.
+    enum DofMode {
+        OFF, TRACED, POST;
+
+        int value() {
+            return CausticaConfig.Rt.DepthOfField.MODES.get(ordinal());
+        }
+    }
+
+    // Ordered against CausticaConfig.Rt.Materials.PARALLAX_STYLES.
+    enum ParallaxStyle {
+        SMOOTH, SHARP;
+
+        int value() {
+            return CausticaConfig.Rt.Materials.PARALLAX_STYLES.get(ordinal());
+        }
+    }
+
     @Override
     public void registerConfigLate(ConfigBuilder config) {
         ModOptionsBuilder mod = config.registerOwnModOptions();
@@ -131,12 +151,37 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
     }
 
     private static OptionBuilder buildOption(ConfigBuilder config, Option option) {
-        return switch (option.control()) {
+        OptionBuilder built = switch (option.control()) {
             case Control.Toggle ignored -> toggle(config, option);
             case Control.Count count -> count(config, option, count);
             case Control.Scaled scaled -> scaled(config, option, scaled);
             case Control.Cycled cycled -> cycled(config, option, cycled.cycle());
         };
+        if (option.gate().dependsOn() != null) {
+            // Every concrete builder extends StatefulOptionBuilder; only the erased interface the switch
+            // above returns does not say so.
+            gated((StatefulOptionBuilder<?>) built, option);
+        }
+        return built;
+    }
+
+    /**
+     * A row that is present but greyed until its parent switch is on.
+     *
+     * <p>{@code readBooleanOption} reads the PENDING value, so flipping the switch greys and wakes the row
+     * in the same interaction instead of after Apply. The parent's id is also what Sodium watches to
+     * re-evaluate this provider. Options whose parent is not a boolean (a slider or a mode) fall back to
+     * the live setting, because {@link ConfigState} exposes no generic predicate to re-run.
+     */
+    private static void gated(StatefulOptionBuilder<?> built, Option option) {
+        CausticaSettings.Dependency dependency = option.gate().dependsOn();
+        Option parent = CausticaSettings.byPath(dependency.parentPath());
+        boolean booleanParent = parent != null && parent.control() instanceof Control.Toggle;
+        built.setEnabledProvider(state -> booleanParent
+                ? state.readBooleanOption(id(dependency.parentPath()))
+                : dependency.parentOn().get(), id(dependency.parentPath()));
+        // Present and inactive, rather than absent: a row that disappears takes the relationship with it.
+        built.setControlHiddenWhenDisabled(false);
     }
 
     private static OptionBuilder cycled(ConfigBuilder config, Option option, Cycle cycle) {
@@ -145,6 +190,8 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
             case DLSS_QUALITY -> dlssQuality(config, option);
             case HDR_PEAK -> hdrPeak(config, option);
             case FRAME_GENERATION_BACKEND -> frameGenerationBackend(config, option);
+            case DOF_MODE -> dofMode(config, option);
+            case PARALLAX_STYLE -> parallaxStyle(config, option);
         };
     }
 
@@ -276,6 +323,48 @@ public final class CausticaSodiumConfig implements ConfigEntryPoint {
                         () -> FgBackend.of(option.text().get()))
                 .setStorageHandler(SAVE)
                 .setImpact(impact(option));
+    }
+
+    private static EnumOptionBuilder<DofMode> dofMode(ConfigBuilder config, Option option) {
+        return config.createEnumOption(id(option.path()), DofMode.class)
+                .setName(Component.translatable(option.nameKey()))
+                .setTooltip(Component.translatable(option.tooltipKey()))
+                .setElementNameProvider(mode -> Component.translatable(option.nameKey() + "." + mode.value()))
+                .setDefaultValue(dofModeOf(option.integer().defaultValue()))
+                .setBinding(mode -> { option.integer().set(mode.value()); CausticaSettings.afterChange(option); },
+                        () -> dofModeOf(option.integer().get()))
+                .setStorageHandler(SAVE)
+                .setImpact(impact(option));
+    }
+
+    private static EnumOptionBuilder<ParallaxStyle> parallaxStyle(ConfigBuilder config, Option option) {
+        return config.createEnumOption(id(option.path()), ParallaxStyle.class)
+                .setName(Component.translatable(option.nameKey()))
+                .setTooltip(Component.translatable(option.tooltipKey()))
+                .setElementNameProvider(style -> Component.translatable(option.nameKey() + "." + style.value()))
+                .setDefaultValue(parallaxStyleOf(option.integer().defaultValue()))
+                .setBinding(style -> { option.integer().set(style.value()); CausticaSettings.afterChange(option); },
+                        () -> parallaxStyleOf(option.integer().get()))
+                .setStorageHandler(SAVE)
+                .setImpact(impact(option));
+    }
+
+    private static DofMode dofModeOf(int stored) {
+        for (DofMode mode : DofMode.values()) {
+            if (mode.value() == stored) {
+                return mode;
+            }
+        }
+        return DofMode.OFF;
+    }
+
+    private static ParallaxStyle parallaxStyleOf(int stored) {
+        for (ParallaxStyle style : ParallaxStyle.values()) {
+            if (style.value() == stored) {
+                return style;
+            }
+        }
+        return ParallaxStyle.SMOOTH;
     }
 
     private static DlssQuality qualityOf(int stored) {

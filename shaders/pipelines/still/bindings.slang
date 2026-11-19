@@ -1,7 +1,7 @@
-// The accumulated still render: an fp32 accumulator the finished display frame is added into, and the
-// 8-bit image the average is divided out to for readback. The accumulator is float because the whole
-// point is that a sum of many 8-bit frames is worth more than any single one of them — an 8-bit
-// accumulator would only ever keep the last frame it saw.
+// The accumulated still render: a sum of the scene-linear image the display chain consumes (rrOutput),
+// and the display-res mean the chain is then run on. The accumulator is float because it holds a sum of
+// radiance, not a sum of already tone-mapped pixels: averaging the finished display image is biased by
+// the tone curve, which is what made a long exposure darken and desaturate as samples grew.
 [[vk::binding(0, 0)]] [format("rgba32f")] public RWTexture2D<float4> accumulatorImage;
 [[vk::binding(1, 0)]] public Sampler2D sourceImage;
-[[vk::binding(2, 0)]] [format("rgba8")] public RWTexture2D<float4> outputImage;
+[[vk::binding(2, 0)]] [format("rgba16f")] public RWTexture2D<float4> outputImage;

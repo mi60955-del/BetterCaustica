@@ -1,27 +1,27 @@
 // Participating media: the tint-to-extinction mappings and the depth-2 medium stack the dielectric
 // interface pushes and pops. Depends on core only.
 
-// Per-channel Beer–Lambert extinction from a water body's biome tint (carried in the payload's albedo view
-// for water hits, or worldPush.waterParams.xyz for the camera's own biome when starting submerged). A blue
-// ocean tint (low red) absorbs red fastest → bluer with depth; swamp green-brown shifts the hue. The floor
-// keeps even a white-tinted body very slightly absorbing so deep water never reads as clear vacuum.
-
 import world_common;
 import world_core;
 
-public static const float WATER_DENSITY = 0.1;
-public static const float3 WATER_ABSORB_FLOOR = float3(0.015, 0.010, 0.008);
-// `opacity` scales the whole extinction (floor included), so 0 reads as fully clear water rather
-// than as a floor-only residue. Above 1 the tint-driven channel spread (red dies fastest → blue
-// water) is frozen at its 1.0 strength and only the achromatic mean keeps growing — scaling the
-// spread too would leave blue as the last surviving channel and read as saturated dye instead of
-// the grey-black of genuinely opaque water. Below 1 the whole curve scales, matching 1.0 exactly.
+// Per-channel Beer–Lambert absorption of a water body. The coefficient is Photon's underwater absorption
+// (0.20 red, 0.08 green, 0.04 blue per block in Rec.709) filtered into working space by the same matrix
+// the Rayleigh coefficient uses, so red is swallowed roughly four times as fast as blue and depth reads as
+// teal rather than as grey. That chromatic split is the whole point: a single grey sigma at this magnitude
+// turns every submerged view into flat murk.
+//
+// `opacity` scales the absorption, so 0 reads as fully clear water. The painted value is Photon's look at
+// the default opacity of 3, which keeps existing configs on the same murk level they had before.
+public static const float3 WATER_ABSORPTION = float3(0.151676, 0.087885, 0.047682);
+public static const float WATER_OPACITY_DEFAULT = 3.0;
+// The biome tint only bends the channel ratio: it multiplies a unit-mean hue weight, so a blue ocean body
+// loses blue last and a swamp body stays browner, while the overall murk stays the opacity's job.
+public static const float WATER_BIOME_CONTRAST = 0.6;
 public float3 waterExtinction(float3 tint, float opacity) {
-    float3 base = WATER_ABSORB_FLOOR
-            + WATER_DENSITY * (float3(1.0, 1.0, 1.0) - clamp(tint, 0.0, 1.0));
-    float mean = (base.r + base.g + base.b) / 3.0;
-    float chromaScale = min(opacity, 1.0);
-    return mean * opacity + (base - mean) * chromaScale;
+    float3 lift = float3(1.0, 1.0, 1.0) - clamp(tint, 0.0, 1.0);
+    float meanLift = max((lift.r + lift.g + lift.b) / 3.0, 1.0e-3);
+    float3 hue = lerp(float3(1.0, 1.0, 1.0), lift / meanLift, WATER_BIOME_CONTRAST);
+    return WATER_ABSORPTION * hue * (max(opacity, 0.0) / WATER_OPACITY_DEFAULT);
 }
 
 // A non-water dielectric's tint is a filter over one block of travel rather than a biome water colour, so
@@ -102,22 +102,22 @@ public void mediumPop(inout MediumStack stack) {
     stack.outer = airMedium();
 }
 
-// The water medium's own scattering: `turbidity` (worldPush.water1.x) is the single-scatter fraction
-// sigmaS/sigmaT, so scattering = turbidity * extinction keeps the two coefficients energy-consistent
-// by construction (sigmaS <= sigmaT for every channel, with equality at turbidity 1). Because the
-// fraction is a per-frame global rather than a per-segment quantity, it is DERIVED from the packed
-// extinction wherever the medium is materialised — at the interface (makeDielectricMedium) and again
-// when a packed record resumes (segment.unpackPathSegment) — instead of being carried in the 48-byte
-// path record. Zero turbidity yields zero scattering, so the packed record needs no change at all and
-// the pre-water-fog packing stays byte-identical.
+// The water body's own scattering: `water1.x` is the in-scatter's single-scatter fraction sigmaS/sigmaT,
+// so scattering = fraction * extinction keeps the two coefficients energy-consistent by construction
+// (sigmaS <= sigmaT for every channel, with equality at a fraction of 1). Because the fraction is a
+// per-frame global rather than a per-segment quantity, it is DERIVED from the packed extinction wherever
+// the medium is materialised — at the interface (makeDielectricMedium) and again when a packed record
+// resumes (segment.unpackPathSegment) — instead of being carried in the 48-byte path record. A zero
+// fraction yields zero scattering, so a frame with the water fog off leaves the record byte-identical to
+// one from before the fog existed.
 public float3 waterScattering(float3 extinction) {
-    float turbidity = worldPush.water1.x;
-    return turbidity > 0.0 ? turbidity * extinction : float3(0.0, 0.0, 0.0);
+    float fraction = worldPush.water1.x;
+    return fraction > 0.0 ? fraction * extinction : float3(0.0, 0.0, 0.0);
 }
 
-// Water's tint is a biome colour whose absorption is calibrated per block of depth; any other volume
-// dielectric's tint is a filter over a reference block of travel. Both end up as per-channel extinction;
-// `waterOpacity` (worldPush.waterOpacity) scales only the water branch.
+// Water's absorption is the calibrated per-block coefficient bent by the biome tint's channel ratio; any
+// other volume dielectric's tint is a filter over a reference block of travel. Both end up as per-channel
+// extinction; `waterOpacity` (worldPush.waterOpacity) scales only the water branch.
 public Medium makeDielectricMedium(bool isWater, float ior, float3 tint, float transmission,
         float waterOpacity) {
     Medium m;

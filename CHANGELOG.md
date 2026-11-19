@@ -1,5 +1,181 @@
 # Changelog
 
+## 0.1.3 — 2026-11-18
+
+### Added
+
+- **Rain.** Falling rain is drawn as streaks after the denoiser and before the
+  tone curve. Each drop is one quad whose vertices are generated from the vertex
+  index alone: a vertical strip along the fall direction and the camera's
+  horizontal right, lit from the sky directly overhead, carried sideways by the
+  wind over the fall so that its lean and its drift are one motion, softened at
+  both ends, and faded out where it would touch the eye or the edge of the
+  disc around it. The pass has no depth attachment; the fragment shader reads
+  the traced depth guide and runs the comparison itself, and a streak narrower
+  than a pixel fades by its own coverage instead of shimmering. Because the
+  streaks land in the reconstructed image, the exposure meter, bloom and the
+  tone curve treat them as scene light. A still render leaves them out, since
+  the mean of falling rain is a smear of it.
+- **Weather darkening.** **Rain Sky Darkening** mirrors the curve vanilla's own
+  lightmap follows (each weather level takes up to 5/16 of the sky light, with a
+  20% floor) and applies it to the sky's radiometric inputs, so the sun, the
+  atmosphere and every surface lit by them agree on the dim. Auto-exposure
+  latches the same shift at the tone curve rather than in the scene, because a
+  uniform dim would otherwise be metered straight back out.
+- **Wetting and puddles.** **Rain Wetness** soaks every surface while it rains
+  and dries slowly afterwards, so a gap in the shower does not snap stone and
+  soil back to dry. **Puddle Coverage** then collects standing water on level
+  ground: a puddle is a surface of its own, flattening the normal map, taking
+  the water's roughness and Fresnel and darkening what lies beneath it, placed
+  by a world-anchored lattice so it stays put as you walk. Emissive grounds,
+  glass, foliage cutouts and entities never pool.
+- **Water body medium.** Water now absorbs by channel instead of fading as one
+  colour: red is swallowed about four times as fast as blue, so depth reads as a
+  shift toward blue-green before the light is gone, and the biome tint only
+  bends the ratio between channels. **Water Opacity** scales the absorption and
+  the underwater sun shafts run on the same scattering, so beams and body agree.
+  With **Water Fog** off the world is rendered exactly as before.
+- **Cloud out-scatter.** Rays that terminate on geometry no longer see the hole
+  in the sky behind a cloud sheet: a sheet's scattered radiance and its
+  transmittance are shaded for rays that end on terrain or on a reflection, not
+  only for rays that escape to the sky. **Cloud Steps** is the march count for
+  the volumetric deck, separate from every other cloud dial.
+- **Cloud quality dials.** Three new controls on the Sky page's Cloud detail
+  group, each defaulting to the frame the procedural stack shipped with.
+  **Cloud Light Steps** (1-8) is the sample count of the volumetric tier's sun
+  leg through its own deck: 1 is the single midpoint tap, more resolve a crown
+  shadowing its own base. **Cloud Detail** switches off the close view's
+  erosion cut and the cirrus sheet's filament curl for a smooth,
+  several-fetches-cheaper body — the shape the ground shadow field and the light
+  legs already read — while coverage, crown, base and the cast shadow stay.
+  **Cloud
+  Shadow Steps** (1-4) averages the ground shadow field's sun leg through each
+  deck instead of pricing the whole slab at one mid-plane crossing, sharpening
+  a broken deck's shadow gaps; every NEE site and fog sun leg pays it, so the
+  cost spreads across the frame rather than per cloud pixel.
+- **Distant Horizons LOD.** With Distant Horizons installed, its far terrain is
+  meshed into the traced scene beyond the edge of the traced vanilla world, so
+  the horizon follows DH's render distance instead of the vanilla one. Rings at
+  16-, 32- and 64-block cells cover 256-, 1024- and 4096-block regions, coarse
+  cells are masked where a finer ring covers them, and every region is meshed
+  into the same packed section format the traced terrain uses, so LOD geometry
+  costs the terrain pipeline nothing extra. **LOD max distance** 0 follows DH's
+  own chunk render distance, **LOD emissive light** lets distant windows, lava
+  and caves glow at night, and **LOD fetch budget** bounds the render-thread
+  microseconds spent reading DH's data. DH's own rasterized LOD is switched off
+  while this is on.
+- **Indirect radiance cache.** **Indirect Radiance Cache** ends each indirect
+  path at its first bounce and reads the light beyond it out of a camera-centred
+  grid of 48×16×48 probes two blocks apart, each holding an L1 spherical
+  harmonic and refreshed by the screen pixel that owns it. Probes carry an age
+  and a confidence, so a stale or missing one falls back to tracing and a light
+  that changes propagates within a couple of seconds.
+- **Indirect light subsampling.** **Indirect Light Subsampling** traces the
+  indirect pass for two of every three pixels per axis and rebuilds the rest
+  from a depth-aware upsample; it saves about a fifth of the indirect ray work
+  and the result reads softer and slightly darker.
+- **Endless still render.** **Endless Still Render** keeps summing past the
+  sample count until the still-render key is pressed again, and that press both
+  resolves and saves the run. F2 takes the accumulated picture at any moment.
+- **Still render resolution.** **Still Render Resolution** resizes the window to
+  **Still Render Width** and **Still Render Height** for the duration of a run
+  and puts it back afterwards, so a picture can be accumulated larger than the
+  desktop; a fullscreen run keeps the display's own size and says so.
+- **Still render denoise.** **Still Render Denoise** filters the accumulated
+  mean before it is tone mapped, using the normal, albedo and depth the tracer
+  already wrote: it removes the part of the noise neighbouring pixels saw from
+  the same surface and leaves textures, silhouettes and fine geometry alone.
+  **Still Render Denoise Strength** blends it against the raw mean, and a run
+  with DLSS-RR on skips the filter because it is already reconstructed.
+- **Cat-eye and swirly bokeh.** **Cat-Eye Bokeh** clips the aperture toward the
+  frame's edges the way a lens barrel does, leaving the crescent a wide-open
+  lens puts on corner highlights, and renormalises the clip so the frame does
+  not darken. **Swirly Bokeh** stretches highlights tangentially around the
+  centre with the square of the field angle, for the swirl of a Petzval-type
+  lens. Both work in the traced lens and in the post pass.
+- **RR Input Spark Clamp.** Caps isolated single-texel spikes in the traced
+  frame before Ray Reconstruction sees it, so one stray sample cannot become a
+  bright dot in the reconstruction; a real highlight covers several texels and
+  survives untouched.
+- **Emitter Shadow Ray Depth Limit.** Stops the emitter shadow ray at vertices
+  deeper than the given number of bounces and treats them as unoccluded, which
+  is where emitters are dim and indirect anyway.
+- **Pipeline dump.** `-Dcaustica.rt.pipelineStats=true` dumps what the driver
+  compiled for each pipeline — executable statistics, register use, spills and
+  the internal representations — through `VK_KHR_pipeline_executable_properties`.
+
+### Changed
+
+- **Clouds are now a four-deck procedural stack.** The nine baked VDB volumes,
+  their atlas, the shape slider and the random-shape switch are gone. A low
+  cumulus deck, a towering cumulus deck above it, an altostratus sheet and a
+  curl-warped cirrus sheet are all cut from one 512-square tileable noise atlas
+  generated at device bring-up. Each body is a solid isosurface: a biased
+  coverage threshold, a flat base with a domed crown, a fourth-power erosion cut
+  and a downwind shear of the crown. Lighting uses a four-lobe powder phase and a
+  multi-scatter gain, so thin rims keep a silver lining while deep cores stay lit.
+  Cloud shadows are priced per deck; the high sheets ride a longer fade than the
+  cumulus.
+- **Cloud settings.** Coverage is now a 0-200% shape threshold (70% nearly
+  clear, 100% broken cumulus, 120% two-thirds covered, 180% solid overcast), density is a multiplier on the
+  authored per-deck extinctions, size scales the noise tiles, and flow scrolls
+  only the fine detail. Rain and thunder raise the coverage threshold and the
+  density together. Cloud Type and Random Cloud Shapes were removed with the
+  baked volumes.
+- **Smaller jar.** Nine 2 MB cloud volumes and their baking tool are no longer
+  shipped; the shape atlas is generated in memory instead.
+- **Exposure metering.** The metering histogram now averages a 4×4 block per
+  sample before binning. Log is concave, so noise in a one-sample frame biases
+  the metered average upward; with DLSS-RR off nothing else was averaging it.
+- **Focus pull.** The focal plane now travels on an exponential in dioptres: it
+  covers 99% of the defocus it started with over **Focus Time**, at a constant
+  rate in 1/s, in either direction, and cannot overshoot. A near surface and a
+  far one take the same time.
+- **Still render sums light.** A run accumulates scene-linear radiance before
+  exposure instead of the mapped frame, and the running mean becomes the source
+  the display chain sees, so bloom, flare and the tone curve treat it as the
+  picture rather than as a frame that happened to be averaged.
+- **Settings pages.** An option can now name the switch it depends on: an off
+  parent greys its children where they are instead of hiding them, while the
+  ones the machine cannot use at all (no HDR swapchain) are the ones that
+  disappear. The **Volumetric Quality** row reads back the tier the dials
+  currently spell and says Custom when they spell none.
+- **Opacity micromaps retired.** The device no longer asks for
+  `VK_EXT_opacity_micromap`: the cutout triangulation still produced artefacts
+  with them, so the any-hit cutout test is the only path now.
+- **Retuned defaults.** The shipped look now runs eight path bounces, a
+  0.0078/block fog that blues out over 280 blocks and reddens out over 1.1 km,
+  shafts at 0.02 / 0.2 anisotropy / 512-block reach, a four-deck cloud layer at
+  70% coverage, 2× density, 1088-block tiles and eight march steps, rain streaks
+  at 2000 drops, half-length and 80% brightness, 1.1 Purkinje strength, and a
+  2.3-block depth-of-field focus that racks in 0.02 s with both blur caps off
+  and swirl at 0.7. Lens flare, sharpening, clouds, fog, shafts, water fog and
+  Distant Horizons LOD all ship off; the still render ships endless at 3840×2160
+  with its denoise off.
+
+### Fixed
+
+- **Boat water patch.** The water patch vanilla draws inside a boat was captured
+  into the acceleration structure as a quad and read as an opaque lid over the
+  interior; it is now a raster-only mask.
+- **Xaero's Minimap.** Waypoint markers kept the rotation of the last pass that
+  went through `LevelRenderer`, which a traced frame skips. The hook now hands
+  the minimap the world model-view matrix of the pass the ray tracer replaces,
+  and is inert when the mod is absent.
+- **DLSS-RR specular hit distance.** The shim passed a null specular hit
+  distance on every frame; it now passes the mirror layer's depth from the guide
+  probe wherever the renderer has one, so a reflection the tracer resolved to a
+  mirror surface carries its own distance instead of the layer's.
+
+### Performance
+
+- **One raygen record per frame.** Besides the volume-free and no-march twins,
+  the world raygen now has no-probe and no-RIS twins, and the composite picks
+  the record that matches the frame's switches: a sky with the radiance cache
+  off, or with emitter light samples at zero, no longer carries the code for
+  either, and none of it costs registers in the paths that do not use it.
+
+
 ## 0.1.1 — 2026-10-31
 
 ### Added

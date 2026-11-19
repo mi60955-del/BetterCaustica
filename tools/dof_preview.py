@@ -36,7 +36,8 @@ PROJECTION_Z_NEAR = 0.05  # blocks; the preview's own near plane, which is where
 EYE_HEIGHT = 1.6  # blocks; the preview camera's height over the ground plane
 FOCUS_PROBE_BLOCKS = 64.0  # RtDepthOfField.FAR_BLOCKS, the meter's far stop
 FOCUS_NEAR_BLOCK = 0.05  # RtFocusProbe.NEAR_BLOCK, the closest range a tap may answer
-FOCUS_RACK_SECONDS = 0.2  # the dof.rack-time default
+FOCUS_RACK_SECONDS = 0.15  # the dof.rack-time default
+RACK_LANDING = 4.6  # RtDepthOfField.RACK_LANDING: ln 100, so one dial of time is one arrival
 DEFAULT_APERTURE_BLOCKS = 0.04  # CausticaConfig.Rt.DepthOfField.APERTURE: a 4 cm lens
 DEFAULT_MAX_BLUR_PIXELS = 14.0  # CausticaConfig.Rt.DepthOfField.MAX_BLUR_PIXELS
 DEFAULT_FOCUS_BLOCKS = 8.0  # CausticaConfig.Rt.DepthOfField.FOCUS_BLOCKS
@@ -136,10 +137,13 @@ def meter_focus(depths, near_block=FOCUS_NEAR_BLOCK, far_block=FOCUS_PROBE_BLOCK
 
 def rack_focus(current: float, target: float, frame_seconds: float,
                rack_seconds: float = FOCUS_RACK_SECONDS) -> float:
-    """Port of `RtDepthOfField.rackFocus`: exponential approach, so the plane covers the same fraction of
-    its remaining distance per second whatever the frame rate is. `rack_seconds` is the Focus Time dial."""
-    approach = 1.0 - math.exp(-max(0.0, frame_seconds) / rack_seconds)
-    return current + (target - current) * approach
+    """Port of `RtDepthOfField.rackFocus`: exponential approach in dioptres, so the plane covers the same
+    share of the defocus it has left per second whatever the frame rate is, and the same dial answers with
+    the same duration in both directions. `rack_seconds` is the Focus Time dial, and the plane has arrived —
+    99% of the way — when it elapses."""
+    start = 1.0 / current
+    approach = 1.0 - math.exp(-RACK_LANDING * max(0.0, frame_seconds) / rack_seconds)
+    return 1.0 / (start + (1.0 / target - start) * approach)
 
 
 # --- the lens (primary.rgen) -------------------------------------------------------------------

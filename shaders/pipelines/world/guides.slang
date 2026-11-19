@@ -413,4 +413,7 @@ public void writeGuides(int2 pix, float3 primaryDir, float2 size, float primaryC
     gMotion[pix] = motion;
     gSpecAlbedo[pix] = float4(specAlbedo * specWeight, 1.0);
     gSpecMotion[pix] = specMotion * specWeight;
+    // The mirror probe already resolved this distance for the lens. Zero means "no reflected image", and a
+    // fog-dominated pixel has no specular layer left for RR to reproject with it.
+    gSpecHitDist[pix] = specWeight > 0.01 ? imageDepth : 0.0;
 }

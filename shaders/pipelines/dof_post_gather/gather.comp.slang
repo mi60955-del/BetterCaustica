@@ -18,6 +18,11 @@
 // foreground edge therefore carries its own bokeh over the background without a halo, and a background
 // blur never eats the in-focus object before it.
 //
+// Off the axis the barrel clips the aperture, and every tap's disc carries that clip at its own frame
+// position: the highlights toward the border draw the cat-eye a real wide-open lens leaves there.
+// Field astigmatism stretches the same discs tangentially around the frame's centre, so a field of
+// highlights away from the axis reads as the swirl of a Petzval-type lens.
+//
 // Runs at half the display resolution: a defocus field is band-limited by the discs it accumulates, so
 // the recombine's bilinear fetch costs less than the second half of every kernel would. Both display
 // channels are accumulated by this one dispatch -- the HDR work is gated by a push constant rather
@@ -84,6 +89,50 @@ float apertureCoverage(float2 unit, float edge) {
     return saturate((rim - r) / edge + 0.5);
 }
 
+// Off-axis astigmatism draws a point of light into an ellipse whose long axis runs tangentially around
+// the frame's centre: the field's swirl. The blur grows with the square of the field angle, so the
+// centre stays round and the corners -- the farthest points from the axis -- stretch hardest.
+float swirlStretch(float2 fieldPos, float strength) {
+    // The frame's corner is the largest field angle the [-1, +1] axes can name; clamping the square
+    // there keeps a mis-scaled frame position from squeezing a highlight into a hairline.
+    return 1.0 + strength * 1.2 * min(dot(fieldPos, fieldPos), 2.0);
+}
+
+// The gather tests a point of the defocused image by mapping it back into the aperture's own circular
+// frame. Scaling the radial axis by `stretch` there draws the tangentially long ellipse here; only the
+// radial extent shrinks, so the shape stays inside the unit disc the ring kernel already covers.
+float2 swirlToPupil(float2 unit, float2 fieldPos, float stretch) {
+    if (stretch <= 1.0) {
+        return unit;
+    }
+    float r = length(fieldPos);
+    if (r < 1.0e-4) {
+        return unit;
+    }
+    float2 radial = fieldPos / r;
+    float2 tangential = float2(-radial.y, radial.x);
+    return radial * (dot(unit, radial) * stretch) + tangential * dot(unit, tangential);
+}
+
+// The bokeh highlight's shape for a sample whose disc sits at the frame position `frameUv`: the
+// aperture clipped the way the barrel clips it that far off the axis, then swirled by the field's
+// astigmatism. The entrance pupil an off-axis bundle is imaged through is the aperture stop and the
+// barrel's opening drawn over each other, the opening displaced toward the frame's centre -- so the
+// overlap keeps the aperture's own round arc on the centre-facing side and bites into the outer side,
+// deepening from a flat spot at the frame's edge midpoints to the crescent a wide-open lens puts on
+// corner highlights. The bite's depth is the frame position scaled by the dial, so the corner of the
+// frame -- the farthest point from the axis -- is eclipsed hardest, the way a real lens vignettes.
+// Both dials at zero leave the plain aperture untouched.
+float bokehCoverage(float2 unit, float edge, float2 frameUv) {
+    float2 fieldPos = frameUv * 2.0 - 1.0;
+    float2 q = swirlToPupil(unit, fieldPos, swirlStretch(fieldPos, pc.swirl));
+    if (pc.catEye <= 0.0) {
+        return apertureCoverage(q, edge);
+    }
+    float2 shift = fieldPos * pc.catEye;
+    return min(apertureCoverage(q, edge), apertureCoverage(q + shift, edge));
+}
+
 // The relative depth gate: two surfaces within this share of each other's range are one layer, so
 // noise between neighbouring render texels cannot cut a sample off from the pixel it legitimately
 // covers. Beyond it the sample is a different layer, and the occlusion rule decides.
@@ -132,7 +181,7 @@ FieldResult gatherField(Sampler2D source, int2 pix, float2 halfSize) {
                 if (sampleCoc < 0.5) {
                     continue;
                 }
-                float coverage = apertureCoverage(offset / sampleCoc, 1.0 / sampleCoc);
+                float coverage = bokehCoverage(offset / sampleCoc, 1.0 / sampleCoc, uv);
                 sum += coverage * source.SampleLevel(uv, 0.0).rgb;
                 weightSum += coverage;
             }
@@ -176,7 +225,7 @@ FieldResult gatherField(Sampler2D source, int2 pix, float2 halfSize) {
             for (int t = 0; t < taps; ++t) {
                 float theta = angle + 2.0 * PI * float(t) / float(taps);
                 float2 offset = ringRadius * float2(cos(theta), sin(theta));
-                fullSum += apertureCoverage(offset / kernelHalf, 1.0 / kernelHalf);
+                fullSum += bokehCoverage(offset / kernelHalf, 1.0 / kernelHalf, centreUv);
                 float2 uv = (centre + offset + 0.25) / halfSize;
                 float sampleBlocks = axialBlocks(centre + offset, halfSize);
                 float sampleCoc = (sampleBlocks > 0.0 && sampleBlocks < pc.focus)
@@ -189,7 +238,7 @@ FieldResult gatherField(Sampler2D source, int2 pix, float2 halfSize) {
                 if (sampleBlocks - blocks > layerGate(sampleBlocks)) {
                     continue;
                 }
-                float coverage = apertureCoverage(offset / sampleCoc, 1.0 / sampleCoc);
+                float coverage = bokehCoverage(offset / sampleCoc, 1.0 / sampleCoc, uv);
                 sum += coverage * source.SampleLevel(uv, 0.0).rgb;
                 weightSum += coverage;
             }

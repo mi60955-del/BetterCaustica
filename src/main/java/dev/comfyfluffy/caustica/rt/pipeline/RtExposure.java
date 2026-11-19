@@ -45,6 +45,21 @@ public final class RtExposure {
     private float framePreExposure = 1.0f;
     /** This frame's latched night lift in EV; see {@link #beginFrame} for why it is latched too. */
     private float frameNightLift;
+    /**
+     * EV the frame's weather moves the presented image by, latched per frame. Negative in a storm: the
+     * light a storm removes is removed uniformly from every radiometric input, and a uniform scale is
+     * exactly what the meter renormalises, so the part of it that should survive adaptation has to be
+     * applied to the curve instead of to the scene.
+     */
+    private float frameWeatherShift;
+    /**
+     * While a still run sums frames the controller holds the exposure the run started with: a long
+     * exposure must not re-meter every sample, or its mean spans several exposures and loses the
+     * contrast the run is accumulating. The pre-exposure is held with it because the raygen's storage
+     * scale and the display's absolute multiplier only cancel while both stay fixed.
+     */
+    private boolean held;
+    private float heldPreExposure = 1.0f;
 
     private static final long DIAG_LOG_INTERVAL_NANOS = 1_000_000_000L;
     private static final int STATE_READBACK_RING = 6;
@@ -168,7 +183,11 @@ public final class RtExposure {
             throw new IllegalStateException("RT exposure image not created");
         }
         if (mode() == Mode.AUTO) {
-            recordAuto(ctx, cmd, stack, traceColor, guideDepth, guideAlbedo);
+            // A held run keeps the exposure image and its pre-exposure exactly where the run found
+            // them, so every accumulated sample shares one exposure.
+            if (!held) {
+                recordAuto(ctx, cmd, stack, traceColor, guideDepth, guideAlbedo);
+            }
             return;
         }
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure manual write")) {
@@ -214,6 +233,9 @@ public final class RtExposure {
         completedState = null;
         framePreExposure = 1.0f;
         frameNightLift = 0.0f;
+        frameWeatherShift = 0.0f;
+        held = false;
+        heldPreExposure = 1.0f;
         logged = false;
         cachedCurveSpec = null;
         cachedCurve = null;
@@ -438,26 +460,29 @@ public final class RtExposure {
                 CausticaConfig.Rt.Exposure.CENTER_WEIGHT_FLOOR.value(),
                 CausticaConfig.Rt.Exposure.SKY_WEIGHT_CAP.value(),
                 CausticaConfig.Rt.Exposure.EMISSIVE_WEIGHT_CAP.value(),
-                curveConfig().withNightLift(frameNightLift),
+                curveConfig().withNightLift(frameNightLift).withExposureShift(frameWeatherShift),
                 preExposure(),
                 resetSequence);
     }
 
     /**
-     * Latches this frame's pre-exposure and night lift. MUST be called once per frame before the world
-     * push constants are written, and must not be re-latched afterwards.
+     * Latches this frame's pre-exposure, night lift and weather shift. MUST be called once per frame
+     * before the world push constants are written, and must not be re-latched afterwards.
      *
      * <p>The raygen multiply and the resolve's divide have to use the <em>same</em> value or they
      * stop cancelling and the frame comes out mis-scaled. Both read {@link #preExposure()}, but at
      * different points in CPU time. The completed readback can be several frames old, so latching once
      * ensures both consumers use one prediction; the residual absorbs whatever it failed to predict.
      *
-     * <p>{@code nightFactor} is how dark the world's sky is, 0 at midday and 1 at full night. It arrives
-     * from the caller because it is camera state, and this class owns the exposure controller rather
-     * than the world.
+     * <p>{@code nightFactor} is how dark the world's sky is, 0 at midday and 1 at full night, and
+     * {@code weatherStops} is the EV the weather takes off the presented image (0 at clear weather,
+     * negative in a storm). Both arrive from the caller because they are world state, and this class
+     * owns the exposure controller rather than the world.
      */
-    public void beginFrame(RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter, float nightFactor) {
+    public void beginFrame(RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter, float nightFactor,
+                           float weatherStops) {
         frameNightLift = CausticaConfig.Rt.Exposure.NIGHT_LIFT.value() * Math.clamp(nightFactor, 0.0f, 1.0f);
+        frameWeatherShift = Math.min(weatherStops, 0.0f);
         Mode currentMode = mode();
         boolean reset = currentMode == Mode.AUTO && resetRequested;
         if (reset) {
@@ -482,7 +507,22 @@ public final class RtExposure {
 
         // On a reset frame the previous world's exposure is a poor storage-scale prediction. Unity is
         // neutral and the resolve removes it exactly; subsequent frames resume last-frame prediction.
-        framePreExposure = reset ? 1.0f : computePreExposure();
+        if (held) {
+            framePreExposure = heldPreExposure;
+        } else {
+            framePreExposure = reset ? 1.0f : computePreExposure();
+        }
+    }
+
+    /** Freeze or resume automatic exposure; see {@link #held}. */
+    public void setHold(boolean value) {
+        if (held == value) {
+            return;
+        }
+        held = value;
+        if (held) {
+            heldPreExposure = framePreExposure;
+        }
     }
 
     /** Request a GPU-side history reset on the next auto-exposure frame. */
@@ -628,6 +668,17 @@ public final class RtExposure {
             return lift == 0.0f ? this
                     : new ExposureCurve(scene0, compensation0 + lift, scene1, compensation1 + lift,
                             scene2, compensation2, scene3, compensation3);
+        }
+
+        /**
+         * Shift every control point by {@code ev}: positive brightens the whole frame, negative darkens
+         * it. The night lift moves only the two low points, because it exists to open the shadows; this
+         * one moves all four, because a weather change is a change of light level over the whole range.
+         */
+        ExposureCurve withExposureShift(float ev) {
+            return ev == 0.0f ? this
+                    : new ExposureCurve(scene0, compensation0 + ev, scene1, compensation1 + ev,
+                            scene2, compensation2 + ev, scene3, compensation3 + ev);
         }
 
         float compensationAt(float sceneEv) {

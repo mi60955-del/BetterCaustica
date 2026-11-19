@@ -27,9 +27,9 @@ import net.minecraft.resources.Identifier;
  *
  * <p>The still-render binding is the other half of the same idea: the picture worth keeping is the one in
  * front of the player, so averaging it cannot ask them to stop the world, leave the world, or rebuild it
- * through a settings screen. Counting frames, restarting on a camera move and saving live in
- * {@link RtStillRender}; the press only starts a run or drops the one in flight, and the ticks give the run
- * the moments it needs to resolve.
+ * through a settings screen. Counting frames, showing the mean, restarting on a camera move and saving live
+ * in {@link RtStillRender}; the press starts a run or ends the one in flight by saving what it has summed,
+ * and the ticks give the run the moments it needs to resolve and to put the window back.
  */
 public final class CausticaHotkeys {
 	private static final String TOGGLE_RT_TRANSLATION = "key.caustica.toggle-rt";

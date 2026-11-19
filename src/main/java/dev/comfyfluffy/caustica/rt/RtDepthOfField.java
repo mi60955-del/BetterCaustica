@@ -127,13 +127,29 @@ final class RtDepthOfField {
     }
 
     /**
-     * One frame of the rack: exponential approach, so the plane covers the same fraction of its remaining
-     * distance per second whatever the frame rate is, and a hitch cannot jump it further than a steady
-     * frame would. {@code rackSeconds} is the time constant the settings dial names.
+     * The rate that leaves one percent of the dioptric distance after one {@code rackSeconds}: {@code ln 100}.
+     * The dial names a duration, so the glide is tuned to have arrived when it elapses instead of having
+     * covered 63% of the way, which is what a bare time constant answers — and a dial a player reads in
+     * seconds has to mean the seconds they can watch.
+     */
+    private static final float RACK_LANDING = 4.6f;
+
+    /**
+     * One frame of the rack, in dioptres rather than in blocks: a surface at range {@code s} sits off the
+     * plane by {@code |1/s - 1/f|}, so the reciprocal metre is what the picture blurs by and therefore the
+     * quantity that has to move evenly. Racking in blocks spends the far half of a move on a fraction of a
+     * dioptre nothing on screen can show and rushes the near half, which reads as a pull that hangs, then
+     * snaps, then crawls. Exponential in dioptres, so the plane covers the same share of the defocus it has
+     * left whatever the frame rate is, a hitch cannot jump it further than a steady frame would, and the
+     * same dial answers with the same duration in both directions. It cannot overshoot: the answer is a
+     * weighted mean of two positive reciprocals.
      */
     static float rackFocus(float current, float target, float frameSeconds, float rackSeconds) {
-        float approach = 1.0f - (float) Math.exp(-Math.max(0.0f, frameSeconds) / rackSeconds);
-        return current + (target - current) * approach;
+        float from = 1.0f / current;
+        float to = 1.0f / target;
+        float approach = 1.0f - (float) Math.exp(
+                -RACK_LANDING * Math.max(0.0f, frameSeconds) / rackSeconds);
+        return 1.0f / (from + (to - from) * approach);
     }
 
     /**

@@ -15,7 +15,13 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
 
 由 island_i 维护。在上游 Caustica 的基础上：
 
-- 体积雾与体积云：异质体积噪声、随天气增厚的云层、九种烘焙云形状与体积质量预设
+- 体积雾与四层程序化云层（低层积云、高耸积云、高层云与卷曲扭曲的卷云），
+  带异质体积噪声、随天气增厚、出散射与体积质量预设
+- 画进光追画面的雨丝，含天气压暗、随雨浸润并在雨停后缓慢变干的表面，
+  以及平坦地面上的积水
+- 按通道吸收的水体介质，水下太阳光束跑在同一套散射上
+- Distant Horizons LOD：把 DH 的远方地形网格化进光追场景，地平线因此跟随
+  DH 的渲染距离而不是原版的
 - 独立于体积雾的太阳光束（丁达尔光），并带独立的水下光束控制（默认关闭以节省帧时间）
 - 锐化与镜头光晕后期效果
 - 面向 LabPBR 高度图的视差样式（锐利/平滑）与视差自阴影
@@ -26,6 +32,10 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
 - 简体中文与繁体中文选项翻译
 - Mod Menu 与 Sodium Config API 设置入口
 - 游戏内光线追踪开关（默认 F9）
+- 累积静帧渲染（默认 F10）：把正在查看的若干帧平均成一张 PNG，游戏继续运行
+  ——可以无限累积、可用自己的分辨率、可降噪——DLSS-RR 与帧生成保持原样
+- 间接光的辐照度缓存与间接光降采样，两者默认关闭
+- 把光追通道的世界矩阵转交给 Xaero 小地图的路径点标记
 
 光线追踪核心、DLSS 支持与 ACES HDR 管线来自上游。
 
@@ -45,7 +55,9 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
 ## 功能
 
 - Vulkan 硬件路径追踪世界渲染
-- 体积雾、烘焙体积云，以及晴空/水下太阳光束
+- 体积雾、程序化体积云、水体介质与晴空/水下太阳光束
+- 雨丝、天气压暗、随雨浸润并缓慢变干的表面与积水
+- 作为 LOD 几何网格化进光追场景的 Distant Horizons 远方地形
 - 后期效果：锐化、镜头光晕、泛光强度与 AgX 色调控制
 - DLSS 光线重建支持，包含透明层与引导缓冲修复
 - 通过 DLSS（NVIDIA，实验性）或 FSR（任意 Vulkan 1.3 设备）进行帧生成
@@ -53,7 +65,7 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
 - 动态实体渲染：受伤/生成闪光叠加、附魔光泽与纹理槽位回收
 - 视差高度映射：锐利/平滑样式与自阴影
 - LabPBR 风格材质支持
-- OMM（不透明度微图）+ SER（着色器执行重排序）优化
+- SER（着色器执行重排序），用于连贯的二次光线
 - 游戏内光线追踪开关，以及 Mod Menu / Sodium Config 设置界面
 
 ## 需求
@@ -64,6 +76,7 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
 - HDR 输出需要支持 HDR 的显示设备，并在系统中开启 HDR 模式
 - Linux 上的 HDR 输出需要支持 HDR 的 Wayland 合成器与原生 Wayland 会话
 - 安装 LabPBR 资源包（如 [SPBR](https://modrinth.com/resourcepack/spbr)）以获得更好的画面
+- 可选：安装 [Distant Horizons](https://modrinth.com/mod/distanthorizons) 以使用远方地形的 LOD
 
 ## 安装
 
@@ -79,7 +92,9 @@ BetterCaustica 是 [ComfyFluffy](https://github.com/ComfyFluffy) 的
    帧生成都不受影响。
 5. 使用 Vulkan 图形后端启动游戏。
 6. 打开视频设置调整渲染器选项，或在游戏内按 F9 切换光线追踪（可在
-   “控制 → Caustica” 中改键）。
+   “控制 → Caustica” 中改键）。按 F10 把配置数量的帧平均成 `screenshots/`
+   里的一张截图；运行期间保持相机不动，再按一次即放弃本次运行（开启无限静帧渲染时，
+   那一次按下会完成并保存）。
 
 BetterCaustica 会替代上游 Caustica 安装：两个 jar 共用 `caustica` 系统属性命名空间，
 因此请先移除 Caustica。
@@ -129,7 +144,7 @@ Caustica 的项目自有源代码与文档采用 GNU Lesser General Public Licen
 - [x] 体积雾与体积云（本分支）
 - [ ] 面向非 NVIDIA GPU 的 NRD 降噪
 - [x] 面向非 NVIDIA GPU 的 FSR 帧生成（本分支）
-- [ ] LOD
+- [x] LOD（本分支）
 - [x] ReSTIR 发光体重采样
 - [ ] ReSTIR 时序蓄水池复用（已实现且可开关；目前测得的噪声高于每帧重新采样，
       价值尚未证实）

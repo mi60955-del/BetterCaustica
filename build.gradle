@@ -84,6 +84,12 @@ dependencies {
 	// player has neither installed.
 	compileOnly "net.caffeinemc:sodium-fabric:0.9.1+mc26.2"
 	compileOnly "com.terraformersmc:modmenu:20.0.1"
+	// Distant Horizons: compile-only, and unlike the two above the bridge class cannot even link
+	// without DH — its fields name DH API types, so the JVM rejects DhBridge during verification with
+	// a NoClassDefFoundError before any isModLoaded guard inside it could run. Callers gate on
+	// DhPresence.present() and never name DhBridge when it is false, so the shipped jar works without
+	// DH installed.
+	compileOnly files("third_party/distant-horizons/DistantHorizons-3.3.3-26.2-fabric-neoforge.jar")
 
 	// Sodium rejects an incomplete option by crashing the client while it registers configs, so the test
 	// source set builds the real option tree. The shipped jar still carries neither as a runtime dep.
@@ -164,6 +170,19 @@ abstract class CompileShaders extends DefaultTask {
 			}
 			validate(spv)
 		}
+		def noCloudDefines = ["-DCAUSTICA_NO_CLOUD_PATH", "-DCAUSTICA_NO_VISIBLE_CLOUD_PATH"]
+		def shadowOnlyDefines = ["-DCAUSTICA_NO_VISIBLE_CLOUD_PATH"]
+		def noMarchDefines = ["-DCAUSTICA_NO_MARCH_PATH"]
+		def leanDefines = ["-DCAUSTICA_NO_VOLUME_PATH"] + noCloudDefines
+		// The radiance-probe grid is inert while Radiance Cache is off, but its inlined gather code
+		// still holds registers in the raygen, so the lean tier gets a probe-free twin for that case.
+		def noProbeDefines = ["-DCAUSTICA_NO_PROBE_PATH"]
+		def leanNoProbeDefines = leanDefines + noProbeDefines
+		// ReSTIR only runs while Ris Candidates is above zero; its inlined reservoir code otherwise costs
+		// the raygen a large slice of its live state around every shadow ray.
+		def noRisDefines = ["-DCAUSTICA_NO_RIS_PATH"]
+		def leanFastDefines = leanDefines + noProbeDefines + noRisDefines
+		def serDefines = ["-DCAUSTICA_ENABLE_EXT_SER", "-capability", "spvShaderInvocationReorderEXT"]
 		def shaderFiles = srcDir.get().asFileTree.matching {
 			include stageIncludes
 		}.files.sort { it.absolutePath }
@@ -186,27 +205,70 @@ abstract class CompileShaders extends DefaultTask {
 			def spv = new File(scratchDir, "${base}.spv")
 			def worldIndirectRaygen = base == "pipelines/world/indirect.rgen"
 			def worldPrimaryRaygen = base == "pipelines/world/primary.rgen"
+			def worldSkyMiss = base == "pipelines/world/sky.rmiss"
 			if (worldIndirectRaygen) {
-				// Keep a capability-free TraceRay fallback for devices without EXT SER, and
-				// publish the reordered variant separately when the extension is available.
+				// Ordinary and SER variants of each compile-time tier. The no-cloud records keep
+				// fog/shaft/edge integrals but stub every cloud function; shadow-only records keep
+				// the NEE/fog/shaft shadow field and remove the visible cloud layer; the no-march
+				// records are the same tiers with the heterogeneous fog integrator compiled out, so a
+				// frame that never marches does not carry its registers in the raygen.
 				compileOneSlang(src, spv, [])
 				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_ser.rgen.spv"),
-						["-DCAUSTICA_ENABLE_EXT_SER", "-capability", "spvShaderInvocationReorderEXT"])
-				// Volume-free twin of this pass: the volumetric scatter calls compile out entirely, so the
-				// raygen carries no fog/water code. It is selected at trace time when every volumetric
-				// switch is off, which is what makes "off" free instead of merely not executing — the
-				// unused code still costs registers, and that cost was 5 ms of the frame.
+						serDefines)
 				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean.rgen.spv"),
-						["-DCAUSTICA_NO_VOLUME_PATH"])
+						leanDefines)
 				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean_ser.rgen.spv"),
-						["-DCAUSTICA_NO_VOLUME_PATH", "-DCAUSTICA_ENABLE_EXT_SER",
-						 "-capability", "spvShaderInvocationReorderEXT"])
+						leanDefines + serDefines)
+				// Probe-free twin of the lean tier, dispatched while Radiance Cache is off.
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean_noprobe.rgen.spv"),
+						leanNoProbeDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean_noprobe_ser.rgen.spv"),
+						leanNoProbeDefines + serDefines)
+				// Lean tier with both inert features compiled out, dispatched while Radiance Cache and
+				// Ris Candidates are both off.
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean_fast.rgen.spv"),
+						leanFastDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_lean_fast_ser.rgen.spv"),
+						leanFastDefines + serDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_no_cloud.rgen.spv"),
+						noCloudDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_no_cloud_ser.rgen.spv"),
+						noCloudDefines + serDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_shadow_only.rgen.spv"),
+						shadowOnlyDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_shadow_only_ser.rgen.spv"),
+						shadowOnlyDefines + serDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_no_march.rgen.spv"),
+						noMarchDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_no_march_ser.rgen.spv"),
+						noMarchDefines + serDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_no_cloud_no_march.rgen.spv"),
+						noCloudDefines + noMarchDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_no_cloud_no_march_ser.rgen.spv"),
+						noCloudDefines + noMarchDefines + serDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_shadow_only_no_march.rgen.spv"),
+						shadowOnlyDefines + noMarchDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_shadow_only_no_march_ser.rgen.spv"),
+						shadowOnlyDefines + noMarchDefines + serDefines)
 			} else if (worldPrimaryRaygen) {
 				compileOneSlang(src, spv, [])
 				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_lean.rgen.spv"),
-						["-DCAUSTICA_NO_VOLUME_PATH"])
+						leanDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_no_cloud.rgen.spv"),
+						noCloudDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_shadow_only.rgen.spv"),
+						shadowOnlyDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_no_march.rgen.spv"),
+						noMarchDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_no_cloud_no_march.rgen.spv"),
+						noCloudDefines + noMarchDefines)
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/primary_shadow_only_no_march.rgen.spv"),
+						shadowOnlyDefines + noMarchDefines)
+			} else if (worldSkyMiss) {
+				compileOneSlang(src, spv, [])
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/sky_no_cloud.rmiss.spv"),
+						noCloudDefines)
 			} else {
-				// Pass A intentionally uses ordinary TraceRay.
 				compileOneSlang(src, spv, [])
 			}
 		}

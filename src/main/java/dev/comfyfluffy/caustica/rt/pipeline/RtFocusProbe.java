@@ -34,9 +34,9 @@ import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.DOF_FOCUS_METER;
  * <p>The answer is a GPU value the host cannot use this frame — reading it now would stall on the trace
  * that produced it. So each frame copies it into its own slot of a ring and the host consumes a slot only
  * once that frame's graphics timeline value has completed, which is the same shape
- * {@link RtExposure} uses for its controller state. The measurement is therefore a handful of frames old,
- * and that is invisible: the focal plane glides to its target over
- * {@code dof.rack-time}, which is longer than the ring.
+ * {@link RtExposure} uses for its controller state. The measurement is therefore a handful of frames old, and
+ * every frame brings a fresh one, so the glide chases an answer that moves rather than a staircase of jumps:
+ * the age reads as lag on the pull, and {@code dof.rack-time} decides how much of that lag a player watches.
  *
  * <p>Metering the traced depth rather than raycasting the block state is what makes the focus match the
  * picture. A block-shape probe can only ever answer one block's voxel face, so it walks through entities,

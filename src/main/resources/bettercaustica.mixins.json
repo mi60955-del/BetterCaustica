@@ -18,6 +18,7 @@
 		"ModelPartAccessor",
 		"OptionsSubScreenAccessor",
 		"ParticleEngineAccessor",
+		"ParticleAccessor",
 		"RenderSetupAccessor",
 		"RenderTypeAccessor",
 		"ScreenshotMixin",

@@ -55,6 +55,11 @@ public struct WorldPushConstants {
     // instead of a materialToggles bit: the switches answer "is this feature on" and this answers "which
     // one", and a frame of either style draws the same set of features.
     public int parallaxStyle;
+    // xy the terrain origin reduced mod 4096 — the same anchor the water waves use, and periodic in the
+    // puddle field's own 4096-block lattice, so a rebase never shifts a puddle. z the Puddle Coverage dial
+    // (0 = no standing water); w reserved. The anchor rides here rather than through WorldPush because the
+    // closest-hit material path must not pay an extra device load per hit for a frame constant.
+    public float4 puddleParams;
 };
 
 // materialToggles bits. Each one gates a material feature the renderer would otherwise apply whenever the
@@ -79,22 +84,17 @@ public static const int PARALLAX_STYLE_SHARP = 1;
 // The world border's haze joins the height fog's medium instead of bringing its own bit: Java sets this
 // one when either is on, and every consumer that asks "is there air fog on this segment" gets both.
 public static const uint WORLD_FLAG_FOG = 1u << 7u;           // analytic/marched height fog + border haze
-public static const uint WORLD_FLAG_CLOUD = 1u << 8u;         // planar + volumetric cloud layer
-public static const uint WORLD_FLAG_SPRAY = 1u << 9u;         // water-surface spray band
+public static const uint WORLD_FLAG_CLOUD = 1u << 8u;         // visible cloud layer (sheet, walk, out-scatter)
+public static const uint WORLD_FLAG_WATER_FOG = 1u << 9u;      // the water body's own in-scatter
 public static const uint WORLD_FLAG_VOLUME_SHADOW = 1u << 10u; // fog in-scatter's sun shadow ray
 public static const uint WORLD_FLAG_VOLUME_MARCH = 1u << 11u;  // marched tier (clear = analytic)
 public static const uint WORLD_FLAG_VOLUME_DEBUG = 1u << 12u;  // write the volume debug image
-// Volumetric cloud slab (Phase 5): with this up the cloud layer is walked through instead of crossed
-// once. It is a separate bit from WORLD_FLAG_CLOUD on purpose — the planar sheet stays the base tier and
-// the fallback, and every consumer that only needs the layer's mean opacity (the NEE probes, the fog sun
-// legs, the continuation-ray attenuation) keeps reading it through WORLD_FLAG_CLOUD either way.
+// Volumetric cloud slab: with this up the visible cloud layer is walked through instead of crossed
+// once. It is a separate bit from WORLD_FLAG_CLOUD on purpose — the planar sheet stays the fallback.
+// The shadow field is an independent consumer and reads WORLD_FLAG_CLOUD_SHADOW instead.
 public static const uint WORLD_FLAG_CLOUD_VOLUMETRIC = 1u << 13u;
 // Clear-air sun shafts (the god-ray layer that does not need the height fog to exist).
 public static const uint WORLD_FLAG_SHAFTS = 1u << 14u;
-// The cloud layer's shape source: up means the instance grid draws from the whole baked atlas
-// instead of the Cloud Type slider. Only volume.slang's density reads it; the level, the tiers and
-// the shadow probes are untouched by it.
-public static const uint WORLD_FLAG_CLOUD_RANDOM = 1u << 15u;
 // The render edge's fade (volume.slang's edge section). Deliberately independent of WORLD_FLAG_FOG: the
 // fade is a blend of the finished segment toward the sky, not a medium, so it works with every volumetric
 // switch off. The host still routes such a frame to the full raygen records, whose code carries it.
@@ -105,6 +105,20 @@ public static const uint WORLD_FLAG_EDGE_FADE = 1u << 16u;
 // RtComposite), because the same image is the per-pixel blur ceiling's history and a manual focus has no
 // meter to serve.
 public static const uint WORLD_FLAG_DOF_REFLECTION = 1u << 17u;
+// The cloud deck's out-scattering on rays that terminate on geometry. sky.rmiss only shades rays that
+// escape to the sky, so without this the deck is invisible in front of a surface: terrain seen from
+// above it, and a reflection or refraction that ends on a hillside behind it. Those segments get the
+// sheet's own scattered radiance plus its Beer-Lambert transmittance over the part of the segment that
+// actually crosses the layer.
+public static const uint WORLD_FLAG_CLOUD_OUTSCATTER = 1u << 18u;
+// Path-continuation Russian roulette kill switch. Up means the two roulette sites in indirect.rgen
+// let every path run to the bounce cap: unbiased for A/B comparisons of deeper-bounce changes, at
+// the cost of the frames the roulette was saving. Clear (the default) keeps the estimator as tuned.
+public static const uint WORLD_FLAG_RR_DISABLED = 1u << 19u;
+// The cloud layer's shadow field, shared by NEE, fog sun legs and sun shafts. It is independent of
+// WORLD_FLAG_CLOUD: looking away from the sky can keep ground shadows while the visible layer is off,
+// and a frame with no visible cloud and no relevant ground shadow can select a no-cloud raygen.
+public static const uint WORLD_FLAG_CLOUD_SHADOW = 1u << 20u;
 
 // Minimal push block for the compute passes that only need to dereference the frame's WorldPush: the sky
 // LUT bakes read sun/moon/look state from the same BDA slot the trace does, so there is exactly one
@@ -200,6 +214,13 @@ public struct WorldPush {
     // Effective-sample ceiling the temporal merge may accumulate to. Equal to risCandidates it degenerates
     // to single-frame shading; 0 is treated the same way rather than as an unbounded history.
     public uint     risTemporalHistory;
+    // Emitter shadow rays stop being traced at vertices whose indirect depth is at least this value,
+    // trading occlusion accuracy in the dimmer indirect light for frame time. 0 keeps every ray.
+    public uint     shadowSkipDepth;
+    // Indirect subsampling factor. 0 traces every pixel; 2 traces every second pixel per axis and 3 traces
+    // two of every three, leaving the remaining pixels to the upsample raygen. The traced pixels keep their
+    // full-resolution index for the path queue, the guides and the reservoir.
+    public uint     indirectSubsample;
     // Pre-exposure scalar applied to radiance at the outImage write
     // ONLY, so all light transport above stays in absolute scene units. Keeps stored fp16 values
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
@@ -216,9 +237,10 @@ public struct WorldPush {
     public float    endPortalTime;
     // ---- Volumetric block (see volume.slang). Every field is zero while its feature is off, so a
     // default frame pushes an inert block and the shaders gate on the flags bits before reading it.
-    // x fog extinction at the base (1/block), y height scale H (block), z fog base height (REBASED
-    // blocks — Java subtracts the terrain origin, the same anchoring waterAnchor uses), w Henyey–
-    // Greenstein anisotropy.
+    // x Rayleigh density at the base (1/block — volume.slang multiplies it by FOG_RAYLEIGH_COEFF, so
+    // a value of 0.0005 becomes an extinction of ~0.46/block in blue and ~0.12 in red), y height scale
+    // H (block), z fog base height (REBASED blocks — Java subtracts the terrain origin, the same
+    // anchoring waterAnchor uses), w Henyey–Greenstein anisotropy (0 for Rayleigh air).
     public float4   fog0;
     // x/z the Java-accumulated wind drift (blocks, per axis, each axis pre-wrapped in whole
     // 4096-block periods — the fog lattice's exact period, so a wrap is invisible by
@@ -227,28 +249,35 @@ public struct WorldPush {
     public float4   fog1;
     // xyz single-scatter albedo (ACEScg linear, also the sigmaS/sigmaT ratio), w ambient-term weight.
     public float4   fogColor;
-    // x coverage, y cloud base (rebased blocks), z layer thickness (block), w density multiplier.
+    // x the cloud stack's coverage threshold (0 = inert: every consumer early-outs, which is what the
+    // whole block rides on), y the cumulus base (rebased blocks), z the height scale the two cumulus
+    // decks derive from, w the density multiplier.
     public float4   cloud0;
-    // x the cloud shape index — which baked volume (RtCloudVolumes order) every instance of the
-    // layer renders; y the weather swell 0..1 (Rain Boost x storm — rain widens the footprints
-    // instead of lifting the coverage gate), z the per-instance scale/occupancy jitter strength, w
-    // the sheet's fade distance (blocks; sheet-only — the shadow field never dissolves).
+    // x the volumetric tier's sun-leg sample count (0 = inert, clamped to 1: the single midpoint tap
+    // the tier shipped with; only the march reads it), y the weather's share of the
+    // coverage lift above 0..1, z the patchiness (how far the large field outweighs the fine one), w
+    // the visible layer's fade distance (blocks; the shadow field has no per-ray fade, its relevance
+    // is decided by the host's cloud-shadow gate).
     public float4   cloud1;
-    // xy the EXACT terrain origin in world blocks (fp32; the streak lattice is not
-    // periodic, so unlike the wave domain's mod-4096 anchor this one must not wrap), zw the
-    // Java-accumulated cloud wind drift per axis (unwrapped; the accumulator is a double and only
-    // sheds sub-block precision past millions of blocks of drift).
+    // xy the EXACT terrain origin in world blocks (fp32; the noise tiles are sampled in absolute
+    // world XZ, so this anchor must not wrap), zw the Java-accumulated cloud wind drift per axis
+    // (unwrapped; the accumulator is a double and only sheds sub-block precision past millions of
+    // blocks of drift).
     public float4   cloud2;
-    // x the cloud footprint in blocks (the Cloud Size dial; the instance grid spaces by it), y the
-    // atlas's LAST shape index — the clamp for the shader's per-instance shape variety (0 while clouds
-    // are off), z the flow phase (seconds Java-accumulated on the wave clock behind the flow dial,
-    // wrapped to stay inside fp32's precise range), w the deck's ambient-term weight.
+    // x the horizontal noise scale as a multiple of the layer tables' authored footprint, y the detail
+    // dial (1 = the close view's erosion cut and the cirrus filament curl, 0 = the smooth un-eroded
+    // body and unwarped sheet the shadow field and light legs read), z the flow phase (seconds
+    // Java-accumulated on the wave clock behind the flow dial, wrapped to
+    // stay inside fp32's precise range; it scrolls the fine detail against the body), w the deck's
+    // ambient-term weight.
     public float4   cloudColor;
-    // x rain level 0..1, y thunder level 0..1, z spray strength, w the previous frame's rain level
+    // x rain level 0..1, y thunder level 0..1, z the Rain Sky Darkening dial 0..1 (how much the weather
+    // dims the sky; 0 leaves the atmosphere clear above a storm), w the previous frame's rain level
     // (temporal-stability work interpolates toward it rather than jumping on a weather change).
     public float4   weather;
-    // x march step count, y jitter strength 0..1, z max integration distance (block, 0 = ray tmax),
-    // w reserved.
+    // x the fog march's step count, y its jitter strength 0..1, z the cloud shadow field's per-deck
+    // sample count (0 = inert, clamped to 1: the single mid-plane crossing the field shipped with),
+    // w the volumetric cloud slab's step budget (0 = the planar fallback).
     public float4   volumeParams;
     // ---- The world border's haze. x extinction (1/block; 0 = the feature is off, the same zero-when-inert
     // invariant the rest of the block keeps), yzw reserved. It is a flat addition to the height fog's medium
@@ -266,12 +295,12 @@ public struct WorldPush {
     // the sky behind the ray (see volume.slang's edge-fade section). Its distances are measured from the
     // camera, which is what makes a reflection of the far world carry the same fade the direct view does.
     public float4   edgeFade;
-    // ---- Water-volume block (the water medium's own scattering + the spray band). x turbidity, the
-    // water's single-scatter fraction sigmaS/sigmaT in 0..1 (0 = the feature is off, the same
-    // zero-when-inert invariant the rest of the block keeps); y the Henyey–Greenstein g of the
-    // water's phase; z spray band height in blocks; w the spray band's base height in REBASED blocks
-    // (the sea level minus the terrain origin, the same anchoring fog0.z uses). The spray strength
-    // itself rides weather.z, whose lane the plan reserves for it.
+    // ---- Water-volume block (the water body's own medium). x the body's single-scatter fraction
+    // sigmaS/sigmaT in 0..1 (0 = the fog is off, the same zero-when-inert invariant the rest of the
+    // block keeps); y the Henyey–Greenstein g of the body's phase; z the sky term's weight, a multiple
+    // of the irradiance the surface lets through; w the surface plane the ambient term attenuates
+    // against, in REBASED blocks (the sea level minus the terrain origin, the same anchoring fog0.z
+    // uses). yz are read only through x, so a zero x leaves them inert.
     public float4   water1;
     // ---- Clear-air sun shafts (volume.slang's shaft integrator). x extinction (1/block; 0 = the
     // feature is off, the same zero-when-inert invariant the rest of the block keeps), y the
@@ -311,6 +340,27 @@ public struct WorldPush {
     // reconstruction guides describe the surface this pixel is standing in front of rather than whichever
     // point the aperture happened to sample this frame.
     public float4   dof;
+    // The cat-eye's strength, 0..1: how much the barrel eclipses the opening for bundles arriving
+    // toward the frame's edges. Off-axis the lens samples inside the overlap of the aperture and the
+    // barrel's opening displaced toward the frame's centre, so the bokeh the traced lens draws keeps
+    // the aperture's own round arc on the centre-facing side and bites into the outer side, deepening
+    // to the crescent a wide-open lens puts on corner highlights. Zero keeps the full disc -- the
+    // plain thin lens.
+    public float    dofCatEye;
+    // The field swirl's strength, 0..1: off-axis astigmatism compresses each aperture sample's radial
+    // component, so the bokeh a run of pupil points averages into stretches tangentially around the
+    // frame's centre. It grows with the square of the field angle, is round on the axis, and never
+    // moves a sample outside the aperture. Zero keeps the plain thin lens's circular disc.
+    public float    dofSwirl;
+    // Indirect radiance probes. probeGridAddr is the BDA base of the pair of L1 SH probe arrays: the frame
+    // writes the half opposite probeParity and every query reads the half probeParity names, so a path can
+    // read a complete previous frame while the current one is being refreshed. probeOrigin.xyz is the
+    // (0,0,0) probe's lower corner in rebased blocks and .w the probe spacing; a zero probeEnabled leaves
+    // the walk tracing its full depth.
+    public uint64_t probeGridAddr;
+    public float4   probeOrigin;
+    public uint     probeParity;
+    public uint     probeEnabled;
 };
 
 // Direction toward a celestial body sitting `angleRad` along its arc, tilted by the dimension's noon tilt.
@@ -370,6 +420,11 @@ public static const uint TERRAIN_PRIM_IN_LIGHT_BUFFER = 1u;
 // (a pane, a decorative layer), so the face never bounds a volume — see PAYLOAD_DIELECTRIC_THIN. Set by
 // RtTerrainMesher, which is the only place that knows the block's shape.
 public static const uint TERRAIN_PRIM_THIN_DIELECTRIC = 2u;
+// TerrainPrim.materialId sentinel for Distant Horizons LOD cells. Chosen as the bit pattern of Float.MAX
+// (a normal float), so it survives the float-lane round trip through the prim buffer unchanged and can
+// never collide with a real material-table index. RtDhLodScene's mesher stamps it; world.rchit branches
+// to the flat-colour LOD path on it before any material-table dereference.
+public static const uint MATERIAL_ID_LOD = 0x7F7FFFFFu;
 
 // Largest finite half. Producers of fp16 HDR storage clamp to this instead of letting the conversion
 // round up to +inf and propagate as NaN — world.rgen's rgba16f outImage store most of all, which is the
@@ -446,6 +501,11 @@ public static const uint PAYLOAD_GUIDE_STABLE = 512u;
 // glint as an additive pass over exactly this surface, so the overlay's radiance rides the payload's
 // overlay lane and the raygen adds it once alongside this hit's shading.
 public static const uint PAYLOAD_GLINT_OVERLAY = 2048u;
+// Set on a Distant Horizons LOD cell hit. LOD cells are the replacement far field beyond the traced
+// world, so the render-edge fade must not dissolve them into the sky (the fade's whole job is to hide
+// the traced world's END, and LOD terrain is what now stands there). Fog still applies: it is a real
+// medium between the eye and the hit. Set together with PAYLOAD_DIELECTRIC_THIN for LOD water.
+public static const uint PAYLOAD_LOD = 4096u;
 public static const uint PAYLOAD_EMISSION_SOURCE_SHIFT = 4u;
 public static const uint PAYLOAD_EMISSION_SOURCE_MASK = 7u;
 public static const uint EMISSION_SOURCE_NONE = 0u;

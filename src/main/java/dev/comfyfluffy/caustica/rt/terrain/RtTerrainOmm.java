@@ -54,14 +54,19 @@ final class RtTerrainOmm {
     private static final AtomicLong OMM_STATS_DISABLED_SECTIONS = new AtomicLong();
     private static final AtomicLong OMM_STATS_LAST_LOG = new AtomicLong();
 
+    /** Micromap subdivision level, as an exponent: 4 is a 16x16 micro-triangle grid per triangle. */
+    private static final int SUBDIVISION = 4;
+    /** Periodic classification summary in the log. Off: the counters below only feed the crash report. */
+    private static final boolean STATS = false;
+
     private RtTerrainOmm() {}
 
     private static int ommSubdivision() {
-        return CausticaConfig.Rt.Omm.SUBDIVISION.value();
+        return SUBDIVISION;
     }
 
     private static boolean ommStats() {
-        return CausticaConfig.Rt.Omm.STATS.value();
+        return STATS;
     }
 
     /** Drop all cached triangle classifications; call on resource reload when sprite pixels may change. */

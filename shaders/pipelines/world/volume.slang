@@ -37,75 +37,87 @@ public VolumeSample emptyVolumeSample() {
 
 // ---- Analytic height fog ---------------------------------------------------------------------------
 //
-// Density falls exponentially above the fog base and is constant below it:
-//     sigma_t(y) = sigma0 * exp(-max(0, y - baseY) / H)
-// baseY arrives already rebased into terrain coordinates (Java subtracts the terrain origin, the same
-// anchoring waterAnchor uses), so the profile stays pinned to the world as the terrain rebase shifts.
-// The fog's scattering fraction lives Java-side (volume.fog-albedo, default 0.85) and arrives inside
-// fogColor.rgb — the shader must not re-scale it.
+// The medium is Rayleigh air: a height profile times a per-channel coefficient.
+//
+//     sigma_t(p) = rho(y) * FOG_RAYLEIGH_COEFF
+//     rho(y)     = density0 * exp(-max(0, y - baseY) / H)
+//
+// The profile falls exponentially above the fog base and is constant below it; baseY arrives already
+// rebased into terrain coordinates (Java subtracts the terrain origin, the same anchoring waterAnchor
+// uses), so the profile stays pinned to the world as the terrain rebase shifts.
+//
+// The coefficient carries the colour, and that is the point of the term: blue is extinguished about
+// four times faster than red per block, so distance blues the terrain out while the low sun reddens
+// through the same air — the aerial perspective every landscape has. At the default 0.0078 the
+// e-folding distance is 280 blocks for blue and 1.1 km for red. FOG_RAYLEIGH_COEFF is that
+// coefficient in ACEScg, the push's working space, which is what makes a white surface lose each
+// channel at the rate the source filter says; AP1's primaries are far wider than Rec.709's, so the
+// same filter reads different distances on this file's channels than Photon's Rec.709 ones.
+//
+// The fog's scattering fraction lives Java-side (volume.fog-albedo) and arrives inside fogColor.rgb —
+// the shader must not re-scale it.
+
+// Photon's Rayleigh air: from_srgb(0.31, 0.67, 1.00) in linear Rec.709 times the 0.5 its airmass
+// integral folds in, carried through the push's Rec.709 -> ACEScg matrix. 1/block per unit of pushed
+// density.
+public static const float3 FOG_RAYLEIGH_COEFF = float3(0.116688, 0.195699, 0.457982);
+// Largest channel. The marched tier's significant-band bound has to hold for the channel that dies
+// first, so it prices density against this coefficient.
+public static const float FOG_RAYLEIGH_PEAK = 0.457982;
+// ACEScg luminance of the coefficient (AP1 weights 0.2722/0.6741/0.0537): the scalar proxy wherever
+// one number has to stand for the medium — the sun-probe strata, the shaft attenuation, the volume
+// debug image.
+public static const float FOG_RAYLEIGH_MEAN = 0.188272;
 
 // Closed-form depth of the pure-exponential stretch: starts `above` blocks above the base and travels
 // `len` along the vertical component dirY without crossing the base. Positive for either dirY sign.
 // For dirY < 0 the two signed factors cancel, so the large intermediate exp(above/H) only ever loses
-// precision, never overflows.
-public float fogExpStretchDepth(float sigma0, float heightH, float above, float dirY, float len) {
-    return sigma0 * exp(-max(above, 0.0) / heightH) * (heightH / dirY)
+// precision, never overflows. `density0` is the profile's value at the base, not an extinction: the
+// coefficient multiplies it at the call sites that need one.
+public float fogExpStretchDepth(float density0, float heightH, float above, float dirY, float len) {
+    return density0 * exp(-max(above, 0.0) / heightH) * (heightH / dirY)
             * (1.0 - exp(-dirY * len / heightH));
 }
 
-// Optical depth of the profile over [0, t] along a direction with vertical component dirY. Closed form,
-// so the analytic fog tier integrates with zero march samples and zero Monte-Carlo noise — the property
-// the RR pipeline and the low-end tier both lean on. The clamp at the base makes this piecewise: below
-// baseY the density is flat sigma0, above it the exponential integrates in closed form.
-public float fogOpticalDepth(float sigma0, float baseY, float heightH, float y0, float dirY, float t) {
+// Optical depth of the profile over [0, t] along a direction with vertical component dirY, in units of
+// the coefficient (multiply by FOG_RAYLEIGH_COEFF for the medium's own depth). Closed form, so the
+// analytic fog tier integrates with zero march samples and zero Monte-Carlo noise — the property the RR
+// pipeline and the low-end tier both lean on. The clamp at the base makes this piecewise: below baseY
+// the density is flat density0, above it the exponential integrates in closed form.
+public float fogOpticalDepth(float density0, float baseY, float heightH, float y0, float dirY, float t) {
     if (t <= 0.0) {
         return 0.0;
     }
     float above = y0 - baseY;
     if (abs(dirY) < 1.0e-6) {
-        return sigma0 * exp(-max(above, 0.0) / heightH) * t;
+        return density0 * exp(-max(above, 0.0) / heightH) * t;
     }
     if (dirY > 0.0) {
         if (above >= 0.0) {
-            return fogExpStretchDepth(sigma0, heightH, above, dirY, t);
+            return fogExpStretchDepth(density0, heightH, above, dirY, t);
         }
         float sBase = -above / dirY; // flat-density stretch from below the base up to baseY
         if (t <= sBase) {
-            return sigma0 * t;
+            return density0 * t;
         }
-        return sigma0 * sBase + fogExpStretchDepth(sigma0, heightH, 0.0, dirY, t - sBase);
+        return density0 * sBase + fogExpStretchDepth(density0, heightH, 0.0, dirY, t - sBase);
     }
     // dirY < 0
     if (above <= 0.0) {
-        return sigma0 * t;
+        return density0 * t;
     }
     float sBase = above / (-dirY); // exponential stretch from above the base down to baseY
     if (t <= sBase) {
-        return fogExpStretchDepth(sigma0, heightH, above, dirY, t);
+        return fogExpStretchDepth(density0, heightH, above, dirY, t);
     }
-    return fogExpStretchDepth(sigma0, heightH, above, dirY, sBase) + sigma0 * (t - sBase);
+    return fogExpStretchDepth(density0, heightH, above, dirY, sBase) + density0 * (t - sBase);
 }
 
-public float fogTransmittance(float sigma0, float baseY, float heightH, float y0, float dirY, float t) {
-    return exp(-fogOpticalDepth(sigma0, baseY, heightH, y0, dirY, t));
-}
-
-/**
- * Closed-form single-scatter in-scatter over [0, t], the analytic fog tier's whole lighting term:
- *
- *     L = albedo * (1 - T(t)) * (sunTerm + ambient)
- *
- * The identity integral[T(s)*sigma_t(s) ds] = 1 - T(t) (transmittance's own derivative) makes the marched
- * integral exact for ANY density profile as long as sigma_s/sigma_t stays at `albedo`, which the constant
- * fog albedo gives. `sunTerm` and `ambient` are radiance-shaped terms the caller assembles — the sun's
- * phase-weighted illuminance times its geometric visibility times the analytic transmittance toward it,
- * and the sky-irradiance ambient — so the shadow-ray count stays at one per pixel and no LUT access
- * happens inside this module.
- */
-public float3 fogInScatter(float3 albedo, float sigma0, float baseY, float heightH,
-                           float y0, float dirY, float t, float3 sunTerm, float3 ambient) {
-    float transmittance = fogTransmittance(sigma0, baseY, heightH, y0, dirY, t);
-    return albedo * ((1.0 - transmittance) * (sunTerm + ambient));
+// Per-channel transmittance of the height profile alone, with no border haze. This is the sun legs'
+// quantity: they deliberately exclude the flat term.
+public float3 fogTransmittanceRGB(float density0, float baseY, float heightH,
+                                  float y0, float dirY, float t) {
+    return exp(-fogOpticalDepth(density0, baseY, heightH, y0, dirY, t) * FOG_RAYLEIGH_COEFF);
 }
 
 // ---- The world border's haze -----------------------------------------------------------------------
@@ -116,7 +128,7 @@ public float3 fogInScatter(float3 albedo, float sigma0, float baseY, float heigh
 // terms and flag.
 //
 // Being an addition to sigma_t rather than a second layer is what makes it cheap and what makes it exact at
-// once: the identity integral[T(s)·sigma_t(s) ds] = 1 - T(t) that fogInScatter rests on holds for any
+// once: the identity integral[T(s)·sigma_t(s) ds] = 1 - T(t) the tiers' in-scatter rests on holds for any
 // profile, so it holds for the sum, and the closed form needs one multiply-add more rather than a second
 // exponential to compose two transmittances. Being flat is its only real difference from the height fog —
 // no stretch of air stays clear of it — which is also why the marched tier's span clamp has to stand down
@@ -133,18 +145,25 @@ public float3 fogInScatter(float3 albedo, float sigma0, float baseY, float heigh
 // too thin to see on the view ray. The border's job is to veil what the eye reaches, not to dim the sun.
 
 // The flat extinction the border adds to the air, in 1/block. Zero unless the border is within its ramp.
+// Deliberately NOT scaled by the Rayleigh coefficient: the veil is grey mist, not sky, and a haze that
+// reddened with distance the way the air does would read as weather rather than as the world ending.
 public float boundarySigma(WorldPush push) {
     return push.boundaryFog.x;
 }
 
-// Optical depth of the air the fog integrators actually walk: the height profile and the border's floor.
-// `ro` is camera-relative throughout the renderer.
-public float airOpticalDepth(float3 ro, float3 rd, float t) {
+// Optical depth of the air the fog integrators actually walk: the height profile's per-channel depth
+// plus the border's flat share. `ro` is camera-relative throughout the renderer.
+//
+// The tier's in-scatter rests on integral[T(s)*sigma_t(s) ds] = 1 - T(t) — transmittance's own
+// derivative — which holds for ANY profile as long as sigma_s/sigma_t stays at the scattering albedo.
+// That is what lets the closed form price the height profile and the flat term together with one
+// multiply-add and no march samples.
+public float3 airOpticalDepth(float3 ro, float3 rd, float t) {
     return fogOpticalDepth(worldPush.fog0.x, worldPush.fog0.z, worldPush.fog0.y, ro.y, rd.y, t)
-            + boundarySigma(worldPush) * t;
+            * FOG_RAYLEIGH_COEFF + boundarySigma(worldPush) * t;
 }
 
-public float airTransmittance(float3 ro, float3 rd, float t) {
+public float3 airTransmittance(float3 ro, float3 rd, float t) {
     return exp(-airOpticalDepth(ro, rd, t));
 }
 
@@ -258,41 +277,6 @@ float fogFbm(float3 p) {
     return sum / norm;
 }
 
-// ---- Spray band (the water surface's own mist layer) ------------------------------------------------
-//
-// A thin high-density band living just above the water surface, its density driven by the wave field
-// itself: crest steepness (the wave tilt's magnitude) is the density modulation, so spray gathers
-// where the surface is actually agitated. Rides the marched tier only — a wavefield-dependent density
-// has no closed form for the analytic tier to consume — and is gated by WORLD_FLAG_SPRAY, which Java
-// only sets when the marched fog tier is running.
-//
-// v1 geometry: the band hangs above ONE pushed sea-level plane (water1.w, rebased) rather than the
-// true per-position heightfield, because the air integrator has no water-presence knowledge per
-// sample. Consequences, both accepted for this tier: water surfaces well above sea level (mountain
-// lakes) get no spray, and low-lying terrain near sea level gets a whisper of the band where the
-// wave field is agitated. The band is 1.5 blocks and the modulation keeps most of it hugging zero,
-// so the approximation reads as coastal ground mist rather than a artefact. Default strength is 0 —
-// the whole term is opt-in.
-public static const float SPRAY_SIGMA = 0.35; // extinction at full strength and full crest (1/block)
-
-float sprayDensity(WorldPush push, float3 pos) {
-    if ((push.flags & WORLD_FLAG_SPRAY) == 0u) {
-        return 0.0;
-    }
-    float above = pos.y - push.water1.w;
-    float bandH = max(push.water1.z, 0.05);
-    if (above < 0.0 || above >= bandH) {
-        return 0.0;
-    }
-    float band = smoothstep(0.0, 0.35 * bandH, above) * (1.0 - smoothstep(0.6 * bandH, bandH, above));
-    // Crest steepness 0..1: the wave tilt (the same gradient the visible ripples use, scaled by the
-    // wave-height control like every other consumer) saturates the spray around ~0.12 slope.
-    float2 tilt = waterWaveTilt(pos.xz + push.waterAnchor.xy, push.water1.w,
-            push.waterParams.w, 0.0) * waterWaveControls().x;
-    float crest = clamp(length(tilt) * 8.0, 0.0, 1.0);
-    return push.weather.z * SPRAY_SIGMA * band * crest;
-}
-
 // The march tier's density at one point. Returns the plain analytic profile while the noise amplitude
 // is zero, so the marched integrator degenerates to integrating the analytic field.
 // The march tier's density at one point. Returns the plain analytic profile while the noise amplitude
@@ -308,7 +292,7 @@ public float fogMarchDensity(WorldPush push, float3 pos) {
     float base = fogDensityAt(push, pos.y);
     float amp = push.fog1.z;
     if (base <= 0.0 || amp <= 0.0 || base * (1.0 + abs(amp)) < FOG_NOISE_MIN_DENSITY) {
-        return base + sprayDensity(push, pos);
+        return base;
     }
     // The wind drift arrives pre-accumulated per axis (Java integrates speed x direction over the
     // frame step and wraps each axis in whole 4096-block periods — this lattice's exact period —
@@ -317,117 +301,242 @@ public float fogMarchDensity(WorldPush push, float3 pos) {
     float2 wind = push.fog1.xy;
     float3 q = (float3(pos.xz + push.waterAnchor.xy, pos.y)
             + float3(wind.x, 0.0, wind.y)) / FOG_NOISE_CELL;
-    return base * max(0.0, 1.0 + amp * (fogFbm(q) * 2.0 - 1.0)) + sprayDensity(push, pos);
+    return base * max(0.0, 1.0 + amp * (fogFbm(q) * 2.0 - 1.0));
 }
 
-// ---- Cloud layer (baked volumetric clouds, the clouds_unreal scheme) --------------------------------
-//
-// The layer's datum is cloud0.y, its base, and cloud0.z, how deep the deck stands above it. Instances
-// stand on that base as an infinite wind-drifted grid, each rendering one baked 3D density volume
-// (the textures/cloud/*.vol assets, uploaded as one 2D-array atlas by RtCloudVolumes) in a box as
-// wide as Cloud Size and as deep as Cloud Thickness. The march and the
-// lighting are the UE "volumetric raymarcher" scheme the clouds_unreal project ships (Ryan Brucks'
-// shaderbits raymarcher): Beer-Lambert extinction per step, a short secondary march toward the
-// dominant body for self-shadow, the multi-scatter octave stack on the light leg, sky-irradiance
-// ambient.
-//
-// Instance placement is a deterministic hash grid, so every consumer — the sky miss shader's walk,
-// the cheap single-crossing tiers, the NEE shadow probes, the continuation-ray attenuation — derives
-// the SAME cloud at the SAME place from the push block alone. The grid reads the EXACT cloud anchor
-// (cloud2.xy) and the Java-accumulated drift (cloud2.zw), so the wind slides the instances and no
-// terrain rebase can snap them. cloud1.x selects which baked volume every instance renders,
-// cloud1.y is the weather swell that widens the footprints, and cloudColor.z carries the flow
-// phase the shapes' warp scrolls on.
-//
-// Per-instance variety comes from the same hash: each instance rotates its volume by a quarter-turn
-// with an optional mirror and scales it inside a patchiness-driven band, so one texture dresses the
-// whole sky without visible repetition. Near full coverage the grid saturates into a solid overcast
-// of touching decks; below that, a coarse hash of the parent cell gathers instances into weather
-// systems with clear sky between them — the patchiness setting drives how hard.
+// Cloud code has two compile-time cut lines. CAUSTICA_NO_VISIBLE_CLOUD_PATH removes the sky layer,
+// segment out-scatter and continuation attenuation while retaining the shadow field. Adding
+// CAUSTICA_NO_CLOUD_PATH removes the shadow field too, leaving only inert stubs for the fog/shaft
+// sun legs and the volume debug image. Both variants keep those callers compiling without carrying
+// the shape sampler or its register footprint.
+#ifndef CAUSTICA_NO_CLOUD_PATH
 
-public static const float CLOUD_GRID_CELL = 176.0;  // blocks per instance-grid cell at the base span
-public static const float CLOUD_BOX_SPAN = 0.86;    // instance footprint as a fraction of its cell
-// Column optical depth, in density-blocks, every tier prices the deck at: the one number that sets
-// how opaque a cloud is. The march converts it into an extinction per block by dividing by the box
-// height, and the planar tier and the shadow probes use it directly. Derived from the nine shipped
-// volumes: their mean density times this is the column the old slab calibration delivered, measured
-// over the set.
-public static const float CLOUD_COLUMN_DEPTH = 34.8;
-// Height inside the box, as a fraction, where the single-sample consumers read the field: the
-// mass-weighted centre of the authored profiles. The planar sheet's crossing, the shadow probes and
-// the continuation-ray transmittance all use it, so neither switching tiers nor flying in and out of
-// the walk moves the cloud.
+// ---- Cloud stack (procedural layered cumulus) ------------------------------------------------------
+//
+// The layer is a stack of four procedurally generated decks, not a placed asset:
+//
+//   low    cumulus humilis/mediocris, standing on the Cloud Altitude dial
+//   high   cumulus congestus, one gap above the low deck: the towering bodies
+//   alto   an altostratus sheet far above both, thin and wide
+//   cirrus a curl-warped cirrus sheet higher still
+//
+// Every deck answers the same three questions the same way, which is what keeps them one system
+// instead of four effects:
+//
+//   coverage   a low-frequency noise field thresholded against the layer's coverage lane
+//   profile    a flat base and a domed crown: the horizontal shape is multiplied by a vertical
+//              profile that reaches zero at the base and at the crown, and the two together decide
+//              where the body is solid
+//   erosion    a fourth-power noise cut that eats the isosurface's rim, with a horizontal shear
+//              that leans the crown downwind
+//
+// Densities are authored per block (see the layer table), so a march step's optical depth is the
+// sample's shape times its layer's density times the step length — there is no separate calibrated
+// column to keep in step. The Cloud Thickness dial scales the two cumulus decks' heights only; the
+// horizontal scales are per-layer constants, because a taller deck carrying larger cells is what
+// makes the towering layer read as the same sky's weather system rather than as the low deck moved
+// up.
+//
+// Everything below samples one 512-square noise atlas (RtCloudNoise) in tile-relative units, so the
+// whole sky is deterministic from the push block: the same coverage, wind and height always produce
+// the same cloud, and no two consumers can disagree about where a body stands.
+
+public static const int CLOUD_LAYER_COUNT = 4;
+public static const int CLOUD_LOW = 0;
+public static const int CLOUD_HIGH = 1;
+public static const int CLOUD_ALTO = 2;
+public static const int CLOUD_CIRRUS = 3;
+
+// Stack geometry, as multiples of the Cloud Thickness dial. The towering deck's base sits 0.65 dials
+// above the low deck's and stands 1.21 dials deep against the low deck's 0.56, so at the default 232
+// the pair spans 312..442 and 463..744: two decks that overlap in silhouette without ever sharing a
+// body, which is what lets the low layer shade the high one's base from below.
+public static const float CLOUD_LOW_TALLNESS = 0.56;
+public static const float CLOUD_HIGH_BASE = 0.65;
+public static const float CLOUD_HIGH_TALLNESS = 1.21;
+// The high sheets are pinned relative to the cumulus base rather than to the world, so raising the
+// altitude dial lifts the whole sky instead of pushing the cirrus under the towering deck.
+public static const float CLOUD_ALTO_OFFSET = 4688.0;
+public static const float CLOUD_CIRRUS_OFFSET = 6688.0;
+// Both sheets are five blocks thick and are crossed, never really walked: the shape field is a
+// column, so the thickness only decides how much optical depth a vertical sight line picks up.
+public static const float CLOUD_SHEET_TALLNESS = 5.0;
+
+// Authored extinction at unit shape, in 1/block, multiplied by the Cloud Density dial. A cumulus body
+// is 0.5/block — a two-block mean free path — which is what makes its isosurface solid instead of
+// milky. The sheets are two orders of magnitude thinner, and that contrast is the whole difference
+// between a deck and a veil.
+public static const float CLOUD_LOW_DENSITY = 0.50;
+public static const float CLOUD_HIGH_DENSITY = 0.60;
+public static const float CLOUD_ALTO_DENSITY = 0.10;
+public static const float CLOUD_CIRRUS_DENSITY = 0.02;
+
+// The sheets' coverage, as a fraction of the cumulus lane's saturated value: a high overcast should
+// thin out when the player asks for a clear sky, and thicken with the dial, so one number keeps
+// meaning "how cloudy".
+// The high sheets clear LESS of the mask than the cumulus decks, so they stay sparse filaments. A
+// full-coverage sheet was the first thing to turn the sky into one flat grey wash: two thin decks at
+// 5000 and 7000 blocks cover a far larger cone of sky than a cumulus body does.
+public static const float CLOUD_ALTO_COVERAGE = 1.05;
+public static const float CLOUD_CIRRUS_COVERAGE = 0.95;
+
+// Shape: two noise fields added into one mask, thresholded against coverage and normalised by the
+// square root of it. The normalisation keeps a half-covered sky's bodies as solid as an overcast's
+// instead of fading every cloud uniformly: the threshold moves, the density behind it does not.
+//
+// The FINE field must carry the local shape. The large field is sampled at a 20 km tile, so within
+// one view it is essentially a constant: giving it most of the weight made the whole sky clear or the
+// whole sky overcast depending on where the player stood (a 130% coverage sky produced one square
+// cloud and nothing else). The fine field has a 2 km tile and std 0.19, so it puts several distinct
+// bodies in the same view; the large field only modulates which neighbourhood gets more of them.
+// Linear fine, not squared: squaring flattened its low end and handed the decision back to `big`.
+// Mean mask ~0.98 at the authored 100% — 0.7 nearly clear, 1.0 broken cumulus, 1.2 two thirds
+// covered, 1.8 solid overcast.
+public static const float CLOUD_MASK_LARGE = 0.60;
+public static const float CLOUD_MASK_FINE = 1.30;
+public static const float CLOUD_MASK_BIAS = 0.10;
+// Patchiness trades the large field's weight against the fine one's: at 0 the silhouette is shredded
+// evenly by small cells, at 1 whole weather systems decide their neighbourhood. Kept small — a wide
+// swing turns the dial into an empty/full switch instead of a clustering control.
+public static const float CLOUD_MASK_PATCH = 0.35;
+public static const float CLOUD_SHAPE_SOFTNESS = 0.20;
+// The vertical profile. BASE_ROUND is how many blocks the underside curves in over; TOP_POWER is the
+// dome's taper — a smooth 1-(1-t)^p falls away through the whole upper half of the body instead of
+// cutting off in the last few blocks, which is what keeps a crown from reading as a flat lid.
+public static const float CLOUD_BASE_ROUND = 26.0;
+public static const float CLOUD_TOP_POWER = 2.2;
+// Fourth-power erosion depth, and the share of it that comes from the base carve. The exponent is
+// what turns smooth noise into a cauliflower rim: a linear cut leaves the isosurface's own blur on
+// the silhouette, and that blur is what reads as volumetric fog instead of cloud.
+public static const float CLOUD_EROSION = 0.55;
+public static const float CLOUD_EROSION_BASE = 0.75;
+// Horizontal shear: the crown leans up to this many blocks downwind at the deck's top, on a 1.5-power
+// ramp. Without it a deck is a prism; with it, a congestus leans the way the real one does.
+public static const float CLOUD_SHEAR = 26.0;
+
+// Tiles, in blocks per noise period. The cumulus pair deliberately differs: 5 km cells with 700 m
+// detail for the low deck puts a body's width within a few multiples of its height — the aspect
+// real cumulus have, which the shipped 20 km tables did not (a 1000-5000 block body on a
+// 130-block deck read as one flat plate from any raised camera). The towering deck keeps the same
+// proportion at its own scale.
+public static const float CLOUD_LOW_FIELD_TILE = 5000.0;
+public static const float CLOUD_LOW_DETAIL_TILE = 700.0;
+public static const float CLOUD_HIGH_FIELD_TILE = 9000.0;
+public static const float CLOUD_HIGH_DETAIL_TILE = 1800.0;
+public static const float CLOUD_ALTO_FIELD_TILE = 100000.0;
+public static const float CLOUD_ALTO_DETAIL_TILE = 2600.0;
+public static const float CLOUD_CIRRUS_FIELD_TILE = 60000.0;
+public static const float CLOUD_CIRRUS_DETAIL_TILE = 4200.0;
+// One cell of the erosion field, in blocks. Small enough that a rim carries several cells across a
+// march step, so the cut reads as grain, and large enough that a distant deck does not turn into
+// noise the reconstruct cannot resolve.
+public static const float CLOUD_EROSION_CELL = 12.0;
+// The erosion field's vertical scroll amplifies its v coordinate 193-fold, so one of its texels
+// covers only a few dozen blocks along a grazing sight line — far below a pixel at cloud distance.
+// Sampling it two mip levels coarser than the shape field removes the comb of fine stripes that
+// otherwise appears along every cloud base near the horizon; 48 march steps made it worse, not
+// better, because the grain is a texture-frequency problem rather than a step-count one.
+public static const float CLOUD_EROSION_MIP = 2.0;
+// Third, finer erosion octave, blended into the cut with this weight. The two base octaves land at
+// 12 and 6.6 blocks; this one re-uses the same cell field at 3.6, so a rim carries grain at three
+// scales instead of reading as one smooth bite.
+public static const float CLOUD_EROSION_FINE = 0.35;
+// The coverage fields' height shear, in world blocks of address shift per block of height above the
+// deck's own base. One diagonal slice through a body's fine field decorrelates within a few blocks
+// of climb while the large field needs the whole deck, which is what makes a body billow instead of
+// extruding one horizontal blob from base to lid. Anchored to the base, not to the camera, so the
+// pattern is world-fixed whatever altitude the viewer takes. The rate stays low on purpose: the
+// fine field's features are only a few blocks across at the shipped tiles, so even this rate
+// decorrelates them fully, and a higher one stretched those features into the near-horizontal
+// streaks a side view reads as layers.
+public static const float2 CLOUD_FIELD_SCROLL = float2(1.5, -1.1);
+// Tiling suppression for every coverage field: a warp fetched at an incommensurate fraction of the
+// field's own period (0.27 — the ratio 1/0.27 must stay clear of any near-integer, or the warp lands
+// on a near-same phase one field period away and the wrap shows through), displacing the sample by
+// this fraction of the period at most. The composite of field and warp then repeats only at a period
+// no sky ever reaches, so the same blob cluster never recurs at the tile interval the wrap alone
+// would give it.
+public static const float CLOUD_WARP_TILE = 0.27;
+public static const float CLOUD_WARP_AMOUNT = 0.18;
+// The interior texture depth, from the fine fetch's spare alpha channel: how far below its local
+// value a solid body's density may swing. The floor keeps the body solid — this shades a crown, it
+// does not hollow it.
+public static const float CLOUD_INNER_TEXTURE = 0.28;
+// Per-column crown height. A column's own top comes from the coverage mask read at one fixed
+// reference height (a fraction of the deck's tallness), so the fetch never moves with the sample's
+// y and a body domes with its own shape: the crown rises where the column is most saturated and
+// slopes down at its rim, instead of every column ending on the same horizontal lid — the flat
+// plate a flying camera reads as a cut-off slab.
+public static const float CLOUD_CROWN_REF = 0.35;
+public static const float CLOUD_HEIGHT_RANGE = 0.55;
+public static const float CLOUD_CROWN_MIN = 0.25;
+public static const float CLOUD_CROWN_POWER = 0.8;
+// Curl strength on the fine field, as a fraction of the detail tile. The value-noise lattice puts
+// every blob's centre on a regular grid, and a sky of grid-aligned bodies reads as a tiled texture
+// however well the wrap itself is broken; the swirl scatters the centres and chews up any streak
+// the height shear leaves behind.
+public static const float CLOUD_FINE_CURL = 0.10;
+// Target march step for the volumetric tier, in blocks: two erosion cells. A coarser step puts whole
+// cells behind one sample and quantizes the body's surface to the step length; a finer one buys
+// aliasing samples, not shape.
+public static const float CLOUD_MARCH_STEP = 24.0;
+// The light leg's edge fade and cap, in optical depths. The leg's sample ramps to zero over this many
+// blocks inside the slab, so its contribution vanishes continuously as the sun crosses a deck's lid or
+// floor instead of drawing a brightness step there; the leg is capped once it is deep enough that
+// nothing downstream of the normalised shadow mask can move.
+public static const float CLOUD_LIGHT_EDGE = 16.0;
+public static const float CLOUD_LIGHT_BREAK = 16.0;
+// The dissipation distance the two high sheets ride, as a multiple of the cumulus fade: a sheet at
+// 5000 blocks is crossed tens of kilometres out, and the cumulus fade would erase it before it
+// reached the horizon band it exists to paint.
+public static const float CLOUD_SHEET_FADE_MULT = 8.0;
+// Assumed angular size of one render pixel, in radians: the mip the shape field is sampled at is
+// derived from it. Advisory only — a coarser device gets a slightly sharper cloud, never a crawling
+// one, because the erosion is already faded past its own cell size.
+public static const float CLOUD_TEXEL_ANGLE = 0.0011;
+// Height inside the low deck the single-sample consumers read the field at, as a fraction of its
+// tallness: the mass-weighted centre of the profile. The planar sheet's crossing, the shadow probes
+// and the continuation-ray transmittance all use it, so neither switching tiers nor flying in and
+// out of the walk moves the cloud.
 public static const float CLOUD_SHEET_HEIGHT = 0.35;
-// Vertical thickness of the two taps the planar tier averages, as a fraction of the box height. Wide
-// enough to average out one slice's speckle, narrow enough that the two taps describe one height.
-public static const float CLOUD_SHEET_BAND = 0.08;
-// Vertical resolution of the baked volumes; MUST match RtCloudVolumes.RES, which validates the
-// resources against it at load.
-public static const float CLOUD_VOLUME_RES = 128.0;
-// Reach of the flow warp, as a fraction of the instance footprint. The atlas window fades over the
-// footprint's last 8% before its border, so a warp at this size reshapes the body well inside its
-// own crop and never exposes the window's edge.
-public static const float CLOUD_FLOW_AMPLITUDE = 0.09;
-public static const float CLOUD_EXTINCTION = 0.22;      // 1/block at unit density (water-cloud order)
-public static const float CLOUD_G = 0.4;                // phase anisotropy, the fog tier's forward doctrine
+
 public static const float3 CLOUD_ALBEDO = float3(0.86, 0.87, 0.90); // BT-709-linear, sky.rmiss space
-// The phase a sample is lit by: an isotropic share plus the single-scatter lobe, mostly intact. The lobe
-// alone spans nearly two orders of magnitude between looking into the body and looking away from it, which
-// drew one and the same deck blown white on the body's side of the sky and black on the other. Taking that
-// range out entirely is worse: a deck with no directional falloff reads as one flat bright sheet, and the
-// falloff IS what makes the cloud field read as shape. The share below only lifts the extreme - the
-// directions more than ~75 degrees off the body, where the lobe has nothing left - and the lobe keeps the
-// rest of its range.
-public static const float CLOUD_SCATTER_FLOOR = 0.15;   // the isotropic share every sample carries
-public static const float CLOUD_SCATTER_LOBE = 0.85;    // how much of the single-scatter lobe survives
-// How much of the column above a sample occludes the SKY that lights it. Light reaches a deck's base from
-// the whole hemisphere - the sides and the gaps included - so this stays well below the sun leg's own
-// occlusion. It is also what makes the base darker than the crown, so it cannot be driven to zero either:
-// the deck's own vertical gradient is this weight's whole job.
-public static const float CLOUD_AMBIENT_OCCLUSION = 0.20;
-// The sky term is the only light a thick base receives: its sun leg saturates the multi-scatter stack, and
-// what reaches a viewer under the deck is light that entered through the sides and the gaps. Two constants
-// keep that floor from collapsing. The FLOOR is the share of the unoccluded sky a sample keeps at any depth
-// (the hemisphere around it is never fully cloud), and the GAIN undoes the irradiance-to-radiance divide
-// for a scattering medium, whose in-scatter is not a Lambertian surface's.
-public static const float CLOUD_AMBIENT_FLOOR = 0.35;
-public static const float CLOUD_AMBIENT_GAIN = 5.0;
+// The direct look level is pushed at 128000, well above what the exposure can resolve on a cloud top.
+// Scaling it before the powder and shadow stack is what lets the crown keep a gradient instead of
+// clipping to a flat white.
+public static const float CLOUD_DIRECT_GAIN = 0.65;
+// How much of the column above a sample occludes the SKY that lights it, as a share of the direct
+// leg's own occlusion. Light reaches a deck's base from the whole hemisphere, so this stays below
+// the sun leg — but it is the only term that can darken a base, and a value small enough to leave
+// the base within a few percent of the crown flattened the whole deck into one white sheet.
+public static const float CLOUD_AMBIENT_OCCLUSION = 0.45;
+// The sky term is the only light a thick base receives: its sun leg saturates the multi-scatter
+// stack, and what reaches a viewer under the deck is light that entered through the sides and the
+// gaps. FLOOR is the share of the unoccluded sky a sample keeps at any depth; GAIN undoes the
+// irradiance-to-radiance divide for a scattering medium.
+public static const float CLOUD_AMBIENT_FLOOR = 0.15;
+public static const float CLOUD_AMBIENT_GAIN = 2.0;
+// The light leg returns an OPTICAL DEPTH: a 130-block cumulus at 0.5/block puts tens of them on even
+// the shortest leg. The multi-scatter gain needs a normalised 0..1 shadow mask, so the leg is divided
+// by this depth before 1-exp(-tau) turns it into one. Eight depths is where a crown and a base part
+// company: the top of a body still sees light, its underside does not.
+public static const float CLOUD_LIGHT_DEPTH_SCALE = 8.0;
 
-// Self-shadow of a sample with the multi-scatter octave stack. The weights (1, 1/2, 1/4) over
-// extinctions (tau, tau/2, tau/4) are normalised by their sum, so the result is 1 at tau = 0 and falls
-// off far more slowly than exp(-tau): that slow tail IS the missing bounces, and it is what keeps a thick
-// deck white by day and moonlit at night.
-public float cloudSelfShadow(float tau) {
-    float sum = 0.0;
-    float weightSum = 0.0;
-    float weight = 1.0;
-    for (int i = 0; i < 3; i++) {
-        sum += weight * exp(-tau * exp2(-float(i)));
-        weightSum += weight;
-        weight *= 0.5;
-    }
-    return sum / weightSum;
-}
+// ---- Shape field -----------------------------------------------------------------------------------
 
-// ---- The instance grid ------------------------------------------------------------------------------
-//
-// One hash grid answers "which cloud, where, how posed" for every consumer. The cell grows with the
-// Cloud Size dial so an instance's footprint always fits inside its cell: a sky of large decks has
-// proportionally larger gaps between their centres. Size is the only dial the grid reads, which is
-// what keeps the layout still while thickness, density and steps change what the deck is made of.
+/** One deck's geometry and material, resolved from the push block. */
+public struct CloudLayer {
+    public int   kind;        // 0 cumulus, 1 altostratus sheet, 2 cirrus sheet
+    public float base;        // rebased blocks
+    public float top;
+    public float tallness;
+    public float fieldTile;
+    public float detailTile;
+    public float coverage;
+    public float density;
+    public float windScale;
+};
 
-// Horizontal footprint (full width) of one instance box, in blocks: the Cloud Size dial. It is
-// pushed in cloudColor.x and is the ONLY thing that sizes an instance, so changing the slab's
-// thickness moves no cloud.
-float cloudSpan(WorldPush push) {
-    return clamp(push.cloudColor.x, 32.0, 2048.0);
-}
-
-// Vertical extent of one instance box, in blocks: the Cloud Thickness dial, directly. The box STANDS
-// ON the cloud base, so the volume's flat bottom is the layer's own base and the crown grows upward
-// into clear air; a box centered on the slab would hang half a body below the base, where the terrain
-// and the planar tier both say the cloud has already ended. Thickness moves nothing else: the
-// footprint is Cloud Size, and the column the tiers price is CLOUD_COLUMN_DEPTH.
 float cloudBoxHeight(WorldPush push) {
     return clamp(push.cloud0.z, 8.0, 1024.0);
 }
@@ -436,196 +545,351 @@ float cloudBoxBottom(WorldPush push) {
     return push.cloud0.y;
 }
 
-// The height the single-sample consumers read the field at: CLOUD_SHEET_HEIGHT up the box, which is
-// where the authored profiles carry their mass. The planar sheet's crossing, the shadow probes and the
-// continuation-ray transmittance all use it, so neither switching tiers nor flying in and out of the
-// walk moves the cloud.
+CloudLayer cloudLayerOf(WorldPush push, int index) {
+    float thickness = cloudBoxHeight(push);
+    float base = cloudBoxBottom(push);
+    // The dial is the threshold; weather adds to it, which is how rain decks the sky — the bodies
+    // grow into each other instead of a different field being drawn.
+    float coverage = clamp(push.cloud0.x + push.cloud1.y, 0.0, 2.5);
+    float density = clamp(push.cloud0.w, 0.0, 4.0);
+    // Cloud Size scales every tile, so a dial that makes the bodies larger makes them larger in every
+    // deck at once. The layer tables' tiles are the 1.0 reference.
+    float sizeScale = clamp(push.cloudColor.x, 0.25, 4.0);
+    CloudLayer l;
+    l.kind = 0;
+    l.base = base;
+    l.tallness = thickness * CLOUD_LOW_TALLNESS;
+    l.fieldTile = CLOUD_LOW_FIELD_TILE * sizeScale;
+    l.detailTile = CLOUD_LOW_DETAIL_TILE * sizeScale;
+    l.coverage = coverage;
+    l.density = CLOUD_LOW_DENSITY * density;
+    l.windScale = 1.0;
+    if (index == CLOUD_HIGH) {
+        l.base = base + thickness * CLOUD_HIGH_BASE;
+        l.tallness = thickness * CLOUD_HIGH_TALLNESS;
+        l.fieldTile = CLOUD_HIGH_FIELD_TILE * sizeScale;
+        l.detailTile = CLOUD_HIGH_DETAIL_TILE * sizeScale;
+        l.density = CLOUD_HIGH_DENSITY * density;
+        l.windScale = 1.35;
+    } else if (index == CLOUD_ALTO) {
+        l.kind = 1;
+        l.base = base + CLOUD_ALTO_OFFSET;
+        l.tallness = CLOUD_SHEET_TALLNESS;
+        l.fieldTile = CLOUD_ALTO_FIELD_TILE * sizeScale;
+        l.detailTile = CLOUD_ALTO_DETAIL_TILE * sizeScale;
+        l.coverage = CLOUD_ALTO_COVERAGE * saturate(coverage);
+        l.density = CLOUD_ALTO_DENSITY * density;
+        l.windScale = 2.2;
+    } else if (index == CLOUD_CIRRUS) {
+        l.kind = 2;
+        l.base = base + CLOUD_CIRRUS_OFFSET;
+        l.tallness = CLOUD_SHEET_TALLNESS;
+        l.fieldTile = CLOUD_CIRRUS_FIELD_TILE * sizeScale;
+        l.detailTile = CLOUD_CIRRUS_DETAIL_TILE * sizeScale;
+        l.coverage = CLOUD_CIRRUS_COVERAGE * saturate(coverage);
+        l.density = CLOUD_CIRRUS_DENSITY * density;
+        l.windScale = 1.8;
+    }
+    l.top = l.base + l.tallness;
+    return l;
+}
+
+// The height the single-sample consumers read the field at: CLOUD_SHEET_HEIGHT up the low deck.
 public float cloudBoxMid(WorldPush push) {
-    return cloudBoxBottom(push) + CLOUD_SHEET_HEIGHT * cloudBoxHeight(push);
+    return cloudBoxBottom(push) + CLOUD_SHEET_HEIGHT * cloudLayerOf(push, CLOUD_LOW).tallness;
 }
 
-// The walk's extinction per block: the column every tier prices, spread over the deck's actual depth.
-// This is what keeps Cloud Thickness a shape dial — a deeper deck carries the same water, so it is
-// thinner per unit length and no darker — and it is the only place the box height reaches opacity.
-float cloudDensityScale(WorldPush push) {
-    return clamp(CLOUD_COLUMN_DEPTH / cloudBoxHeight(push), 0.0, 4.0);
+// Mip level for a shape sample `dist` blocks away: one texel of the layer's field should never be
+// smaller than a pixel. Past the erosion's own cell the cut is faded out instead, so this only has
+// to keep the distant decks from crawling.
+float cloudLod(float dist, float tile) {
+    return clamp(log2(max(dist, 1.0) * CLOUD_TEXEL_ANGLE * 512.0 / tile), 0.0, 5.0);
 }
 
-float cloudGridCell(WorldPush push) {
-    return max(CLOUD_GRID_CELL, cloudSpan(push) / CLOUD_BOX_SPAN);
+/** One sample of the noise atlas. Channels: r fine detail, g/b the cell field, a the interior texture. */
+float4 cloudNoiseSample(float2 uv, float lod) {
+    return cloudNoise.SampleLevel(uv, lod);
 }
 
-float cloudGridHash(float2 cell, float salt) {
-    return fogHash13(float3(cell.x, cell.y, salt));
+// The coverage fields' shared warp: one fetch at an incommensurate fraction of the period of the
+// tile the caller is about to sample, returned as a fraction of that tile. Each field warps at its
+// OWN scale — a warp shared from the field tile would leave the detail field's own wrap showing
+// through, because a smooth displacement barely moves across one detail period.
+float2 cloudFieldWarp(float2 xz, float tile, float2 wind) {
+    return (cloudNoiseSample((xz + wind) / (tile * CLOUD_WARP_TILE), 1.0).rg - 0.5)
+            * CLOUD_WARP_AMOUNT;
 }
 
-// One octave of value noise on the same hash grid, bilinearly smoothed — the flow warp's raw
-// material. Returns 0..1.
-float cloudFlowNoise(float2 p, float salt) {
-    float2 f = floor(p);
-    float2 u = frac(p);
-    u = u * u * (3.0 - 2.0 * u);
-    return lerp(
-            lerp(cloudGridHash(f, salt), cloudGridHash(f + float2(1.0, 0.0), salt), u.x),
-            lerp(cloudGridHash(f + float2(0.0, 1.0), salt), cloudGridHash(f + float2(1.0, 1.0), salt), u.x),
-            u.y);
+// A coverage field's sample address: the deck's wind offset, the height shear above its own base,
+// and the warp scaled to this field's tile. Every big/fine fetch goes through here — including the
+// march's cheap rejection — or the rejection and the density it prunes would disagree about what
+// the field says.
+float2 cloudFieldAddress(float2 xz, float aboveBase, float tile, float2 wind, float2 warp) {
+    return xz + wind + aboveBase * (CLOUD_FIELD_SCROLL / tile) + warp * tile;
 }
 
-// Density 0..1 of the layer at one drifted-grid position and one normalized box height (0 at the
-// cloud base, 1 at the crown). Returns 0 wherever no instance holds the point. `driftedXZ` has already been moved through cloud2 (anchor +
-// drift); the instance centers live in the same drifted frame, which is what makes the wind slide
-// them. The two adjacent atlas layers are lerped by hand — 2D-array filtering is nearest along the
-// layer axis — and the box window keeps a clipped neighbour from drawing a visible box wall on top
-// of the volumes' own soft borders.
-float cloudInstanceDensity(WorldPush push, float2 driftedXZ, float vertical01) {
-    if (push.cloud0.x <= 0.0 || vertical01 < 0.0 || vertical01 > 1.0) {
+// The erosion field: one atlas texel per lattice cell, two independently scrolled channels summing
+// to a field that varies in all three axes without a 3D texture.
+//
+// The vertical offset MUST use the CONTINUOUS p.y. Flooring it to an integer cell and stepping the
+// atlas row by 193 per cell put a hard discontinuity every cell — the cross-section came out as a
+// layer cake of horizontal stripes — because no amount of bilinear filtering smooths a jump. A
+// continuous diagonal scroll through the same tile keeps the field 3D-looking and seamless; keying a
+// channel blend off frac(p.y) instead left a derivative kink at every cell boundary, which read as
+// faint horizontal stripes across a deck's cross-section.
+float cloudCellNoise(float3 p, float lod) {
+    float2 uv = (p.xz + p.y * float2(0.0, 193.0)) * (1.0 / 512.0);
+    float a = cloudNoiseSample(uv, lod + CLOUD_EROSION_MIP).g;
+    // A second, independent scroll along the same tile keeps the two channels from being one field
+    // sampled twice. Both offsets are continuous, so neither introduces a cell boundary's stripe.
+    float2 uv2 = (p.xz * 1.7 + p.y * float2(11.0, 193.0)) * (1.0 / 512.0);
+    float b = cloudNoiseSample(uv2, lod + CLOUD_EROSION_MIP).b;
+    return a * 0.6 + b * 0.4;
+}
+
+// 2D gradient hash for the cirrus warp: two independent members per lattice point, normalised so the
+// curl below is scale-free.
+float2 cloudGradient(float2 p) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    float2 h = frac((p3.xx + p3.yz) * p3.zy);
+    return normalize(h - 0.5 + float2(1.0e-4, 1.0e-4));
+}
+
+// Curl of the gradient field: divergence-free, so the warp swirls the cirrus into filaments instead
+// of smearing it into a blob.
+float2 cloudCurl(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    float2 g0 = cloudGradient(i);
+    float2 g1 = cloudGradient(i + float2(1.0, 0.0));
+    float2 g2 = cloudGradient(i + float2(0.0, 1.0));
+    float2 g3 = cloudGradient(i + float2(1.0, 1.0));
+    float v0 = dot(g0, f);
+    float v1 = dot(g1, f - float2(1.0, 0.0));
+    float v2 = dot(g2, f - float2(0.0, 1.0));
+    float v3 = dot(g3, f - float2(1.0, 1.0));
+    return float2(
+            ((v1 - v0) * (1.0 - u.y) + (v3 - v2) * u.y) * du.x,
+            ((v2 - v0) * (1.0 - u.x) + (v3 - v1) * u.x) * du.y);
+}
+
+// The horizontal mask every deck shares: a large field plus a squared fine one, thresholded against
+// the layer's coverage. The coverage is normalised out of the result, so the body behind the
+// threshold is as solid at 0.4 coverage as at 1.6.
+float cloudMaskLarge(float patchiness) {
+    return CLOUD_MASK_LARGE * (1.0 + CLOUD_MASK_PATCH * (saturate(patchiness) * 2.0 - 1.0));
+}
+
+float cloudMaskFine(float patchiness) {
+    return CLOUD_MASK_FINE * (1.0 - CLOUD_MASK_PATCH * (saturate(patchiness) * 2.0 - 1.0));
+}
+
+float cloudCoverageMask(float big, float fine, float cov, float patchiness) {
+    float mask = cloudMaskLarge(patchiness) * big + cloudMaskFine(patchiness) * fine + CLOUD_MASK_BIAS;
+    // A narrow smoothstep, not the linear ramp: inside the threshold the body is SOLID (shape 1) and
+    // outside it there is clear sky. The linear ramp left every deck a smooth grey wash with holes —
+    // fog, not cumulus — no matter how high the extinction was behind it.
+    float q = saturate(((cov - mask) * rsqrt(max(cov, 1.0e-3))) / CLOUD_SHAPE_SOFTNESS);
+    return q * q * (3.0 - 2.0 * q);
+}
+
+// Cumulus: coverage threshold, then the vertical profile, then the erosion cut. `wind` is the layer's
+// own drifted XZ offset in blocks, `lod` the distance-derived sample level. `warp` and `big` are the
+// coverage field's own fetch, made by the caller: the march rejects with `big` before it pays for the
+// profile, so handing that value back in is what keeps a hit from fetching the same field twice.
+float cloudCumulusDensity(CloudLayer l, float3 p, float2 wind, float lod, bool eroded,
+                          float2 warp, float big) {
+    float cov = l.coverage;
+    if (cov <= 1.0e-3) {
         return 0.0;
     }
-    float cell = cloudGridCell(push);
-    float2 cellId = floor(driftedXZ / cell);
-    float roll = cloudGridHash(cellId, 17.0);
-    // Weather systems: a bilinear-smoothed hash over 4x4-cell parent blocks modulates the occupancy
-    // threshold zero-mean, so whole neighbourhoods fill or clear together and the patchiness slider
-    // gathers instances into clusters instead of sprinkling them. The interpolation matters: a binary
-    // per-block hash drew straight grid-aligned fronts across the sky. Near-full coverage pins the
-    // gate open — a solid overcast is a deck of touching clouds, and the slider's 1.0 must deliver it.
-    float2 parent = cellId / 4.0;
-    float2 pf = floor(parent);
-    float2 pu = frac(parent);
-    float cluster = lerp(
-            lerp(cloudGridHash(pf, 83.0), cloudGridHash(pf + float2(1.0, 0.0), 83.0), pu.x),
-            lerp(cloudGridHash(pf + float2(0.0, 1.0), 83.0), cloudGridHash(pf + float2(1.0, 1.0), 83.0), pu.x),
-            pu.y);
-    // Occupancy gate. It never reads the weather: the coverage slider, not the rain, owns the
-    // instance count, and the sky's clear gaps stay exactly where the slider put them in any
-    // weather. Rain's whole effect on the deck is the footprint swell further below.
-    float gate = push.cloud0.x >= 0.95 ? 2.0
-            : saturate(push.cloud0.x * (1.0 + push.cloud1.z * (cluster * 2.0 - 1.0)));
-    if (roll >= gate) {
+    float aboveBase = p.y - l.base;
+    // The flow phase scrolls the FINE field against the body, at its own rate: the body is carried by
+    // the wind, the detail inside it billows, and the two never move as one sheet. The same fetch's
+    // alpha is an independent octave stack reserved for the interior texture.
+    float2 flow = float2(worldPush.cloudColor.z * 1.7, -worldPush.cloudColor.z * 1.1);
+    float2 fineWind = flow - wind * 0.6;
+    float2 fineWarp = cloudFieldWarp(p.xz, l.detailTile, fineWind);
+    float2 fineAddr = cloudFieldAddress(p.xz, aboveBase, l.detailTile, fineWind, fineWarp);
+    // The curl displaces the fine address with a divergence-free swirl so the lattice's blob
+    // centres stop landing on a grid. It is part of the shape field every consumer reads, shadow
+    // field and light legs included, so the detail dial leaves it on: a body's coverage, crown and
+    // base — and the shadow it casts — must not move under a close-view switch.
+    float2 curl = cloudCurl(fineAddr / l.detailTile) * CLOUD_FINE_CURL;
+    bool detailOn = worldPush.cloudColor.y > 0.5;
+    float4 detail = cloudNoiseSample((fineAddr + curl * l.detailTile) / l.detailTile, lod);
+    float fine = 1.0 - detail.r;
+    float shape = cloudCoverageMask(big, fine, cov, worldPush.cloud1.z);
+    if (shape <= 0.0) {
         return 0.0;
     }
-    float span = cloudSpan(push);
-    float2 jitter = float2(cloudGridHash(cellId, 29.0), cloudGridHash(cellId, 43.0)) - 0.5;
-    float pose = cloudGridHash(cellId, 61.0);
-    float2 center = (cellId + 0.5 + jitter * (1.0 - span / cell)) * cell;
-    // Quarter-turns plus a mirror: eight poses out of one texture, so the grid never reads as a stamp.
-    float2 q = driftedXZ - center;
-    float turn = floor(pose * 3.999);
-    float2 r = turn < 0.5 ? q
-            : turn < 1.5 ? float2(-q.y, q.x)
-            : turn < 2.5 ? -q
-            : float2(q.y, -q.x);
-    if (frac(pose * 7.31) < 0.5) {
-        r.x = -r.x;
-    }
-    // Patchiness also breathes the footprint, so a sparse sky carries visibly smaller decks.
-    float scale = 1.0 + (frac(pose * 3.77) - 0.5) * push.cloud1.z * 0.5;
-    // The weather swell widens the footprint toward the size that just tiles the cell: centres sit
-    // within a jitter of (1 - span/cell)/2 of the cell centre, so a footprint of span * swellFull
-    // covers the cell's own share plus every neighbour's gap, whatever the Cloud Size dial says.
-    // The 1.15 margin pushes past touching, because the rounded window fades before the border.
-    float swellFull = 2.0 * cell / span - 1.0;
-    float swell = lerp(1.0, swellFull * 1.15, clamp(push.cloud1.y, 0.0, 1.0));
-    // Footprint-normalised coordinates (0 at the instance centre). The window and the flow warp
-    // both work in this frame, so their reach is a fixed FRACTION of a cloud whether the dial says
-    // 32 blocks or 2048.
-    float2 fp = r / (span * scale * swell);
-    // Rounded-square window (a superellipse over the centered coordinates). A plain box window drew
-    // straight vertical walls wherever the baked cloud ran to its own border, and every instance read
-    // as a square card; the wide ramp blends the crop into the volumes' own border fade.
-    float2 cc = abs(fp) * 2.0;
-    float radius = pow(cc.x * cc.x * cc.x + cc.y * cc.y * cc.y, 1.0 / 3.0);
-    float window = 1.0 - smoothstep(0.96, 1.12, radius);
-    if (window <= 0.0) {
+    // Per-column crown: the column's own top comes from the coverage mask read at one fixed
+    // reference height, so the height field never moves with the sample's y and a body domes
+    // with its own shape — crown rising where the column is most saturated, sloping down at its
+    // rim — instead of every column ending on the deck's one horizontal lid.
+    float2 refAddr = cloudFieldAddress(p.xz, l.tallness * CLOUD_CROWN_REF, l.detailTile,
+            fineWind, fineWarp);
+    float refFine = 1.0 - cloudNoiseSample((refAddr + curl * l.detailTile) / l.detailTile, lod).r;
+    float hmask = cloudMaskLarge(worldPush.cloud1.z) * big
+            + cloudMaskFine(worldPush.cloud1.z) * refFine + CLOUD_MASK_BIAS;
+    float hexc = saturate(((cov - hmask) * rsqrt(max(cov, 1.0e-3))) / CLOUD_HEIGHT_RANGE);
+    float colTall = max(l.tallness * (CLOUD_CROWN_MIN
+            + (1.0 - CLOUD_CROWN_MIN) * pow(hexc, CLOUD_CROWN_POWER)), 1.0);
+    float below = p.y - l.base;
+    float above = l.base + colTall - p.y;
+    // Close the body on its own silhouette before the profile runs: a sample outside the box has no
+    // density whatever the column says, and these two clamps are what make the lid and the floor read
+    // as the cloud's own boundaries rather than as cuts through it.
+    shape = min(min(shape, saturate(above)), saturate(below));
+    // The underside curves in over the first few tens of blocks, so a base looks like a base.
+    float bottom = 1.0 - pow(1.0 - saturate(below / CLOUD_BASE_ROUND), 5.0);
+    // The crown tapers through the upper half of the column instead of cutting off at its top: at
+    // the top the term is zero, so the subtraction below reads "no density" there, and a cloud seen
+    // from below closes on a rounded crown rather than on a plane.
+    float top = saturate(above / colTall);
+    top = 1.0 - pow(1.0 - top, CLOUD_TOP_POWER);
+    shape = max(shape - 1.0 + top * bottom, 0.0);
+    if (shape <= 1.0e-3) {
         return 0.0;
     }
-    // Shape selection, made per PARENT cell (4x4 instance cells) rather than per cell: a shape hash
-    // per cell put a different volume against every instance wall, and the line that drew there was
-    // the shape change, not the density. A district now shares one volume, so the swap only lands
-    // where the weather already does. With CLOUD_RANDOM_STYLE the district draws from the whole
-    // atlas; otherwise it renders the pushed shape and, in a hash minority, one of its two neighbours
-    // in the slider order, so the type dial keeps its meaning. cloudColor.y is the atlas's last shape
-    // index Java pushes alongside, and clamps both paths.
-    float2 parentId = floor(cellId / 4.0);
-    float shapeRoll = cloudGridHash(parentId, 97.0);
-    float lastShape = max(push.cloudColor.y, 0.0);
-    float shape;
-    if ((push.flags & WORLD_FLAG_CLOUD_RANDOM) != 0u) {
-        shape = clamp(floor(shapeRoll * (lastShape + 1.0)), 0.0, lastShape);
+    // Interior texture: the thresholded mask saturates to a solid body, so without this modulation a
+    // crown is one smooth dome. The alpha octave swings the density while keeping the body solid —
+    // the erosion below bites where this made the body thinner, and the two read as one billow.
+    shape *= 1.0 - CLOUD_INNER_TEXTURE * (1.0 - detail.a);
+    if (!eroded || !detailOn) {
+        // The shadow field and the far decks read the un-eroded shape, shrunk by the mean depth of
+        // the cut so the shadow a deck casts matches the body a close look sees; the detail-off close
+        // view lands here too, skipping the three erosion fetches below.
+        return max(shape - CLOUD_EROSION * 0.5, 0.0);
+    }
+    // Wind shear: the crown leans downwind on a 1.5-power ramp measured from 20 blocks above the
+    // base, so the bottom stays planted while the top drifts.
+    float3 q = p;
+    q.xz += pow(max(below - 20.0, 0.0) / max(l.tallness * 0.2, 1.0), 1.5) * CLOUD_SHEAR;
+    q.xz -= wind * 0.25;
+    float falloff = 1.0 - saturate(above / max(colTall * 0.75, 1.0));
+    float e1 = 1.0 - cloudCellNoise(q / CLOUD_EROSION_CELL, lod);
+    float e2 = cloudCellNoise(q / (CLOUD_EROSION_CELL * 0.55), lod);
+    float e3 = 1.0 - cloudCellNoise(q / (CLOUD_EROSION_CELL * 0.30), lod);
+    float om = 1.0 - shape;
+    float erosion = e1 * sqrt(om);
+    erosion += abs(e2 - falloff) * CLOUD_EROSION_BASE * om * om * (1.0 - falloff * 0.5);
+    erosion += e3 * CLOUD_EROSION_FINE * om * (1.0 - falloff * 0.5);
+    erosion = erosion * erosion;
+    erosion *= erosion;
+    return max(shape - erosion * CLOUD_EROSION, 0.0);
+}
+
+// A high sheet. Altostratus is a wide, soft, low-contrast field whose threshold is squared, so the
+// sheet reads denser in its middle than at its edges; cirrus is the same threshold over a
+// curl-warped detail, which is what turns a smooth sheet into filaments.
+float cloudSheetDensity(CloudLayer l, float3 p, float2 wind, float lod) {
+    float cov = l.coverage;
+    if (cov <= 1.0e-3) {
+        return 0.0;
+    }
+    float aboveBase = p.y - l.base;
+    float2 warp = cloudFieldWarp(p.xz, l.fieldTile, wind);
+    float2 bigAddr = cloudFieldAddress(p.xz, aboveBase, l.fieldTile, wind, warp);
+    float big = cloudNoiseSample(bigAddr / l.fieldTile, lod).b;
+    float fine;
+    if (l.kind == 2) {
+        // The curl warps the DETAIL sampling coordinates, so a cirrus sheet breaks into filaments that
+        // flow rather than the smooth blobs a plain threshold would give it. The detail dial gates it
+        // like the cumulus erosion: off keeps the filament threshold but skips the three curl fetches.
+        float2 c = (p.xz - wind) / l.detailTile;
+        float2 curl = float2(0.0, 0.0);
+        if (worldPush.cloudColor.y > 0.5) {
+            curl = cloudCurl(c * 3.0) * 0.5 + cloudCurl(c * 7.0) * 0.25 + cloudCurl(c * 19.0) * 0.125;
+        }
+        float a = 1.0 - cloudNoiseSample(c * 0.6 + curl * 0.35, lod + 1.0).r;
+        float b = 1.0 - cloudNoiseSample(c * 2.3 + curl * 0.9, lod + 1.0).b;
+        fine = a * 0.6 + b * 0.4;
     } else {
-        shape = clamp(floor(push.cloud1.x)
-                + (shapeRoll < 0.18 ? -1.0 : shapeRoll > 0.82 ? 1.0 : 0.0),
-                0.0, lastShape);
+        // The red channel, not the blue the big field reads: one channel at two scales would threshold
+        // the same blobs twice and the sheet would carry no detail of its own.
+        float2 fineWind = -wind * 1.4;
+        float2 fineWarp = cloudFieldWarp(p.xz, l.detailTile, fineWind);
+        float2 fineAddr = cloudFieldAddress(p.xz, aboveBase, l.detailTile, fineWind, fineWarp);
+        fine = 1.0 - cloudNoiseSample(fineAddr / l.detailTile, lod).r;
     }
-    // Atlas layer = shape * RES + height slice; the clamp keeps the hand-made trilinear's second
-    // tap inside the shape's own layer band.
-    // The bodies FLOW: a two-octave warp scrolls through the footprint frame on the pushed flow
-    // clock (cloudColor.z, Java-accumulated on the wave clock), so edges undulate and interiors
-    // billow while the wind only slides the field. The warp is sampled in fp — the drifted,
-    // footprint-normalised frame — so the pattern advects WITH its cloud: frozen turbulence,
-    // shape evolving as it moves. Warping the atlas coordinate after the window keeps the
-    // footprint and the gate economy fixed; only the sampled shape moves.
-    float phase = push.cloudColor.z;
-    float2 warp = (cloudFlowNoise(fp * 3.0 + float2(phase * 0.37, phase * 0.23), 7.0) - 0.5)
-            + 0.5 * (cloudFlowNoise(fp * 7.0 + float2(-phase * 0.53, phase * 0.31), 11.0) - 0.5);
-    float2 local = fp + 0.5 + warp * CLOUD_FLOW_AMPLITUDE;
-    float layerF = min(vertical01 * (CLOUD_VOLUME_RES - 1.0), CLOUD_VOLUME_RES - 1.001);
-    float l0 = floor(layerF);
-    float layer = shape * CLOUD_VOLUME_RES + l0;
-    float a = cloudVolumes.SampleLevel(float3(local.x, local.y, layer), 0.0).r;
-    float b = cloudVolumes.SampleLevel(float3(local.x, local.y, layer + 1.0), 0.0).r;
-    return lerp(a, b, layerF - l0) * window;
-}
-
-// Transmittance of the cloud layer along a sun leg from `pos` (rebased): the density sampled where
-// the leg crosses the layer's mid-height plane, with the optical depth thickened by the leg's slant.
-// This is the one estimate the ground-level NEE, the fog sun legs and the sheet's own self-shadow all
-// share, so a clouded sun dims identically in all of them. Returns 1 while clouds are off — the
-// callers' multiply keeps them bit-identical.
-public float cloudShadowTransmittance(float3 pos, float3 sunDir) {
-    if ((worldPush.flags & WORLD_FLAG_CLOUD) == 0u || worldPush.cloud0.x <= 0.0) {
-        return 1.0;
-    }
-    // The body's own elevation gate. A sun at the horizon has no light left to shadow, but
-    // switching the shadow off at a fixed elevation put a step on every surface the deck shades:
-    // at 2.87 degrees the shadow vanished between two frames. Fade it out over the last few
-    // degrees instead, and clamp the leg's denominator with the same floor so the tau being
-    // blended stays finite.
-    float shadowGate = smoothstep(0.0, 0.06, sunDir.y);
-    if (shadowGate <= 0.0) {
-        return 1.0; // the body sits at or below the horizon; there is no light left to shadow
-    }
-    float denom = max(sunDir.y, 0.02);
-    float t = (cloudBoxMid(worldPush) - pos.y) / denom;
-    if (t <= 0.0) {
-        return 1.0; // the sample is at or above the layer along the sun leg
-    }
-    float2 drifted = pos.xz + sunDir.xz * t + worldPush.cloud2.xy + worldPush.cloud2.zw;
-    float density = cloudInstanceDensity(worldPush, drifted, 0.5);
-    if (density <= 0.0) {
-        return 1.0;
-    }
-    float tau = density * worldPush.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / denom;
-    return lerp(1.0, exp(-tau), shadowGate);
-}
-
-/** Field sample at one world position's projection, for the debug views. */
-public float cloudCoverageWorld(float2 rebasedXZ) {
-    if ((worldPush.flags & WORLD_FLAG_CLOUD) == 0u || worldPush.cloud0.x <= 0.0) {
+    // Every deck, sheets included, clears the same threshold. The numbers differ (their own coverage
+    // and density lanes) but the shape language is one, which is why a high sheet reads as weather
+    // rather than as a different effect pasted over the cumulus.
+    float shape = cloudCoverageMask(big, fine, cov, worldPush.cloud1.z);
+    float below = p.y - l.base;
+    float above = l.top - p.y;
+    if (below <= 0.0 || above <= 0.0) {
         return 0.0;
     }
-    return cloudInstanceDensity(worldPush, rebasedXZ + worldPush.cloud2.xy + worldPush.cloud2.zw,
-            CLOUD_SHEET_HEIGHT);
+    // A sheet's own slab: two blocks of ramp so the plane has an edge instead of a step.
+    shape = min(shape, saturate(above * 0.4));
+    return min(shape, saturate(below * 0.4));
 }
 
-// The colour the pushed illuminance is tinted with, and how far it may be pulled off white. The derived
-// body's colour is normalised to unit LUMINANCE rather than to its brightest channel, so the deck keeps the
-// level the look constant means and only its hue moves: normalising to the brightest channel would dim the
-// deck by the colour's own luminance - 0.42 for a one-degree sun - and a warm deck two stops down reads as
-// brown. Applied at full strength even the luminance-normalised one-degree sunset colour (red at 2.4, blue
-// at 0.12) is an impossible light, and the ACES highlight roll-off turned the deck khaki rather than a
-// sunset, which is why the trim is a constant and not the raw colour. A body that is down derives a zero
-// colour, and that returns zero: no light, whatever the look constant says.
+// The coverage fields' own fetch for a cumulus sample, for the callers that need it without paying for
+// the profile and the erosion: the march's column rejection, and the light leg's slab midpoint.
+float cloudCumulusMaskBig(CloudLayer l, float3 p, float2 wind, float lod, out float2 warp) {
+    warp = cloudFieldWarp(p.xz, l.fieldTile, wind);
+    float2 addr = cloudFieldAddress(p.xz, p.y - l.base, l.fieldTile, wind, warp);
+    return cloudNoiseSample(addr / l.fieldTile, lod).b;
+}
+
+// Density 0..1 at one point of one deck.
+public float cloudLayerDensity(WorldPush push, int index, float3 p, float2 wind, float lod, bool eroded) {
+    CloudLayer l = cloudLayerOf(push, index);
+    if (l.kind == 0) {
+        float2 warp;
+        float big = cloudCumulusMaskBig(l, p, wind, lod, warp);
+        return cloudCumulusDensity(l, p, wind, lod, eroded, warp, big);
+    }
+    return cloudSheetDensity(l, p, wind, lod);
+}
+
+// XZ wind offset for one deck, in blocks. The Java drift is one world-space offset; each deck scales
+// it so the stack shears instead of sliding as a rigid sheet.
+float2 cloudLayerWind(WorldPush push, int index) {
+    CloudLayer l = cloudLayerOf(push, index);
+    return (push.cloud2.xy + push.cloud2.zw) * l.windScale;
+}
+
+// ---- Light ---------------------------------------------------------------------------------------
+
+// The phase a sample is lit by: four Henyey-Greenstein lobes interpolated by the powder term. The
+// strong forward lobes are the sun-facing rim of a body; the weak ones carry the flat middle; the
+// back lobe is the silver lining when the body sits between the eye and the sun. A constant blend of
+// two lobes cannot do this — the powder weight is what makes a thin rim and a thick core light
+// differently at the same view angle.
+float cloudPhase4(float cosTheta, float powder) {
+    float a = lerp(hg(cosTheta, 0.80), hg(cosTheta, 0.55), powder);
+    float b = lerp(hg(cosTheta, 0.35), hg(cosTheta, 0.10), powder);
+    return lerp(a, b, powder) + powder * 2.0 * hg(-cosTheta, 0.25);
+}
+
+// Density-based Beer-Powder: the sample's own density, not the view angle or the light leg, decides
+// how much of the strong forward lobe it keeps. A thin rim at the isosurface is lit almost entirely by
+// the forward scatter (the silver lining); a solid interior sits on the flat lobes. Bounded above so a
+// thin sample cannot be multiplied past the direct level the look constant sets.
+float cloudPowder(float shape) {
+    return min(exp(-4.0 * exp(-4.0 * shape)) * 3.5, 1.0);
+}
+
+// The one body lighting the stack, resolved once per ray so no deck can disagree about the hour.
+public struct CloudLight {
+    public float3 dir;
+    public float3 direct;     // illuminance * tint * gain
+    public float3 ambient;    // sky irradiance term
+    public float  cosTheta;   // dot(view, light)
+};
+
+// The colour the pushed illuminance is tinted with, and how far it may be pulled off white. The
+// derived body's colour is normalised to unit LUMINANCE rather than to its brightest channel, so the
+// deck keeps the level the look constant means and only its hue moves: normalising to the brightest
+// channel would dim the deck by the colour's own luminance — 0.42 for a one-degree sun — and a warm
+// deck two stops down reads as brown.
 public static const float CLOUD_LIGHT_TINT = 0.5;
 
 public float3 cloudLightTint(float3 derivedIlluminance) {
@@ -637,13 +901,10 @@ public float3 cloudLightTint(float3 derivedIlluminance) {
     return lerp(float3(1.0, 1.0, 1.0), chroma, CLOUD_LIGHT_TINT);
 }
 
-// The elevation the deck's direct level rides. cloudLightTint returns unit luminance by
-// construction, so without this ramp the deck is lit at the pushed look constant from noon all
-// the way to the horizon gate and then loses the entire direct term in one step -- and that step
-// lands on the frame where dominantCelestialLight hands the light to the moon, 128000 lux to 5.
-// The ramp reaches zero just below that handoff (it flips at alpha = -0.81 degrees), so the moon
-// takes over between two levels that are both already zero, and the deck's brightness follows the
-// sun through the last five degrees instead of holding flat and falling off a cliff.
+// The elevation the deck's direct level rides. cloudLightTint returns unit luminance by construction,
+// so without this ramp the deck is lit at the pushed look constant from noon all the way to the
+// horizon gate and then loses the entire direct term in one step — and that step lands on the frame
+// where dominantCelestialLight hands the light to the moon, 128000 lux to 5.
 public static const float CLOUD_LEVEL_ZERO_ALT = -0.012;  // cos zenith, -0.69 degrees
 public static const float CLOUD_LEVEL_FULL_ALT = 0.080;   // cos zenith, +4.6 degrees
 
@@ -651,298 +912,516 @@ float cloudDaylightLevel(float sunDirY) {
     return smoothstep(CLOUD_LEVEL_ZERO_ALT, CLOUD_LEVEL_FULL_ALT, sunDirY);
 }
 
-// The planar sheet as sky.rmiss renders it: single scatter of the dominant celestial where the view
-// ray crosses the layer's mid-height plane, plus the sky-dome ambient, with the sheet's transmittance
-// out for the caller to attenuate the sky behind it (atmosphere, stars, discs) with. The density is
-// one instance fetch at the crossing — the same field the shadow probes read, which is exactly what
-// makes the sheet and its shadows agree. A camera inside the body sees the mid-height cut; far
-// crossings fade into the haze they sit behind.
-public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
-                                      out float cloudT) {
+CloudLight cloudLightOf(SkyState state, float3 rd) {
+    CloudLight light;
+    CelestialLight body = dominantCelestialLight(state, transmittanceLut);
+    light.dir = body.dir;
+    bool sunDominant = dot(body.dir, state.sunDir) >= dot(body.dir, state.moonDir);
+    float level = sunDominant ? state.sunIlluminance : state.moonIlluminance;
+    if (sunDominant) {
+        level *= cloudDaylightLevel(state.sunDir.y);
+    }
+    light.direct = level * cloudLightTint(body.illuminance) * CLOUD_DIRECT_GAIN;
+    // The sky term is the HEMISPHERE irradiance the fog and the water read, not the radiance of one
+    // direction; INV_PI turns the cos-weighted integral back into the average radiance the albedo
+    // multiplies. The weight is clamped because it is a config lane.
+    light.ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
+            * clamp(worldPush.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;
+    light.cosTheta = dot(rd, body.dir);
+    return light;
+}
+
+// One sample's radiance. `shape` is the density 0..1, `tauSun` the optical depth toward the body and
+// `height01` the sample's position inside the deck (0 at the base, 1 at the crown).
+//
+// The direct term is the multi-scatter approximation, but its exponent takes a NORMALISED shadow
+// mask, not the raw optical depth: a 130-block cumulus at 0.5/block puts tens of optical depths on
+// even the shortest light leg, and exp(-5·tau) would be zero everywhere — the whole sky renders as
+// one flat, ambient-only grey sheet. Dividing by CLOUD_LIGHT_DEPTH_SCALE before 1-exp(-tau) maps that
+// leg back to [0, 1], so an unshadowed rim keeps 6.28 of the bounced-light gain, a deep core keeps
+// 6.28·exp(-5) and the deck keeps a lit crown over a darker base instead of a uniform slab.
+float3 cloudSampleRadiance(float shape, float tauSun, float height01, CloudLight light) {
+    float powder = cloudPowder(shape);
+    float phase = cloudPhase4(light.cosTheta, powder);
+    float sunMask = 1.0 - exp(-tauSun / CLOUD_LIGHT_DEPTH_SCALE);
+    float beer = 6.28 * exp(-5.0 * sunMask);
+    float3 direct = beer * light.direct * phase;
+    float occl = height01 * height01;
+    float ambOcclusion = lerp(CLOUD_AMBIENT_FLOOR, 1.0,
+            lerp(1.0, exp2(-5.0 * saturate(shape)), occl * CLOUD_AMBIENT_OCCLUSION));
+    float3 ambient = light.ambient * ambOcclusion;
+    return CLOUD_ALBEDO * (direct + ambient);
+}
+
+// ---- Sampling the stack along a ray ----------------------------------------------------------------
+
+// The stretch of [0, tMax] a ray spends inside one deck, or an empty range.
+bool cloudLayerSpan(CloudLayer l, float3 ro, float3 rd, float tMax, out float t0, out float t1) {
+    t0 = 0.0;
+    t1 = 0.0;
+    if (abs(rd.y) < 1.0e-6) {
+        // A ray parallel to a sheet never enters it unless it starts inside.
+        if (ro.y <= l.base || ro.y >= l.top) {
+            return false;
+        }
+        t1 = tMax;
+        return t1 > 0.0;
+    }
+    float ta = (l.base - ro.y) / rd.y;
+    float tb = (l.top - ro.y) / rd.y;
+    t0 = max(min(ta, tb), 0.0);
+    t1 = min(max(ta, tb), tMax);
+    return t1 > t0;
+}
+
+// The optical depth a sample sees toward the body through its own deck: the stretch of the sun ray
+// that still lies between the deck's base and its crown, priced by one density sample at the midpoint
+// of each of the leg's sub-segments. The span is clipped analytically rather than sampled, so the leg
+// stays continuous where the sun crosses a deck's lid or floor — a sampled span would step the shadow
+// mask as the crossing moves. The sample count is the Cloud Light Steps dial (cloud1.x, clamped to
+// 1..8): 1 is the single midpoint tap the tier shipped with, more resolve the light gradient through
+// the body. `CLOUD_LIGHT_BREAK` caps the leg, whose only consumer is the normalised multi-scatter mask.
+float cloudSunTau(WorldPush push, int index, CloudLayer l, float3 p, float2 wind, float3 ro,
+                  float3 sunDir) {
+    float tallness = max(l.tallness, 1.0);
+    float below = p.y - l.base;
+    float legLen = max(tallness, 24.0);
+    if (abs(sunDir.y) > 1.0e-6) {
+        // Distance to the plane the leg leaves through, measured from the sample: the crown for a
+        // rising sun, the base for a setting one.
+        float exit = sunDir.y > 0.0 ? (tallness - below) / sunDir.y : below / (-sunDir.y);
+        legLen = min(legLen, max(exit, 0.0));
+    }
+    if (legLen <= 0.0) {
+        return 0.0;
+    }
+    int steps = int(clamp(push.cloud1.x, 1.0, 8.0));
+    float dt = legLen / float(steps);
+    float tau = 0.0;
+    for (int i = 0; i < steps; i++) {
+        float3 lp = p + sunDir * ((float(i) + 0.5) * dt);
+        float v = lp.y - l.base;
+        // Each tap's weight ramps to zero over its last blocks inside the slab, so the leg's result
+        // is continuous in p wherever it meets the deck's lid or floor.
+        float edge = min(v, tallness - v);
+        float tap = cloudLayerDensity(push, index, lp, wind, cloudLod(length(lp - ro), l.detailTile),
+                false) * l.density * dt;
+        tau += tap * saturate(edge / CLOUD_LIGHT_EDGE);
+    }
+    return min(tau, CLOUD_LIGHT_BREAK);
+}
+
+// March one deck between t0 and t1 and composite it into the running (L, T). `steps` is this deck's
+// share of the budget, `jitter` the per-pixel phase, `fade` the dissipation applied to its opacity.
+void cloudMarchLayer(WorldPush push, int index, float3 ro, float3 rd, float t0, float t1,
+                     float steps, float jitter, float fade, CloudLight light,
+                     inout float3 L, inout float T) {
+    CloudLayer l = cloudLayerOf(push, index);
+    if (l.coverage <= 1.0e-3) {
+        return;
+    }
+    float2 wind = cloudLayerWind(push, index);
+    float dt = (t1 - t0) / max(steps, 1.0);
+    float tallness = max(l.tallness, 1.0);
+    for (int i = 0; i < int(steps); i++) {
+        float t = t0 + (float(i) + jitter) * dt;
+        float3 p = ro + rd * t;
+        float dist = length(p - ro);
+        float lod = cloudLod(dist, l.detailTile);
+        // One warp fetch and one field fetch reject the empty majority of the sky before the profile,
+        // the erosion and the light leg are paid for. The address is the density's own, through the
+        // shared helpers, so the rejection and the fetches it prunes cannot disagree — and the fetch
+        // it kept is handed to the density below rather than repeated.
+        float2 warp;
+        float big = cloudCumulusMaskBig(l, p, wind, lod, warp);
+        // A lower bound on the mask: the fine term is non-negative, so a big field that already clears
+        // the threshold on its own cannot leave any density behind.
+        if (cloudMaskLarge(worldPush.cloud1.z) * big + CLOUD_MASK_BIAS >= l.coverage) {
+            continue;
+        }
+        float density = cloudCumulusDensity(l, p, wind, lod, true, warp, big);
+        if (density <= 1.0e-4) {
+            continue;
+        }
+        float height01 = saturate((p.y - l.base) / tallness);
+        // The vertical weight: the base quarter absorbs far less than the crown, which is what gives
+        // a deck a translucent, cooler underside instead of a solid black floor.
+        float faded = density * pow(saturate(height01 * 4.0), 2.0);
+        float tauCell = faded * l.density * dt;
+        if (tauCell <= 1.0e-5) {
+            continue;
+        }
+        float tauSun = cloudSunTau(push, index, l, p, wind, ro, light.dir);
+        float3 radiance = cloudSampleRadiance(density, tauSun, height01, light);
+        float absorbed = (1.0 - exp(-tauCell)) * fade;
+        L += T * absorbed * radiance;
+        T *= 1.0 - absorbed;
+        if (T < 3.0e-3) {
+            return;
+        }
+    }
+}
+
+// The stack's planar compositing, shared by the sky miss shader and the segment out-scatter. `tMax`
+// is the reach of the ray: a surface nearer than a deck cannot be veiled by it, so the same function
+// serves a ray that escapes and one that stops on geometry.
+float3 cloudPlanarStack(WorldPush push, float3 ro, float3 rd, SkyState state, float tMax,
+                        out float cloudT) {
     cloudT = 1.0;
     if ((push.flags & WORLD_FLAG_CLOUD) == 0u || push.cloud0.x <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
-    float mid = cloudBoxMid(push);
-    bool below = ro.y < mid;
-    bool above = ro.y > mid;
-    if (below == above) {
-        return float3(0.0, 0.0, 0.0);
+    CloudLight light = cloudLightOf(state, rd);
+    float3 L = float3(0.0, 0.0, 0.0);
+    float T = 1.0;
+    bool upward = rd.y >= 0.0;
+    for (int n = 0; n < CLOUD_LAYER_COUNT; n++) {
+        int index = upward ? n : CLOUD_LAYER_COUNT - 1 - n;
+        CloudLayer l = cloudLayerOf(push, index);
+        if (l.coverage <= 1.0e-3) {
+            continue;
+        }
+        float mid = l.base + 0.5 * l.tallness;
+        bool below = ro.y < mid;
+        if (below == (ro.y > mid)) {
+            continue;
+        }
+        if (below ? rd.y < 1.0e-3 : rd.y > -1.0e-3) {
+            continue; // the ray runs away from the plane
+        }
+        float t = (mid - ro.y) / rd.y;
+        if (t <= 0.0 || t >= tMax) {
+            continue;
+        }
+        // Dissipation distance: the visible layer fades over the last 40% of the pushed range and is
+        // not rendered past it. The shadow field has no per-ray fade; its relevance is decided by the
+        // host's WORLD_FLAG_CLOUD_SHADOW gate.
+        float fadeDist = max(push.cloud1.w, 64.0) * (l.kind == 0 ? 1.0 : CLOUD_SHEET_FADE_MULT);
+        float fade = 1.0 - smoothstep(fadeDist * 0.6, fadeDist, t);
+        if (fade <= 0.0) {
+            continue;
+        }
+        float3 p = ro + rd * t;
+        float2 wind = cloudLayerWind(push, index);
+        float lod = cloudLod(t, l.detailTile);
+        float density = cloudLayerDensity(push, index, p, wind, lod, true);
+        if (density <= 0.0) {
+            continue;
+        }
+        // Perspective thickening: a grazing sight line crosses proportionally more body. The
+        // self-shadow is the stack's own shadow field at the crossing, so the sheet and the ground it
+        // shades agree about how much light is left.
+        float tau = density * l.density * l.tallness / max(abs(rd.y), 0.04);
+        float shadowT = cloudShadowTransmittance(p, light.dir);
+        float tauSun = -log(max(shadowT, 1.0e-3));
+        float3 radiance = cloudSampleRadiance(density, tauSun, 0.5, light);
+        float opacity = (1.0 - exp(-tau)) * fade;
+        L += T * opacity * radiance;
+        T *= 1.0 - opacity;
+        if (T < 3.0e-3) {
+            break;
+        }
     }
-    if (below ? rd.y < 1.0e-3 : rd.y > -1.0e-3) {
-        return float3(0.0, 0.0, 0.0); // the ray runs away from the plane
-    }
-    float t = (mid - ro.y) / rd.y;
-    // Dissipation distance (cloud1.w): the sheet fades over the last 40% of the pushed range and
-    // is not rendered at all past it — clouds beyond the fade cost nothing. Deliberately a sheet-
-    // only fade: the shadow field stays unfaded, because the layer still exists overhead and a
-    // shadow dissolving with distance would smear across the ground as a gradient.
-    float fadeDist = max(push.cloud1.w, 64.0);
-    float fade = 1.0 - smoothstep(fadeDist * 0.6, fadeDist, t);
-    if (fade <= 0.0) {
-        return float3(0.0, 0.0, 0.0);
-    }
-    // Two vertical taps straddling the sheet height average the column the crossing implies, so the
-    // flat tier's silhouette carries some of the volume the walk would resolve instead of one
-    // slice's speckle.
-    float boxH = cloudBoxHeight(push);
-    float slabBand = CLOUD_SHEET_BAND;
-    float2 drift = ro.xz + rd.xz * t + push.cloud2.xy + push.cloud2.zw;
-    float density = 0.5 * (cloudInstanceDensity(push, drift, CLOUD_SHEET_HEIGHT - slabBand)
-            + cloudInstanceDensity(push, drift, CLOUD_SHEET_HEIGHT + slabBand));
-    if (density <= 0.0) {
-        return float3(0.0, 0.0, 0.0); // cloudT stays 1: clear sky, nothing to attenuate with
-    }
-    // Perspective thickening: a grazing sight line crosses proportionally more slab.
-    float tau = density * push.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / max(abs(rd.y), 0.04);
-    // The fade dissolves the slab's OPACITY, not just its glow: radiance and occlusion scale by
-    // the same factor (cloudT = 1 - opacity). Fading the radiance alone painted the dissipation
-    // band black — a grazing sight line saturates the transmittance to 0 long before the fade
-    // ends, so cloudL + 0 x sky approached zero and the far edge read as a black silhouette band.
-    float opacity = (1.0 - exp(-tau)) * fade;
-    cloudT = 1.0 - opacity;
-    // Which body lights the sheet, and what colour its light arrives in, come from the DERIVED celestial —
-    // the same derivation world.rgen hands the fog, so the sky, the fog and the sheet cannot disagree about
-    // which body is up. Its LEVEL deliberately does not: the atmosphere's transmittance along a
-    // one-degree sun leaves a rounding error, and lighting the deck with that literal left the whole deck
-    // black at an hour when a real one burns. The level stays the pushed look constant, which is what keeps
-    // the deck's brightness on its daytime curve, and what the derived light contributes is a fraction of
-    // its chromaticity (see cloudLightTint). A body that is down arrives at zero transmittance, so its tint
-    // is nothing and the deck darkens by itself — the atmosphere is the horizon gate, with no separate
-    // elevation test needed.
-    CelestialLight light = dominantCelestialLight(state, transmittanceLut);
-    float3 lightDir = light.dir;
-    bool sunDominant = dot(lightDir, state.sunDir) >= dot(lightDir, state.moonDir);
-    float lightLevel = sunDominant ? state.sunIlluminance : state.moonIlluminance;
-    // The sun's level is a look constant, so it has to carry the elevation ramp itself; the
-    // moon's does not, because this factor has already reached zero at the handoff.
-    if (sunDominant) {
-        lightLevel *= cloudDaylightLevel(state.sunDir.y);
-    }
-    float3 lightIll = lightLevel * cloudLightTint(light.illuminance);
-    float tauSelf = density * push.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH
-            / max(lightDir.y, 0.05);
-    // Multiple-scatter approximation for the slab's self-shadow. A pure single-scatter sheet darkens a
-    // thick deck to ambient-only, which reads as blue-grey daytime clouds and as black cut-outs at night;
-    // real cloud tops are bright because photons bounce inside them. Three octaves of halved extinction,
-    // energy-normalised so an unshadowed sample still reaches exactly 1 — thin edges keep the exact
-    // single-scatter value, thick cores keep a lit presence.
-    float selfT = cloudSelfShadow(tauSelf);
-    float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE * hg(dot(rd, lightDir), CLOUD_G) * 0.7;
-    // The sheet's ambient is the sky's HEMISPHERE irradiance — the same bake the fog and the water read,
-    // evaluated through sky.slang so the three cannot drift apart — and not the radiance of a single
-    // direction. A zenith sample is the coldest, dimmest part of a sunset sky, so a deck hanging under a
-    // bright warm horizon band came out grey. INV_PI turns the cos-weighted integral back into the average
-    // radiance the albedo multiplies. The weight is clamped: it is a config lane, and the night this
-    // shipped a lane-order slip fed a growing drift accumulator into it and the sky glowed. A bounded read
-    // makes that class of accident merely wrong instead of blinding.
-    float3 ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
-            * clamp(push.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;
-    return CLOUD_ALBEDO * opacity * (phase * lightIll * selfT + ambient);
+    cloudT = T;
+    return L;
 }
 
-// ---- Volumetric cloud march (the raymarcher tier) ----------------------------------------------------
-//
-// The walk spans the instance box — standing on cloudBase, Cloud Thickness deep — while the planar
-// tier prices the same body in one crossing: both price CLOUD_COLUMN_DEPTH, and cloudDensityScale
-// spreads that column over the box's height. So this tier is not a second
-// parameterisation of the clouds: it is the same layer, walked instead of estimated, and both tiers
-// answer the same question at the same scale (which is why the step count can be turned down and the
-// two must not disagree about how much light gets through).
-//
-// What the walk adds over a single crossing is the baked volume's real 3D shape and a light march
-// through it — the two things a plane crossing cannot express, and the reason the extra cost buys
-// anything at all. The march is the clouds_unreal raymarcher's: jittered primary steps accumulating
-// Beer-Lambert extinction, and per in-cloud sample a short secondary march toward the dominant body
-// whose accumulated tau feeds the same multi-scatter octave stack the sheet uses, so both tiers grade
-// identically under the same light.
+// ---- The stack's public surface ---------------------------------------------------------------------
 
-public static const float CLOUD_STEP_MIN = 8.0;        // steps below this alias visibly at the rims
-// Samples the walk spends per slab thickness when the crossing is close to vertical. The baked shape
-// is resolved at that rate; the pushed step lane is a CEILING the crossing grows into as the
-// perspective thickens it (1/|rd.y|), not a rate every ray must pay.
-public static const float CLOUD_STEPS_PER_THICKNESS = 12.0;
-// Secondary (light) march: steps and their minimum world-space length. Three taps is what the baked
-// volumes need — their density is smooth on the scale of a slice, so a longer march buys aliasing
-// samples, not accuracy — and the multi-scatter stack on top of it carries the depth the raw
-// single-scatter tau would miss.
-public static const int CLOUD_LIGHT_STEPS = 3;
-public static const float CLOUD_LIGHT_STEP_MIN = 24.0; // blocks per light leg
-
-// Light-march optical depth from one point toward the body: the instance field re-evaluated along
-// the leg, bounded, early-outing once the tau is deep enough that the octave stack is saturated
-// anyway. The leg leaves the sample's own instance quickly at off-vertical sun angles, and the
-// neighbour it enters carries the rest — the grid lookup is the same one the primary step used.
-float cloudLightTau(WorldPush push, float3 p, float3 lightDir, float boxH) {
-    float stepLen = max(boxH, CLOUD_LIGHT_STEP_MIN) / float(CLOUD_LIGHT_STEPS);
+// Transmittance of the stack along a sun leg from `pos` (rebased): each cumulus and alto deck is
+// sampled along the leg's stretch through its slab — one tap at the mid-height plane by default,
+// the Cloud Shadow Steps dial's count averaged symmetrically around it — and the optical depth is
+// thickened by the leg's slant. This is the one estimate the ground-level NEE, the fog sun legs and
+// the sheets' own self-shadow share, so a clouded sun dims identically in all of them. Returns 1
+// while the shadow field is off — the callers' multiply keeps them bit-identical.
+public float cloudShadowTransmittance(float3 pos, float3 sunDir) {
+    if ((worldPush.flags & WORLD_FLAG_CLOUD_SHADOW) == 0u || worldPush.cloud0.x <= 0.0) {
+        return 1.0;
+    }
+    // The body's own elevation gate. A sun at the horizon has no light left to shadow, but switching
+    // the shadow off at a fixed elevation put a step on every surface the deck shades: at 2.87 degrees
+    // the shadow vanished between two frames. Fade it out over the last few degrees instead, and clamp
+    // the leg's denominator with the same floor so the tau being blended stays finite.
+    float shadowGate = smoothstep(0.0, 0.06, sunDir.y);
+    if (shadowGate <= 0.0) {
+        return 1.0;
+    }
+    float denom = max(sunDir.y, 0.02);
     float tau = 0.0;
-    float3 lp = p;
-    for (int s = 0; s < CLOUD_LIGHT_STEPS; s++) {
-        lp += lightDir * stepLen;
-        float v = (lp.y - cloudBoxBottom(push)) / boxH;
-        if (v < 0.0 || v > 1.0) {
-            break; // the leg left the slab; whatever is above it no longer occludes this sample
+    // Cirrus is deliberately absent: at 0.005/block over five blocks its column is a few percent, and
+    // paying a fetch per NEE site for that is not a trade this field makes.
+    for (int index = CLOUD_LOW; index <= CLOUD_ALTO; index++) {
+        CloudLayer l = cloudLayerOf(worldPush, index);
+        if (l.coverage <= 1.0e-3) {
+            continue;
         }
-        tau += cloudInstanceDensity(push,
-                lp.xz + push.cloud2.xy + push.cloud2.zw, v) * CLOUD_EXTINCTION * stepLen
-                * cloudDensityScale(push);
-        if (tau > 4.0) {
-            break; // the stack's output is flat past this; the taps would be pure waste
+        float mid = l.base + 0.5 * l.tallness;
+        float t = (mid - pos.y) / denom;
+        if (t <= 0.0) {
+            continue;
         }
+        float2 wind = cloudLayerWind(worldPush, index);
+        // The quality dial's sample count, spread symmetrically around the mid-plane crossing: 1 is
+        // the single tap the field shipped with, more average the leg's own density profile through
+        // the slab. A sample outside the slab reads zero shape, so the spread needs no clipping.
+        int steps = int(clamp(worldPush.volumeParams.z, 1.0, 4.0));
+        float legLen = l.tallness / denom;
+        float densitySum = 0.0;
+        for (int i = 0; i < steps; i++) {
+            float ti = t + (float(i) - 0.5 * float(steps - 1)) * (legLen / float(steps));
+            float3 p = pos + sunDir * ti;
+            densitySum += cloudLayerDensity(worldPush, index, p, wind,
+                    cloudLod(length(p - pos), l.detailTile), false);
+        }
+        tau += (densitySum / float(steps)) * l.density * l.tallness / denom;
     }
-    return tau;
+    return lerp(1.0, exp(-tau), shadowGate);
 }
 
-// Volumetric cloud slab as sky.rmiss renders it: a jittered walk across the slab accumulating
-// in-scatter and transmittance. `pix` seeds the pixel-fixed blue-noise offset that advances one
-// golden-ratio stride per frame — a per-frame re-roll is a signal the denoiser cannot accumulate,
-// while a rotating pixel-fixed pattern is one it averages. The fade and the multi-scatter doctrine
-// are the planar tier's, so the tiers degrade into each other instead of jumping.
+/** Field sample at one world position's projection, for the debug views. */
+public float cloudCoverageWorld(float2 rebasedXZ) {
+    if ((worldPush.flags & WORLD_FLAG_CLOUD) == 0u || worldPush.cloud0.x <= 0.0) {
+        return 0.0;
+    }
+    CloudLayer low = cloudLayerOf(worldPush, CLOUD_LOW);
+    float2 wind = cloudLayerWind(worldPush, CLOUD_LOW);
+    float3 p = float3(rebasedXZ.x, low.base + 0.5 * low.tallness, rebasedXZ.y);
+    return cloudLayerDensity(worldPush, CLOUD_LOW, p, wind, 0.0, true);
+}
+
+#ifndef CAUSTICA_NO_VISIBLE_CLOUD_PATH
+
+// The planar tier as sky.rmiss renders it: every deck crossed once, front to back, composited into
+// one transmittance. A camera inside a deck sees its mid-height cut; far crossings fade into the haze
+// they sit behind.
+public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                      out float cloudT) {
+    return cloudPlanarStack(push, ro, rd, state, 1.0e12, cloudT);
+}
+
+// The stack's out-scattering on a segment that ENDS ON GEOMETRY. sky.rmiss composites the layer only
+// for rays that escape, so a ray that crosses the deck and then lands on terrain — the view from above
+// the layer, a reflection or a refraction that finds a hillside — otherwise draws that surface as if
+// no cloud lay in front of it. The crossings are clipped to [0, tMax]: a surface nearer than a deck
+// cannot be veiled by it. Gated on its own flag so a frame with all volumetrics off never reaches the
+// density fetch.
+public float3 cloudSegmentOutScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                     float tMax, out float cloudT) {
+    if ((push.flags & WORLD_FLAG_CLOUD_OUTSCATTER) == 0u) {
+        cloudT = 1.0;
+        return float3(0.0, 0.0, 0.0);
+    }
+    return cloudPlanarStack(push, ro, rd, state, tMax, cloudT);
+}
+
+// ---- Volumetric march (the raymarcher tier) ---------------------------------------------------------
+//
+// The walk spans every deck the ray meets, front to back. The budget is a SAMPLE count shared across
+// the decks in proportion to the slab span each one catches, capped by a target step of two erosion
+// cells: a grazing sight line through a slab needs an order more samples than a vertical one, and a
+// fixed per-deck split starves exactly the ray that needs the help. The planar tier prices the same
+// stack in one crossing per deck, with the same shape field, the same layer densities and the same
+// light, so the two tiers degrade into each other instead of into a different sky.
 public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
                                        float2 pix, out float cloudT) {
     cloudT = 1.0;
-    if ((push.flags & WORLD_FLAG_CLOUD) == 0u || push.cloud0.x <= 0.0 || abs(rd.y) < 1.0e-6) {
-        // A ray parallel to the slab never crosses its thickness; a zero-coverage layer has nothing to
-        // cross. Either way cloudT stays 1 and the caller's compose is a no-op.
+    if ((push.flags & WORLD_FLAG_CLOUD) == 0u || push.cloud0.x <= 0.0) {
+        // A zero-coverage layer has nothing to cross; cloudT stays 1 and the caller's compose is a
+        // no-op. A ray parallel to every deck is handled per deck by cloudLayerSpan.
         return float3(0.0, 0.0, 0.0);
     }
-    float boxBottom = cloudBoxBottom(push);
-    float boxH = cloudBoxHeight(push);
-    float boxTop = boxBottom + boxH;
-    float ta = (boxBottom - ro.y) / rd.y;
-    float tb = (boxTop - ro.y) / rd.y;
-    float t0 = max(min(ta, tb), 0.0);
-    float t1 = max(ta, tb);
-    if (t1 <= t0) {
-        return float3(0.0, 0.0, 0.0); // the camera is above the layer looking away, or below looking down
+    if (push.volumeParams.w < 1.0) {
+        return cloudPlanarStack(push, ro, rd, state, 1.0e12, cloudT);
     }
-    // Dissipation distance (cloud1.w): same sheet-only fade the planar tier applies, and applied to
-    // the slab's OPACITY rather than to its glow alone — fading the radiance alone painted the
-    // dissipation band black.
-    float fadeDist = max(push.cloud1.w, 64.0);
-    float fade = 1.0 - smoothstep(fadeDist * 0.6, fadeDist, t0);
-    if (fade <= 0.0) {
-        return float3(0.0, 0.0, 0.0);
-    }
-
-    // The same body selection and the same tinted-level rule as the sheet, so the tier toggle cannot
-    // change the light the deck is drawn under.
-    CelestialLight light = dominantCelestialLight(state, transmittanceLut);
-    float3 lightDir = light.dir;
-    bool sunDominant = dot(lightDir, state.sunDir) >= dot(lightDir, state.moonDir);
-    float lightLevel = sunDominant ? state.sunIlluminance : state.moonIlluminance;
-    // Same ramp as the sheet: both tiers must lose the direct term at the same elevation, or the
-    // tier toggle changes the hour the deck goes out.
-    if (sunDominant) {
-        lightLevel *= cloudDaylightLevel(state.sunDir.y);
-    }
-    float3 lightIll = lightLevel * cloudLightTint(light.illuminance);
-    float cosTheta = dot(rd, lightDir);
-    // Beer-Powder along the raymarcher's formula: 2/(1 + exp(-2 cos)) is 1 side-on and swells toward 2
-    // when the view runs with the light, which is what makes a back-lit rim read as a lit rim.
-    float phase = CLOUD_SCATTER_FLOOR + CLOUD_SCATTER_LOBE
-            * hg(cosTheta, CLOUD_G) * 0.7 * (2.0 / (1.0 + exp(-2.0 * cosTheta)));
-    float3 ambient = skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0)) * INV_PI
-            * clamp(push.cloudColor.w, 0.0, 2.0) * CLOUD_AMBIENT_GAIN;
-
-    float steps = clamp(push.volumeParams.w, CLOUD_STEP_MIN, 96.0);
-    // The budget scales with the crossing: an overhead sight line crosses the box's own height,
-    // and CLOUD_STEPS_PER_THICKNESS samples resolve what the walk exists for (the baked shape).
-    // Spending the full pushed lane there would only sample cells the step was already wider than,
-    // so the lane is a ceiling the crossing grows into as the perspective thickens it — grazing rays
-    // pay it, vertical ones pay the floor.
-    steps = clamp(ceil((t1 - t0) / max(boxH / CLOUD_STEPS_PER_THICKNESS, 1.0)),
-            CLOUD_STEP_MIN, steps);
-    float dt = (t1 - t0) / steps;
-    float jitter = frac(interleaveGradientNoise(pix)
+    CloudLight light = cloudLightOf(state, rd);
+    float budget = clamp(push.volumeParams.w, 1.0, 96.0);
+    // R2 rank-1 lattice: a fixed per-pixel phase whose neighbouring values are maximally separated,
+    // rotated one golden-ratio stride per frame so RR averages it instead of seeing a re-roll.
+    float jitter = frac(dot(pix, float2(0.7548776662, 0.5698402910))
             + float(push.frameIndex) * 0.6180339887);
+    bool upward = rd.y >= 0.0;
+    // First pass: the slab span each deck catches, so the budget lands where the cloud actually is.
+    float spanSum = 0.0;
+    float spans[CLOUD_LAYER_COUNT];
+    for (int n = 0; n < CLOUD_LAYER_COUNT; n++) {
+        int index = upward ? n : CLOUD_LAYER_COUNT - 1 - n;
+        CloudLayer l = cloudLayerOf(push, index);
+        spans[n] = 0.0;
+        if (l.coverage <= 1.0e-3) {
+            continue;
+        }
+        // The fade distance is also the walk's reach. A ray parallel to a deck and already inside it
+        // would otherwise span an unbounded [t0, t1] and take steps kilometres long.
+        float fadeDist = max(push.cloud1.w, 64.0) * (l.kind == 0 ? 1.0 : CLOUD_SHEET_FADE_MULT);
+        float t0;
+        float t1;
+        if (!cloudLayerSpan(l, ro, rd, fadeDist, t0, t1)) {
+            continue;
+        }
+        if (1.0 - smoothstep(fadeDist * 0.6, fadeDist, t0) <= 0.0) {
+            continue;
+        }
+        spans[n] = t1 - t0;
+        spanSum += spans[n];
+    }
     float3 L = float3(0.0, 0.0, 0.0);
     float T = 1.0;
-    for (int i = 0; i < int(steps); i++) {
-        float3 p = ro + rd * (t0 + (float(i) + jitter) * dt);
-        float v = (p.y - boxBottom) / boxH;
-        float density = cloudInstanceDensity(push,
-                p.xz + push.cloud2.xy + push.cloud2.zw, v);
-        // cloudDensityScale spreads the calibrated column optical depth over the box's actual height,
-        // so the walk resolves the same deck the planar tier prices rather than a denser one.
-        float tauCell = density * push.cloud0.w * CLOUD_EXTINCTION * dt * cloudDensityScale(push);
-        if (tauCell > 1.0e-4) {
-            float cellT = exp(-tauCell);
-            // The light march: the baked shape's own occlusion toward the body, graded through the
-            // same multi-scatter octaves the sheet's column estimate uses. The ambient leg is
-            // occluded by the same tau at a softened weight — what a viewer mostly sees of a deck
-            // is its BASE, where the direct sun is gone and the brightness comes from light that
-            // has bounced many times inside the cloud. Occluding the sky by the full sun tau
-            // crushed the base to a dark sheet; that softening is CLOUD_AMBIENT_OCCLUSION, and it
-            // is also the only term that can light a base at all.
-            float tauSun = cloudLightTau(push, p, lightDir, boxH) * push.cloud0.w;
-            float3 sunT = cloudSelfShadow(tauSun);
-            float ambT = max(cloudSelfShadow(tauSun * CLOUD_AMBIENT_OCCLUSION),
-                    CLOUD_AMBIENT_FLOOR);
-            float3 scatter = CLOUD_ALBEDO * (phase * lightIll * sunT + ambient * ambT);
-            L += T * (1.0 - cellT) * scatter;
-            T *= cellT;
-            if (T < 3.0e-3) {
-                break;
-            }
+    for (int n = 0; n < CLOUD_LAYER_COUNT; n++) {
+        if (spans[n] <= 0.0) {
+            continue;
+        }
+        int index = upward ? n : CLOUD_LAYER_COUNT - 1 - n;
+        CloudLayer l = cloudLayerOf(push, index);
+        float fadeDist = max(push.cloud1.w, 64.0) * (l.kind == 0 ? 1.0 : CLOUD_SHEET_FADE_MULT);
+        float t0;
+        float t1;
+        cloudLayerSpan(l, ro, rd, fadeDist, t0, t1);
+        float fade = 1.0 - smoothstep(fadeDist * 0.6, fadeDist, t0);
+        // Step split: the deck's share of the budget, capped by its own shape scale. A vertical sight
+        // line through a 130-block deck needs six steps, not ninety-six; a grazing one takes whatever
+        // share the span proportion grants it, minimum four so a sliver crossing still resolves.
+        float steps;
+        if (l.kind == 0) {
+            float ideal = ceil(spans[n] / CLOUD_MARCH_STEP);
+            float share = budget * spans[n] / max(spanSum, 1.0e-3);
+            steps = clamp(min(ideal, share), 4.0, budget);
+        } else {
+            // A sheet is five blocks thick and a single crossing is already its whole column.
+            steps = 2.0;
+        }
+        cloudMarchLayer(push, index, ro, rd, t0, t1, steps, jitter, fade, light, L, T);
+        if (T < 3.0e-3) {
+            break;
         }
     }
-    // Fade dissolves the slab's opacity, with the radiance following it at the same scale — half a fade
-    // is half a cloud, never a glowing sheet that has stopped blocking.
-    float opacity = (1.0 - T) * fade;
-    cloudT = 1.0 - opacity;
-    return L * fade;
+    cloudT = T;
+    return L;
 }
 
 // Extinction only, at the planar tier's price: a continuation ray (a reflection, a refraction, an
 // indirect bounce) must be dimmed by the deck it passed through without paying a walk per bounce —
-// the "Pass B does extinction only" contract. One instance fetch at the slab's mid-crossing and the
-// same slant-thickened tau the planar tier uses keeps a bounce's attenuation the MEAN of what the
-// primary ray walked.
+// the "Pass B does extinction only" contract. One fetch per deck at its mid-crossing and the same
+// slant-thickened tau the planar tier uses keeps a bounce's attenuation the MEAN of what the primary
+// ray walked.
 public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd) {
     if ((push.flags & WORLD_FLAG_CLOUD) == 0u || push.cloud0.x <= 0.0 || abs(rd.y) < 1.0e-6) {
         return 1.0;
     }
-    float boxBottom = cloudBoxBottom(push);
-    float boxH = cloudBoxHeight(push);
-    float boxTop = boxBottom + boxH;
-    if (rd.y > 0.0 ? ro.y >= boxTop : ro.y <= boxBottom) {
-        return 1.0; // the ray runs away from the layer
+    float tau = 0.0;
+    for (int index = 0; index < CLOUD_LAYER_COUNT; index++) {
+        CloudLayer l = cloudLayerOf(push, index);
+        if (l.coverage <= 1.0e-3) {
+            continue;
+        }
+        if (rd.y > 0.0 ? ro.y >= l.top : ro.y <= l.base) {
+            continue; // the ray runs away from the deck
+        }
+        float mid = l.base + 0.5 * l.tallness;
+        float t = (mid - ro.y) / rd.y;
+        if (t <= 0.0) {
+            continue;
+        }
+        float3 p = ro + rd * t;
+        float2 wind = cloudLayerWind(push, index);
+        float density = cloudLayerDensity(push, index, p, wind, cloudLod(t, l.detailTile), false);
+        tau += density * l.density * l.tallness / max(abs(rd.y), 0.04);
     }
-    float ta = (boxBottom - ro.y) / rd.y;
-    float tb = (boxTop - ro.y) / rd.y;
-    float tMid = 0.5 * (max(min(ta, tb), 0.0) + max(ta, tb));
-    float vMid = (ro.y + rd.y * tMid - boxBottom) / boxH;
-    float density = cloudInstanceDensity(push,
-            ro.xz + rd.xz * tMid + push.cloud2.xy + push.cloud2.zw, vMid);
-    if (density <= 0.0) {
-        return 1.0;
-    }
-    float tau = density * push.cloud0.w * CLOUD_EXTINCTION * CLOUD_COLUMN_DEPTH / max(abs(rd.y), 0.04);
     return exp(-tau);
 }
+
+#else // CAUSTICA_NO_VISIBLE_CLOUD_PATH: the shadow field remains, the visible layer is inert.
+
+public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                      out float cloudT) {
+    float unused = push.cloud0.x + ro.x + rd.y + state.skyLightFactor;
+    cloudT = 1.0;
+    return float3(0.0, 0.0, 0.0) * unused;
+}
+
+public float3 cloudSegmentOutScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                     float tMax, out float cloudT) {
+    float unused = push.cloud0.x + ro.x + rd.y + state.skyLightFactor + tMax;
+    cloudT = 1.0;
+    return float3(0.0, 0.0, 0.0) * unused;
+}
+
+public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                       float2 pix, out float cloudT) {
+    float unused = push.cloud0.x + ro.x + rd.y + state.skyLightFactor + pix.x;
+    cloudT = 1.0;
+    return float3(0.0, 0.0, 0.0) * unused;
+}
+
+public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd) {
+    return 1.0 + 0.0 * (push.cloud0.x + ro.x + rd.y);
+}
+
+#endif // CAUSTICA_NO_VISIBLE_CLOUD_PATH
+
+#else // CAUSTICA_NO_CLOUD_PATH: every cloud consumer is inert.
+
+public float cloudBoxMid(WorldPush push) {
+    return 0.0 * push.cloud0.y;
+}
+
+public float cloudShadowTransmittance(float3 pos, float3 sunDir) {
+    return 1.0 + 0.0 * (pos.x + sunDir.y);
+}
+
+public float cloudCoverageWorld(float2 rebasedXZ) {
+    return 0.0 * rebasedXZ.x;
+}
+
+public float3 planarCloudSkyInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                      out float cloudT) {
+    float unused = push.cloud0.x + ro.x + rd.y + state.skyLightFactor;
+    cloudT = 1.0;
+    return float3(0.0, 0.0, 0.0) * unused;
+}
+
+public float3 cloudSegmentOutScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                     float tMax, out float cloudT) {
+    float unused = push.cloud0.x + ro.x + rd.y + state.skyLightFactor + tMax;
+    cloudT = 1.0;
+    return float3(0.0, 0.0, 0.0) * unused;
+}
+
+public float3 volumetricCloudInScatter(WorldPush push, float3 ro, float3 rd, SkyState state,
+                                       float2 pix, out float cloudT) {
+    float unused = push.cloud0.x + ro.x + rd.y + state.skyLightFactor + pix.x;
+    cloudT = 1.0;
+    return float3(0.0, 0.0, 0.0) * unused;
+}
+
+public float volumetricCloudTransmittanceFast(WorldPush push, float3 ro, float3 rd) {
+    return 1.0 + 0.0 * (push.cloud0.x + ro.x + rd.y);
+}
+
+#endif // CAUSTICA_NO_CLOUD_PATH
 // ---- Unified air-volume sampler --------------------------------------------------------------------
 //
-// The marcher's per-step density source (the marched tier walks this; the analytic tier above bypasses
-// it). The density sources meet here: fog carries the whole sample while it is the only enabled layer,
-// cloud and spray join it as their layers come online, and the water layer is explicitly NOT sampled — while the
-// path is inside water the stack's medium owns extinction and scattering, so mixing the air field in
-// would double-count the volume the surface crossing already describes.
+// One point sample of the air: the medium's contract, which the tiers integrate in closed form rather
+// than by calling this. `density` comes from the marched tier's FBM field or from the plain profile, and
+// the Rayleigh coefficient turns it into a per-channel extinction; the sampling rules are the tiers'
+// own — the border's haze joins after the modulation, the render-edge fade is not a medium, and water
+// excludes the air entirely because the stack's medium already owns that volume.
 public VolumeSample sampleVolume(float3 pos, bool inWater, WorldPush push) {
     VolumeSample s = emptyVolumeSample();
     if (inWater || (push.flags & WORLD_FLAG_FOG) == 0u) {
         return s;
     }
-    float sigmaT;
+    float density;
     if ((push.flags & WORLD_FLAG_VOLUME_MARCH) != 0u) {
-        sigmaT = fogMarchDensity(push, pos);
+        density = fogMarchDensity(push, pos);
     } else {
-        sigmaT = fogDensityAt(push, pos.y);
+        density = fogDensityAt(push, pos.y);
     }
-    // The border's haze joins the density AFTER the tier's own modulation, so the billow field never scales
-    // it and both tiers describe the same medium. The render edge's fade is deliberately absent: it is not
-    // a medium at all, and a point query has no view ray to measure a coverage against.
-    sigmaT += boundarySigma(push);
+    // The border's haze joins the medium AFTER the tier's own modulation, so the billow field never
+    // scales it and both tiers describe the same air. It is added to every channel alike: the Rayleigh
+    // coefficient multiplies only the profile, so the veil stays grey. The render edge's fade is
+    // deliberately absent: it is not a medium at all, and a point query has no view ray to measure a
+    // coverage against.
+    float3 sigmaT = density * FOG_RAYLEIGH_COEFF + boundarySigma(push);
     float3 albedo = max(push.fogColor.rgb, float3(0.0, 0.0, 0.0));
     s.sigmaS = albedo * sigmaT;
     s.sigmaA = (float3(1.0, 1.0, 1.0) - albedo) * sigmaT;
@@ -950,12 +1429,14 @@ public VolumeSample sampleVolume(float3 pos, bool inWater, WorldPush push) {
     return s;
 }
 
+// The height profile's density at one altitude — the number FOG_RAYLEIGH_COEFF turns into an
+// extinction. Zero while the pushed density is off, which is what a fog-off frame reads.
 public float fogDensityAt(WorldPush push, float y) {
-    float sigma0 = push.fog0.x;
-    if (sigma0 <= 0.0) {
+    float density0 = push.fog0.x;
+    if (density0 <= 0.0) {
         return 0.0;
     }
-    return sigma0 * exp(-max(y - push.fog0.z, 0.0) / max(push.fog0.y, 1.0e-4));
+    return density0 * exp(-max(y - push.fog0.z, 0.0) / max(push.fog0.y, 1.0e-4));
 }
 
 // ---- Marched tier: heterogeneous fog with per-sample occlusion --------------------------------------
@@ -975,9 +1456,9 @@ public float fogDensityAt(WorldPush push, float y) {
 // most FOG_MARCH_PROBE_STRATA geometry shadow rays and cloud-shadow field evaluations per segment,
 // wherever in the band the non-empty samples land. The early-outs matter: a segment entirely above the
 // band returns without marching, samples past negligible transmittance stop the march, and the probes
-// fire only where the medium is non-zero. volumeParams.z (max integration distance) stays reserved —
-// truncating the integral would desynchronise the out fogT from the throughput attenuation, which must
-// agree.
+// fire only where the medium is non-zero. volumeParams.z carries the cloud shadow field's sample
+// count, not a fog integration distance — truncating the fog integral would desynchronise the out
+// fogT from the throughput attenuation, which must agree.
 public static const float FOG_SPAN_TAU = 2.0e-3;      // bound on the optical depth the span clamp excludes
 public static const int FOG_MARCH_PROBE_STRATA = 8;   // shadow-probe budget per marched segment
 
@@ -997,25 +1478,28 @@ public float3 fogSkyRadiance(float3 rd) {
 }
 
 public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 pix,
-                                         bool shadowAllowed, out float fogT) {
-    fogT = 1.0;
-    float sigma0 = worldPush.fog0.x;
+                                         bool shadowAllowed, out float3 fogT) {
+    fogT = float3(1.0, 1.0, 1.0);
+    float density0 = worldPush.fog0.x;
     float sigmaB = boundarySigma(worldPush);
     float3 albedo = max(worldPush.fogColor.rgb, float3(0.0, 0.0, 0.0));
-    if (sigma0 + sigmaB <= 0.0 || dot(albedo, float3(1.0, 1.0, 1.0)) == 0.0
+    if (density0 + sigmaB <= 0.0 || dot(albedo, float3(1.0, 1.0, 1.0)) == 0.0
             || t <= RAY_TMIN) {
         return float3(0.0, 0.0, 0.0);
     }
     // The significant band. The density is a function of height alone and is bounded by the analytic
     // profile times the noise's largest multiplier, so above
-    //     yTop = baseY + H * ln(sigma0 * (1 + |amp|) / eps),  eps = FOG_SPAN_TAU / t,
-    // every block of path carries less than eps of density: the excluded stretch's optical depth — and
-    // with it the error in both the returned transmittance and the skipped in-scatter — is bounded by
-    // FOG_SPAN_TAU whatever the geometry, orders below anything the estimator can resolve. The march
-    // covers only the segment's stretch at or below yTop: a segment entirely above returns without
-    // marching, and one crossing the height concentrates its whole step budget on the density that can
-    // actually read instead of striding the empty tail above the fog.
-    float peak = sigma0 * (1.0 + abs(worldPush.fog1.z)) + sigmaB;
+    //     yTop = baseY + H * ln(peak / eps),
+    //     peak = density0 * (1 + |amp|) * FOG_RAYLEIGH_PEAK + sigmaB,  eps = FOG_SPAN_TAU / t,
+    // every block of path carries less than eps of extinction in the channel that dies first (blue),
+    // and every other channel strictly less. The excluded stretch's optical depth — and with it the
+    // error in both the returned transmittance and the skipped in-scatter — is therefore bounded by
+    // FOG_SPAN_TAU whatever the geometry and whichever channel the eye weighs, orders below anything
+    // the estimator can resolve. The march covers only the segment's stretch at or below yTop: a
+    // segment entirely above returns without marching, and one crossing the height concentrates its
+    // whole step budget on the density that can actually read instead of striding the empty tail above
+    // the fog.
+    float peak = density0 * (1.0 + abs(worldPush.fog1.z)) * FOG_RAYLEIGH_PEAK + sigmaB;
     float eps = FOG_SPAN_TAU / t;
     if (peak <= eps) {
         return float3(0.0, 0.0, 0.0);
@@ -1026,12 +1510,6 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
     // around a profile that does not fall off.
     float yTop = sigmaB > 0.0 ? 1.0e30
             : worldPush.fog0.z + max(worldPush.fog0.y, 1.0e-4) * log(peak / eps);
-    // The spray band is a second density source at its own height; while it is live its top joins the
-    // significant range. Conservatively the span then also covers the fog-free stretch between band
-    // and fog top — a few wasted steps, never a wrong one.
-    if ((worldPush.flags & WORLD_FLAG_SPRAY) != 0u) {
-        yTop = max(yTop, worldPush.water1.w + max(worldPush.water1.z, 0.05));
-    }
     float yEnd = ro.y + rd.y * t;
     if (min(ro.y, yEnd) > yTop) {
         return float3(0.0, 0.0, 0.0); // the whole segment sits above the medium
@@ -1068,18 +1546,24 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
     float3 sunDir = celestialLight.dir;
 
     float3 L = float3(0.0, 0.0, 0.0);
-    float tau = 0.0;
+    float3 tau = float3(0.0, 0.0, 0.0);
     // The probes ride a stratum budget: the marched samples split into FOG_MARCH_PROBE_STRATA equal
-    // ranges, and each stratum's first non-empty sample fires the geometry shadow ray and the
-    // cloud-shadow field evaluation once, with the whole stratum reusing both. A stratum spans
-    // steps/FOG_MARCH_PROBE_STRATA samples, so shadow-volume edges quantise at that scale per frame —
-    // the pixel-fixed jitter walks the sample positions inside the strata, and the reconstruct resolves
-    // the quantisation the same way it resolves the step dither. At or below the stratum count every
-    // sample probes, which is the short-segment case where per-sample resolution actually reads.
+    // ranges, and each stratum's first non-empty sample fires the geometry shadow ray once, with the
+    // whole stratum reusing it. A stratum spans steps/FOG_MARCH_PROBE_STRATA samples, so shadow-volume
+    // edges quantise at that scale per frame — the pixel-fixed jitter walks the sample positions inside
+    // the strata, and the reconstruct resolves the quantisation the same way it resolves the step
+    // dither. At or below the stratum count every sample probes, which is the short-segment case where
+    // per-sample resolution actually reads.
     int lastStratum = -1;
     bool probeValid = false;
     float stratumVis = 1.0;
-    float stratumCloud = 1.0;
+    // One cloud-shadow evaluation for the whole marched span, at its middle: the deck above a segment
+    // does not change faster than the field itself, and the per-stratum signal that must vary is the
+    // geometry visibility below. A field walk per stratum bought cloud-shadow grain the reconstruct
+    // cannot see under the shaft term it multiplies.
+    float cloudShadow = shadow
+            ? cloudShadowTransmittance(ro + rd * (0.5 * (t0 + t1)), sunDir)
+            : 1.0;
     for (int i = 0; i < steps; i++) {
         int stratum = (i * FOG_MARCH_PROBE_STRATA) / steps;
         if (stratum != lastStratum) {
@@ -1088,12 +1572,12 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
         }
         float tMid = t0 + (float(i) + u) * dt;
         float3 p = ro + rd * tMid;
-        float sigma = fogMarchDensity(worldPush, p) + sigmaB;
+        float density = fogMarchDensity(worldPush, p);
+        float3 sigmaT = density * FOG_RAYLEIGH_COEFF + sigmaB;
         float vis = 1.0;
-        if (sigma > 0.0) {
+        if (density + sigmaB > 0.0) {
             if (!probeValid) {
                 stratumVis = shadow ? luminance(visibility(p, sunDir, 10000.0).transmittance) : 1.0;
-                stratumCloud = cloudShadowTransmittance(p, sunDir);
                 probeValid = true;
             }
             vis = stratumVis;
@@ -1103,13 +1587,15 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
         // per-frame-walking, stochastic signal a temporal reconstruct cannot accumulate, and one that
         // deletes the medium wherever the sun is occluded (the air over the sea reading as a dark band
         // while the sky-facing segment, which traces no probes, kept its full density).
-        float sigmaEff = sigma;
-        if (sigmaEff <= 0.0) {
+        if (density + sigmaB <= 0.0) {
             continue;
         }
-        float tauMid = tau + sigmaEff * 0.5 * dt;
-        float tMid_transmittance = exp(-tauMid);
-        if (tMid_transmittance < 0.004) {
+        float3 tauMid = tau + sigmaT * 0.5 * dt;
+        float3 tMid_transmittance = exp(-tauMid);
+        // Blue dies first. Once the surviving luminance is below the eye's floor the channels have
+        // already diverged to a fixed ratio, so their recorded value is negligible too and the rest of
+        // the segment can only add that ratio times nothing.
+        if (luminance(tMid_transmittance) < 0.004) {
             break;
         }
         float3 sunTerm = float3(0.0, 0.0, 0.0);
@@ -1121,28 +1607,102 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
             // deliberately not marched (a second full march per sample for a second-order softening of
             // the shafts is not a trade this tier makes). The cloud shadow rides on top: the same field
             // the sheet renders and the ground NEE reads, so a clouded sun thins the shafts instead of
-            // lighting them.
-            float sunFogT = fogTransmittance(sigma0, worldPush.fog0.z, worldPush.fog0.y,
+            // lighting them. Per channel, so a low sun reddens through the air it crosses.
+            float3 sunFogT = fogTransmittanceRGB(density0, worldPush.fog0.z, worldPush.fog0.y,
                     p.y, sunDir.y, 10000.0);
             sunTerm = phase * celestialLight.illuminance
-                    * (sunVis * sunFogT * stratumCloud);
+                    * (sunVis * sunFogT * cloudShadow);
         }
-        L += tMid_transmittance * (albedo * sigmaEff) * (sunTerm + ambient) * dt;
-        tau += sigmaEff * dt;
+        L += tMid_transmittance * (albedo * sigmaT) * (sunTerm + ambient) * dt;
+        tau += sigmaT * dt;
     }
     fogT = exp(-tau);
     return L;
 }
 
-// ---- The water column ------------------------------------------------------------------------------
+// ---- The water column: its own in-scatter ----------------------------------------------------------
 //
-// The column carries the same structure-gated shaft layer the air uses, on the medium pushed in
-// `waterShaft`: its own extinction decides how far the layer is worth integrating, its ceiling caps the
-// forward lobe so the surface you look up at cannot go white, and the gate draws the beams out of the
-// shadow structure.
+// A path inside water crosses two media that are not the air fog: the body's own in-scatter (here) and
+// the structure-gated shaft layer further down. They are separate terms on purpose. This one is the
+// body's glow — the reason a submerged view has depth instead of reading as a dark window — and it is
+// lit by the sky and the sun exactly once per segment. The shaft layer is the sun's beams, gated on the
+// shadow structure, and it attenuates nothing.
 //
-// The body's absorption (`composite.water-opacity`) is untouched: it lives in the surface-radiance path
-// (`medium.extinction`), not in this term, so water still darkens with depth exactly as it did.
+// The body's constant medium makes the single-scatter integral exact rather than marched:
+//
+//     L = sigmaS * (ambient integral) + (sigmaS/sigmaT) * (1 - T) * sun
+//
+// with T = exp(-sigmaT * t) in the GREY mean of the per-channel extinction. The throughput itself keeps
+// attenuating per channel through the caller's Beer-Lambert line; this term refuses to become a
+// per-channel vector weight for a contribution that is second-order here. sigmaS/sigmaT is the pushed
+// fog density by construction (medium.waterScattering), so no coefficient is derived twice.
+//
+// The ambient field DECAYS WITH DEPTH. Sky irradiance reaches a sample only after crossing the water
+// above it, so ambient(p) = A * exp(-sigmaT * depth(p)). Without that decay every upward view
+// degenerates to a depth-independent milk veil at the fog's own brightness. The surface is the pushed
+// sea-level plane (water1.w) — exact for oceans; for elevated water the depth clamps at zero and the
+// term degrades to the un-attenuated form rather than inventing light. The product T(s) *
+// exp(-sigmaT * depth(s)) is still an exponential, so the integral stays closed form:
+//
+//     L_amb = sigmaS * A * exp(-sigmaT * d0) * (1 - exp(-sigmaT * t * (1 - rd.y))) / (sigmaT * (1 - rd.y))
+//
+// with d0 the segment start's depth below the plane; the rd.y -> 1 (straight-up) limit is t, where the
+// along-path and depth attenuations exactly cancel and the integral is bounded by the surface hit.
+//
+// Sun leg: one shadow-ray probe at the segment midpoint, the same one-probe-per-segment budget the
+// analytic fog tier runs. visibility() already crosses the waved surface as an any-hit (tinting the
+// transmittance and reporting the exit distance as waterHitT); on top of that the leg picks up the
+// body's Beer-Lambert over the underwater stretch of the sun ray and the wave-refraction caustic at the
+// exit point — the same term the underwater terrain NEE applies, so the glow and the caustic light
+// pools come from one wave field. With the shadow switch off there is no probe and hence no exit
+// distance, so the sun term is skipped rather than estimated from a guessed depth; the ambient term
+// alone keeps the water lit.
+public static const float WATER_AMBIENT_SURFACE = 0.92; // surface transmission for downward sky light
+
+public float3 waterSegmentInScatter(float3 ro, float3 rd, float t, float2 pix, Medium medium) {
+    float sigmaT = (medium.extinction.r + medium.extinction.g + medium.extinction.b) / 3.0;
+    float sigmaS = (medium.scattering.r + medium.scattering.g + medium.scattering.b) / 3.0;
+    if (sigmaT <= 0.0 || sigmaS <= 0.0 || t <= RAY_TMIN) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float3 ambient = worldPush.water1.z * skyIrradiance(skyIrradianceLut, float3(0.0, 1.0, 0.0))
+            * INV_PI * WATER_AMBIENT_SURFACE;
+    float scatterWeight = 1.0 - exp(-sigmaT * t);
+    float d0 = max(worldPush.water1.w - ro.y, 0.0);
+    float upCos = 1.0 - rd.y;
+    float ambIntegral;
+    if (upCos < 1.0e-4) {
+        ambIntegral = t * exp(-sigmaT * d0);
+    } else {
+        ambIntegral = exp(-sigmaT * d0) * (1.0 - exp(-sigmaT * t * upCos)) / (sigmaT * upCos);
+    }
+    float3 sunPart = float3(0.0, 0.0, 0.0);
+    bool shadow = (worldPush.flags & WORLD_FLAG_VOLUME_SHADOW) != 0u
+            && celestialLight.halfAngle > 0.0;
+    if (shadow) {
+        float3 p = ro + rd * (t * 0.5);
+        VisibilityResult probe = visibility(p, celestialLight.dir, 10000.0);
+        float vis = luminance(probe.transmittance);
+        if (vis > 0.0) {
+            float legT = 1.0;
+            if (probe.waterHitT > 0.0) {
+                legT = exp(-sigmaT * probe.waterHitT);
+                if ((worldPush.flags & 16u) != 0u) { // the water-waves toggle's flag bit
+                    vis *= waterCaustic(p + celestialLight.dir * probe.waterHitT,
+                            celestialLight.dir, probe.waterHitT);
+                }
+            }
+            // The fog's own 70%-energy HG scaling, plus the cloud shadow the sun leg crosses above the
+            // surface — the same field every other sun term reads, so overcast water loses its beams
+            // with everything else.
+            float phase = hg(dot(rd, celestialLight.dir), medium.phaseG) * SHAFT_PHASE_ENERGY;
+            sunPart = phase * celestialLight.illuminance
+                    * (vis * legT * cloudShadowTransmittance(p, celestialLight.dir));
+        }
+    }
+    return sigmaS * ambIntegral * ambient
+            + (sigmaS / sigmaT) * scatterWeight * sunPart;
+}
 
 // ---- Segment-level lighting assembly ---------------------------------------------------------------
 //
@@ -1155,7 +1715,7 @@ public float3 fogSegmentInScatterMarched(float3 ro, float3 rd, float t, float2 p
 // different media.
 //
 // Visibility therefore gates LIGHT, not matter. FOG_SUN_BANDS probes placed at equal in-scatter-weight
-// depths (bisection on the closed form; pixel-fixed IGN jitter walked by a golden-ratio sequence, so the
+// depths (the closed form's inverse; pixel-fixed IGN jitter walked by a golden-ratio sequence, so the
 // reconstruct resolves their quantisation) each contribute their own measured visibility to their own
 // stratum's direct term, and a stratum the sun does not reach contributes none of it. The sky ambient is
 // not gated at all — shadowed air still scatters sky light, which is what makes a backlit valley read as
@@ -1182,64 +1742,123 @@ public float interleaveGradientNoise(float2 pix) {
     return frac(52.9829189 * frac(dot(pix, float2(0.06711056, 0.00583715))));
 }
 
+// Depth at which the profile's optical depth alone reaches `tau`, along a ray that starts `above`
+// blocks over the base and travels along dirY. The analytic inverse of fogOpticalDepth: each stretch
+// is a constant or a single exponential, so each solves for its length directly. A target past the
+// finite column above a rising sample has no root, and the caller clamps the (large) result to the
+// segment.
+public float fogExpDepthAtTau(float density0, float baseY, float heightH, float y0, float dirY,
+                              float tau) {
+    if (density0 <= 0.0 || tau <= 0.0) {
+        return 0.0;
+    }
+    float h = max(heightH, 1.0e-4);
+    float above = y0 - baseY;
+    if (abs(dirY) < 1.0e-6) {
+        // A level ray sees one constant density: the column is linear in the depth.
+        float rho = density0 * exp(-max(above, 0.0) / h);
+        return rho > 0.0 ? tau / rho : 0.0;
+    }
+    if (dirY > 0.0) {
+        if (above >= 0.0) {
+            float column = density0 * exp(-above / h) * h / dirY;
+            return -(h / dirY) * log(max(1.0 - tau / max(column, 1.0e-30), 1.0e-20));
+        }
+        // Rising through the flat stretch below the base first, then into the exponential.
+        float sBase = -above / dirY;
+        float flat = density0 * sBase;
+        if (tau <= flat) {
+            return tau / density0;
+        }
+        float column = density0 * h / dirY;
+        return sBase - (h / dirY) * log(max(1.0 - (tau - flat) / max(column, 1.0e-30), 1.0e-20));
+    }
+    if (above <= 0.0) {
+        return tau / density0;
+    }
+    // Falling from above the base: the exponential stretch down to baseY, then the flat column.
+    float sBase = above / (-dirY);
+    float toBase = density0 * h * (1.0 - exp(-above / h)) / (-dirY);
+    if (tau <= toBase) {
+        float column = density0 * exp(-above / h) * h / dirY;
+        return -(h / dirY) * log(max(1.0 - tau / min(column, -1.0e-30), 1.0e-20));
+    }
+    return sBase + (tau - toBase) / density0;
+}
+
 // Depth at which the segment's cumulative in-scatter weight reaches `weight` (equivalently, where
-// transmittance drops to 1 - weight), by bisection on the closed-form optical depth. Monotone, so the
-// bisection always brackets. This is what places the sun-visibility probes: equal weight intervals
-// contribute equal Monte-Carlo weight regardless of where the density puts them. `sigmaFlat` is the
-// border haze's share of the same medium, so the bracket the probes are placed on is the one the
-// segment actually integrates rather than the height profile alone.
-public float fogDepthAtWeight(float sigma0, float sigmaFlat, float baseY, float heightH,
+// transmittance drops to 1 - weight). This is what places the sun-visibility probes: equal weight
+// intervals contribute equal Monte-Carlo weight regardless of where the density puts them. `density0`
+// is the pushed profile, not an extinction — callers pass it scaled by FOG_RAYLEIGH_MEAN so a single
+// scalar tracks the perceptual middle of the per-channel medium. `sigmaFlat` is the border haze's share
+// of the same medium, so the depth is solved on the medium the segment actually integrates rather than
+// on the height profile alone.
+//
+// The exponential inverts in closed form (fogExpDepthAtTau), so the common no-border case is a direct
+// solve. The flat haze is the one term with no elementary inverse; with it live, its own bound
+// (tau/sigmaFlat) caps the solve and three Newton steps on the full optical depth land the root — the
+// optical depth is monotone with a closed-form derivative, so the iteration is a rounding step rather
+// than a search.
+public float fogDepthAtWeight(float density0, float sigmaFlat, float baseY, float heightH,
                               float3 ro, float3 rd, float t, float weight) {
     float tauTarget = -log(max(1.0 - weight, 1.0e-4));
     if (weight <= 0.0) {
         return 0.0;
     }
-    if (fogOpticalDepth(sigma0, baseY, heightH, ro.y, rd.y, t) + sigmaFlat * t <= tauTarget) {
+    if (fogOpticalDepth(density0, baseY, heightH, ro.y, rd.y, t) + sigmaFlat * t <= tauTarget) {
         return t;
     }
-    float lo = 0.0;
-    float hi = t;
-    for (int i = 0; i < 18; i++) {
-        float mid = 0.5 * (lo + hi);
-        if (fogOpticalDepth(sigma0, baseY, heightH, ro.y, rd.y, mid) + sigmaFlat * mid < tauTarget) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
+    float depth = fogExpDepthAtTau(density0, baseY, heightH, ro.y, rd.y, tauTarget);
+    if (sigmaFlat <= 0.0) {
+        return clamp(depth, 0.0, t);
     }
-    return 0.5 * (lo + hi);
+    depth = clamp(min(depth, tauTarget / sigmaFlat), 0.0, t);
+    for (int i = 0; i < 3; i++) {
+        float tau = fogOpticalDepth(density0, baseY, heightH, ro.y, rd.y, depth) + sigmaFlat * depth;
+        float slope = density0 * exp(-max(ro.y + rd.y * depth - baseY, 0.0) / heightH) + sigmaFlat;
+        depth = clamp(depth - (tau - tauTarget) / max(slope, 1.0e-20), 0.0, t);
+    }
+    return depth;
 }
 
 // Analytic fog transmittance from the segment start toward the sun, used when the shadow switch is
-// off and no probe exists to evaluate it from. Takes the segment's (possibly culled) sigma so the
-// toward-sun transmittance agrees with the medium the segment actually integrates.
-public float fogT_toSunRo(float3 ro, float3 sunDir, float sigma) {
-    return fogTransmittance(sigma, worldPush.fog0.z, worldPush.fog0.y,
+// off and no probe exists to evaluate it from. Takes the segment's density so the toward-sun
+// transmittance agrees with the medium the segment actually integrates. Per channel, so a low sun
+// reddens through the air it has to cross — the counterpart of the blue the view ray picks up.
+public float3 fogT_toSunRo(float3 ro, float3 sunDir, float density0) {
+    return fogTransmittanceRGB(density0, worldPush.fog0.z, worldPush.fog0.y,
             ro.y, sunDir.y, 10000.0);
 }
 
 public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
-                                  bool allowShadowCull, out float fogT) {
+                                  bool allowShadowCull, out float3 fogT) {
     // Tier dispatch: the march flag routes the whole segment to the heterogeneous integrator, which
     // reuses the same shadow switch, phase, ambient and lighting doctrine. `allowShadowCull` keeps its
     // meaning — the sky-facing miss segment passes false and its march runs without shadow rays, the
     // same cost gate the analytic tier's probes honour.
     //
-    // The march tier exists to resolve a heterogeneous FIELD: the density noise and the spray band.
-    // With both off it integrates exactly the profile the closed form already owns, so every step it
-    // spends buys nothing but the jitter of its own quadrature — a per-frame signal the reconstruct
-    // cannot accumulate, on a frame that has no field to resolve. Take the closed form then; the flag
-    // stays the tier selector for frames that actually carry one.
-    bool heterogeneous = worldPush.fog1.z > 0.0 || (worldPush.flags & WORLD_FLAG_SPRAY) != 0u;
+    // The march tier exists to resolve a heterogeneous FIELD: the density noise. With it off the
+    // integrator would reproduce the profile the closed form already owns, so every step it spends buys
+    // nothing but the jitter of its own quadrature — a per-frame signal the reconstruct cannot
+    // accumulate, on a frame that has no field to resolve. Take the closed form then; the flag stays the
+    // tier selector for frames that actually carry one.
+    //
+    // A record compiled with CAUSTICA_NO_MARCH_PATH pins the field off: nothing in it can reach the
+    // integrator, so the compiler drops it from the SPIR-V and the raygen stops paying its registers.
+    // The renderer dispatches those records only while the march tier is off (see RtComposite).
+    bool heterogeneous = worldPush.fog1.z > 0.0;
+#if defined(CAUSTICA_NO_MARCH_PATH)
+    heterogeneous = false;
+#endif
     if ((worldPush.flags & WORLD_FLAG_VOLUME_MARCH) != 0u && worldPush.volumeParams.x >= 1.0
             && heterogeneous) {
         return fogSegmentInScatterMarched(ro, rd, t, pix, allowShadowCull, fogT);
     }
-    float sigma0 = worldPush.fog0.x;
+    float density0 = worldPush.fog0.x;
     float sigmaB = boundarySigma(worldPush);
-    fogT = 1.0;
+    fogT = float3(1.0, 1.0, 1.0);
     float3 albedo = max(worldPush.fogColor.rgb, float3(0.0, 0.0, 0.0));
-    if (sigma0 + sigmaB <= 0.0 || dot(albedo, float3(1.0, 1.0, 1.0)) == 0.0
+    if (density0 + sigmaB <= 0.0 || dot(albedo, float3(1.0, 1.0, 1.0)) == 0.0
             || t <= RAY_TMIN) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -1247,6 +1866,18 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
     bool shadowCull = allowShadowCull
             && (worldPush.flags & WORLD_FLAG_VOLUME_SHADOW) != 0u
             && celestialLight.halfAngle > 0.0;
+
+    // The medium: the height profile and the border's floor, neither of them modulated by light. `fogT`
+    // is what the caller attenuates its throughput with, so it has to be the same quantity every frame
+    // for a given ray — a visibility-scaled sigma made it a per-pixel lottery and let a shadowed stretch
+    // read as clear air. It is per channel: that is the aerial perspective. `scatterWeight` is the share
+    // of the medium each channel's light is scattered by, and `scatterTotal` its luminance — the one
+    // scalar that can stand for "how much air is in front of this pixel" when deciding whether a probe
+    // is worth tracing.
+    float3 transmittance = airTransmittance(ro, rd, t);
+    fogT = transmittance;
+    float3 scatterWeight = 1.0 - transmittance;
+    float scatterTotal = luminance(scatterWeight);
 
     // One shadow probe per equal-weight stratum, placed on the field with a pixel-fixed,
     // frame-walking jitter. Each sample's visibility is kept for its own stratum's sun term; nothing
@@ -1259,28 +1890,27 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
         vis[k] = 1.0;
         stratumDepth[k] = 0.0;
     }
+    // The cloud field is evaluated ONCE for the segment, at the half-weight depth: a deck's shadow is
+    // a smooth multiplier at the scale of hundreds of blocks, so the four bands would read the same
+    // number to within noise while each paid a full three-deck walk for it. The geometry shadow the
+    // probes measure is what varies band to band, and that is untouched.
+    float cloudShadow = 1.0;
     if (shadowCull) {
-        float scatterWeightFull = 1.0 - airTransmittance(ro, rd, t);
-        if (scatterWeightFull > 1.0e-4) {
+        if (scatterTotal > 1.0e-4) {
+            float midDepth = fogDepthAtWeight(density0 * FOG_RAYLEIGH_MEAN, sigmaB,
+                    worldPush.fog0.z, worldPush.fog0.y, ro, rd, t, 0.5);
+            cloudShadow = cloudShadowTransmittance(ro + rd * midDepth, celestialLight.dir);
             for (int k = 0; k < FOG_SUN_BANDS; k++) {
-                float stratumStart = scatterWeightFull * (float(k) + noise) / float(FOG_SUN_BANDS);
-                stratumDepth[k] = fogDepthAtWeight(sigma0, sigmaB,
+                float stratumStart = scatterTotal * (float(k) + noise) / float(FOG_SUN_BANDS);
+                stratumDepth[k] = fogDepthAtWeight(density0 * FOG_RAYLEIGH_MEAN, sigmaB,
                         worldPush.fog0.z, worldPush.fog0.y,
-                        ro, rd, t, stratumStart + scatterWeightFull * 0.5 / float(FOG_SUN_BANDS));
+                        ro, rd, t, stratumStart + scatterTotal * 0.5 / float(FOG_SUN_BANDS));
                 vis[k] = luminance(visibility(ro + rd * stratumDepth[k], celestialLight.dir,
                         10000.0).transmittance);
             }
         }
     }
 
-    // The medium: the height profile and the border's floor, neither of them modulated by light. `fogT` is
-    // what the caller attenuates its throughput with, so it has to be the same quantity every frame for a
-    // given ray — a visibility-scaled sigma made it a per-pixel lottery and let a shadowed stretch read as
-    // clear air. `sigma` stays the height fog's own value because the only consumer below is the leg toward
-    // the sun, which deliberately carries none of the flat terms (see the boundary section above).
-    float sigma = sigma0;
-    fogT = airTransmittance(ro, rd, t);
-    float scatterWeight = 1.0 - fogT;
     // HG lobe scaled to 70% energy: a pure forward lobe blows out when the view aligns with the
     // sun down a bright shaft. No isotropic floor — a floor at side/back angles reads as a uniform
     // milk wash, and the strata probes already light the lit medium geometrically.
@@ -1292,22 +1922,23 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
         // the segment start. The cloud shadow still applies — geometry shadows are off, the layer
         // above is not.
         sunPart = phase * celestialLight.illuminance * (scatterWeight
-                * fogT_toSunRo(ro, celestialLight.dir, sigma)
+                * fogT_toSunRo(ro, celestialLight.dir, density0)
                 * cloudShadowTransmittance(ro, celestialLight.dir));
-    } else if (scatterWeight > 1.0e-4) {
+    } else if (scatterTotal > 1.0e-4) {
         // Per-stratum sun in-scatter: the stratum's share of the medium times its own measured
         // visibility times the closed-form fog transmittance from its probe toward the sun. Strata
         // whose probe landed in shadow contribute none of it — that IS the culling, and it is light
-        // only. The cloud shadow multiplies the same field every other sun leg reads.
-        float stratumWeight = scatterWeight / float(FOG_SUN_BANDS);
+        // only. The segment's single cloud-shadow sample multiplies the sum, so a clouded sun thins
+        // the shafts exactly as it thins every other sun leg.
+        float3 stratumWeight = scatterWeight / float(FOG_SUN_BANDS);
         for (int k = 0; k < FOG_SUN_BANDS; k++) {
             float3 probe = ro + rd * stratumDepth[k];
-            float sunFogT = fogTransmittance(sigma, worldPush.fog0.z, worldPush.fog0.y,
+            float3 sunFogT = fogTransmittanceRGB(density0, worldPush.fog0.z, worldPush.fog0.y,
                     probe.y, celestialLight.dir.y, 10000.0);
             float sunVis = max(vis[k], fogShadowFloor());
-            sunPart += phase * celestialLight.illuminance * (stratumWeight * sunVis * sunFogT
-                    * cloudShadowTransmittance(probe, celestialLight.dir));
+            sunPart += phase * celestialLight.illuminance * (stratumWeight * sunVis * sunFogT);
         }
+        sunPart *= cloudShadow;
     }
     return albedo * (sunPart + scatterWeight * ambient);
 }
@@ -1329,7 +1960,8 @@ public float3 fogSegmentInScatter(float3 ro, float3 rd, float t, float2 pix,
 // while water (sigma ~ 0.1-0.5) packs them into the few blocks the light actually crosses. A point-
 // sampled sun visibility V sits inside each stratum. There is no ambient term: sky light scattered
 // toward the eye is not a beam, and adding it would only lift the shade the beams have to contrast
-// with. The water column has no ambient of its own any more; see the section at the end.
+// with. The water body's own glow is a separate integral (waterSegmentInScatter), which is what keeps
+// the two separable: a player can want beams without the milky water they sit in.
 //
 // `structure` is what makes this read as a Tyndall beam instead of as fog. A path that never leaves the
 // light scatters uniformly along its whole length, and that smooth lift — added to every sunlit wall,
@@ -1400,9 +2032,11 @@ public float3 shaftInScatter(float3 ro, float3 rd, float t, float2 pix,
     }
     float reach = min(t, max(worldPush.shaft.z, 1.0));
     // Air beams are still swallowed by fog — the height profile and the border's haze alike, since a beam
-    // that crosses the veiled air has to lose its own share of it. Water's own extinction is already inside
-    // sigma, and the air fog does not exist below the surface.
-    float fogT = underwater ? 1.0 : airTransmittance(ro, rd, reach);
+    // that crosses the veiled air has to lose its own share of it. The air's transmittance is per channel
+    // while the beam's own extinction is a scalar, so the shaft takes its luminance: a beam is read by how
+    // much of it survives, and the haze's hue belongs to the fog, not to the beam. Water's own extinction
+    // is already inside sigma, and the air fog does not exist below the surface.
+    float fogT = underwater ? 1.0 : luminance(airTransmittance(ro, rd, reach));
     float total = 1.0 - exp(-sigma * reach);
     float shaftWeight = total * fogT;
     if (shaftWeight <= 1.0e-4) {
@@ -1420,6 +2054,12 @@ public float3 shaftInScatter(float3 ro, float3 rd, float t, float2 pix,
             + float(worldPush.frameIndex) * 0.6180339887);
     float weight = total / float(SHAFT_STRATA);
     bool waterWaves = (worldPush.flags & 16u) != 0u;
+    // The cloud shadow is one multiplier for the whole stretch, sampled at its middle stratum: the
+    // deck above a beam is the same deck at every probe, so a field walk per stratum only re-read the
+    // same number eight times. The probes keep their own geometry visibility — that is the term the
+    // beams are made of.
+    float cloudShadow = cloudShadowTransmittance(
+            ro + rd * shaftDepthAtWeight(sigma, reach, SHAFT_STRATA / 2), celestialLight.dir);
     float caustic = 1.0;
     bool causticKnown = false;
     float3 sun = float3(0.0, 0.0, 0.0);
@@ -1449,7 +2089,7 @@ public float3 shaftInScatter(float3 ro, float3 rd, float t, float2 pix,
         // path does; solids and cutout leaves terminate it. The gate reads the grey mean: what matters
         // there is whether the path is lit, not in what colour.
         lit += dot(vis, float3(0.3333333, 0.3333333, 0.3333333));
-        sun += vis * (weight * cloudShadowTransmittance(p, celestialLight.dir));
+        sun += vis * weight;
     }
     lit *= 1.0 / float(SHAFT_STRATA);
     // Linear in the lit fraction, deliberately: a smoothstep here multiplies the estimator's own
@@ -1468,5 +2108,5 @@ public float3 shaftInScatter(float3 ro, float3 rd, float t, float2 pix,
         structure = lerp(WATER_SHAFT_STRUCTURE_FLOOR, 1.0, structure);
     }
     shaftShare = shaftWeight * structure;
-    return sun * (phase * celestialLight.illuminance * (strength * fogT * structure));
+    return sun * (phase * celestialLight.illuminance * (strength * fogT * structure * cloudShadow));
 }

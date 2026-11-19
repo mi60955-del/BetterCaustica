@@ -366,13 +366,12 @@ void main(inout Payload payload) {
             color = lerp(dimensionSkyRadiance(state, dir), color, skyFactor);
         }
 
-        // The cloud layer, in whichever tier is switched on. The planar sheet (Phase 4) crosses the layer
-        // once and shades that single crossing; the volumetric slab (Phase 5) walks through it and gets a
-        // real vertical profile and light gradient. The tier is the flag, and only the primary ray pays
-        // for a walk: a continuation ray — a reflection, a refraction, an indirect bounce — rides the
-        // deck's MEAN extinction instead, which is the plan's "Pass B does extinction only". The bounce-0
-        // test is showCelestial, the same bit this shader already reads for the sun and moon.
-        // End-sky dimensions keep their dome untouched either way.
+#ifndef CAUSTICA_NO_VISIBLE_CLOUD_PATH
+        // The visible cloud layer: the planar sheet crosses the layer once, the volumetric slab walks
+        // through it. Only the primary ray pays for a walk; a continuation ray — reflection,
+        // refraction or indirect bounce — reads the deck's mean extinction instead. End-sky dimensions
+        // keep their dome untouched. A no-cloud raygen selects the no-cloud miss record, so this entire
+        // block is absent from that dispatch rather than merely falling through a runtime flag.
         if (!endSky) {
             float cloudT;
             float3 cloudL;
@@ -391,6 +390,7 @@ void main(inout Payload payload) {
                 color = cloudL + cloudT * color;
             }
         }
+#endif
     }
 
     // The sky goes out in absolute scene units at full fp32 — packSky writes the payload's three surface

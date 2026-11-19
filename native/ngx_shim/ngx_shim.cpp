@@ -442,9 +442,15 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     NGX_LOG("evaluate_dlssd: handle=%p params=%p color=%p depth=%p mv=%p diffuse=%p specular=%p normals=%p specMotion=%p output=%p",
             (void*) f->handle, (void*) f->params, (void*) colorView, (void*) depthView, (void*) mvView,
             (void*) diffuseAlbedoView, (void*) specularAlbedoView, (void*) normalsView, (void*) specularMotionView, (void*) outputView);
-    (void) specularHitDistanceView;
-    (void) specularHitDistanceImage;
-    (void) specularHitDistanceFormat;
+    // Optional guide: the mirror layer's axial hit distance. A null view means the renderer did not supply
+    // one, and NGX must then see a null resource rather than a wrapper around a null handle.
+    NVSDK_NGX_Resource_VK specularHitDistance = {};
+    const bool hasSpecularHitDistance = specularHitDistanceView != 0
+            && specularHitDistanceImage != 0 && specularHitDistanceFormat != 0;
+    if (hasSpecularHitDistance) {
+        specularHitDistance = makeImageResource(specularHitDistanceView, specularHitDistanceImage,
+                specularHitDistanceFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
+    }
 
     NVSDK_NGX_Resource_VK color = makeImageResource(colorView, colorImage, colorFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
     NVSDK_NGX_Resource_VK depth = makeImageResource(depthView, depthImage, depthFormat, renderWidth, renderHeight, VK_IMAGE_ASPECT_COLOR_BIT, false);
@@ -465,7 +471,7 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
     eval.pInSpecularAlbedo = &specularAlbedo;
     eval.pInNormals = &normals;
     eval.pInMotionVectorsReflections = &specularMotion;
-    eval.pInSpecularHitDistance = nullptr;
+    eval.pInSpecularHitDistance = hasSpecularHitDistance ? &specularHitDistance : nullptr;
     // HW depth needs the projection so DLSS can linearize it (jitter-free; NGX left-multiply layout).
     eval.pInWorldToViewMatrix = worldToViewMatrix;
     eval.pInViewToClipMatrix = viewToClipMatrix;

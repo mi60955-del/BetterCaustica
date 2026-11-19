@@ -40,17 +40,16 @@ import guides;
 
 
 // Volume debug image (debug views 10..13): r fog transmittance along the camera ray, g the fog
-// in-scatter's luminance, b the cloud coverage the camera ray reads off the cloud plane, a the
-// cloud-shadow transmittance the sun leg from the camera would ride. The cloud lanes live since
-// Phase 4; a cloud-off frame leaves them at their inert defaults (0 and 1) through the same push
-// gates every other consumer uses. Gated by WORLD_FLAG_VOLUME_DEBUG, so the ordinary frame never
-// touches this image.
+// in-scatter's luminance, b the visible cloud coverage the camera ray reads off the cloud plane, a
+// the cloud-shadow transmittance the sun leg from the camera would ride. The two cloud lanes have
+// independent flags, so a shadow-only frame still reports its ground shadow. Gated by
+// WORLD_FLAG_VOLUME_DEBUG, so the ordinary frame never touches this image.
 void writeVolumeDebug(int2 pix, float3 ro, float3 rd, float t, bool allowShadowCull) {
     if (!CAUSTICA_VOLUME_PATH) {
         volumeDebug[pix] = float4(1.0, 0.0, 0.0, 1.0);
         return;
     }
-    float fogT;
+    float3 fogT;
     float3 insc = fogSegmentInScatter(ro, rd, t, pix, allowShadowCull, fogT);
     float cloudDensity = 0.0;
     float cloudShadow = 1.0;
@@ -59,11 +58,12 @@ void writeVolumeDebug(int2 pix, float3 ro, float3 rd, float t, bool allowShadowC
         if (tPlane > 0.0) {
             cloudDensity = cloudCoverageWorld(ro.xz + rd.xz * tPlane);
         }
-        if (celestialLight.halfAngle > 0.0) {
-            cloudShadow = cloudShadowTransmittance(ro, celestialLight.dir);
-        }
     }
-    volumeDebug[pix] = float4(fogT, luminance(insc), cloudDensity, cloudShadow);
+    if ((worldPush.flags & WORLD_FLAG_CLOUD_SHADOW) != 0u && worldPush.cloud0.x > 0.0
+            && celestialLight.halfAngle > 0.0) {
+        cloudShadow = cloudShadowTransmittance(ro, celestialLight.dir);
+    }
+    volumeDebug[pix] = float4(luminance(fogT), luminance(insc), cloudDensity, cloudShadow);
 }
 
 // Pass A's camera segment walk. `guidesOnly` runs the same walk for a second ray purely to land the
@@ -89,7 +89,9 @@ public PathSegment tracePrimary(PathSegment seg,
     bool waterWaves = (worldPush.flags & 16u) != 0u;
     bool fogOn = (worldPush.flags & WORLD_FLAG_FOG) != 0u;
     bool shaftOn = (worldPush.flags & WORLD_FLAG_SHAFTS) != 0u;
+    bool waterFogOn = (worldPush.flags & WORLD_FLAG_WATER_FOG) != 0u;
     bool edgeFadeOn = (worldPush.flags & WORLD_FLAG_EDGE_FADE) != 0u;
+    bool cloudOutScatterOn = (worldPush.flags & WORLD_FLAG_CLOUD_OUTSCATTER) != 0u;
     nextRecord = PATH_NO_NEXT;
     prefixInImage = false;
     // Per-pixel specular guide state: only the water interface below sets it.
@@ -178,8 +180,11 @@ public PathSegment tracePrimary(PathSegment seg,
                 // leaving the surface's value there would brighten dark surfaces and darken bright ones
                 // wherever either sits in front. Guarded so a frame with both off keeps the plain write.
                 if (CAUSTICA_VOLUME_PATH && (fogOn || edgeFadeOn)) {
-                    float airT = fogOn ? airTransmittance(ro, rd, payload.hitT) : 1.0;
-                    float coverage = edgeFadeOn ? edgeFadeCoverage(ro, rd, payload.hitT) : 0.0;
+                    float airT = fogOn ? luminance(airTransmittance(ro, rd, payload.hitT)) : 1.0;
+                    // LOD hits skip the fade term exactly like the radiance path does (see PAYLOAD_LOD):
+                    // the cell is the real far field, not a dissolve-in-progress.
+                    float coverage = edgeFadeOn && (payload.flags & PAYLOAD_LOD) == 0u
+                            ? edgeFadeCoverage(ro, rd, payload.hitT) : 0.0;
                     float awayFromSurface = 1.0 - airT * (1.0 - coverage);
                     if (awayFromSurface > 0.0) {
                         gv_albedo = lerp(gv_albedo, float3(0.5, 0.5, 0.5), awayFromSurface);
@@ -223,10 +228,24 @@ public PathSegment tracePrimary(PathSegment seg,
                     // The in-scatter call owns the segment's sigma (the indoor sky-exposure ladder may
                     // thin it), and its out fogT is that same thinned transmittance — attenuate
                     // throughput with it so the two agree instead of re-integrating at full density.
-                    float prefixFogT;
+                    float3 prefixFogT;
                     prefixRadiance += fogSegmentInScatter(ro, rd, payload.hitT, pix, true, prefixFogT);
                     throughput *= prefixFogT;
                     hasPrefix = true;
+                }
+                // The camera-to-interface stretch is consumed here for the Fresnel continuations, and
+                // Pass B never re-traces it: the deck's scattered radiance and its Beer-Lambert
+                // extinction have to ride the same prefix write as the fog. A hit before the layer
+                // leaves cloudT at 1, so no prefix is opened for a cloud that is not in the way.
+                if (CAUSTICA_VOLUME_PATH && cloudOutScatterOn) {
+                    float prefixCloudT;
+                    float3 prefixCloudL = cloudSegmentOutScatter(worldPush, ro, rd,
+                            skyState(worldPush), payload.hitT, prefixCloudT);
+                    if (prefixCloudT < 1.0) {
+                        prefixRadiance += prefixCloudL;
+                        throughput *= prefixCloudT;
+                        hasPrefix = true;
+                    }
                 }
                 if (CAUSTICA_VOLUME_PATH && shaftOn) {
                     float shaftShare;
@@ -240,18 +259,28 @@ public PathSegment tracePrimary(PathSegment seg,
                         float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
                 prefixInImage = true;
             }
-            // The water medium's own scattering over the camera-to-interface stretch (the camera started
-            // submerged): the same prefix doctrine as the fog branch above — the radiance is common to
-            // both Fresnel continuations and can ride neither record, so it is written into outImage once
-            // and flagged, and the indirect pass accumulates on top. The two branches never co-fire: the
-            // fog stands down while any extinction is present, the water term needs the water medium.
-            if (CAUSTICA_VOLUME_PATH && medium.current.water && shaftOn) {
-                float shaftShare;
-                float3 prefixWater = shaftInScatter(ro, rd, payload.hitT, pix, worldPush.waterShaft.x,
-                        medium.current.phaseG, true, shaftShare);
-                outImage[pix] = float4(clamp(prefixWater * worldPush.preExposure,
-                        float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
-                prefixInImage = true;
+            // The water column over the camera-to-interface stretch (the camera started submerged): the
+            // body's own in-scatter and its shaft layer are two terms of the SAME medium, so they add
+            // into one prefix write. The radiance is common to both Fresnel continuations and can ride
+            // neither record, which is why it goes into outImage and is flagged; the fog branch above
+            // never co-fires with this one, because the fog stands down while any extinction is present.
+            if (CAUSTICA_VOLUME_PATH && medium.current.water) {
+                bool waterPrefix = false;
+                if (waterFogOn) {
+                    prefixRadiance += waterSegmentInScatter(ro, rd, payload.hitT, pix, medium.current);
+                    waterPrefix = true;
+                }
+                if (shaftOn) {
+                    float shaftShare;
+                    prefixRadiance += shaftInScatter(ro, rd, payload.hitT, pix, worldPush.waterShaft.x,
+                            medium.current.phaseG, true, shaftShare);
+                    waterPrefix = true;
+                }
+                if (waterPrefix) {
+                    outImage[pix] = float4(clamp(prefixRadiance * worldPush.preExposure,
+                            float3(0.0, 0.0, 0.0), float3(HALF_MAX, HALF_MAX, HALF_MAX)), 1.0);
+                    prefixInImage = true;
+                }
             }
         }
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0),
@@ -457,7 +486,16 @@ void main() {
             float seen = worldPush.dof.y - behind;
             radius = min(radius, worldPush.dof.z * seen * worldPush.dof.y / behind);
         }
-        float2 aperture = sampleLensDisk(worldPush.frameIndex, pixelSeed) * radius;
+        // The barrel eclipses the opening for a bundle arriving this far off the axis, so the lens
+        // point walks inside the aperture and the barrel's opening displaced toward the frame's
+        // centre: the bokeh the reconstruct averages out of these per-frame points keeps its round
+        // side facing the centre and bites into the outer side, the cat-eye at the frame's edges.
+        // Field astigmatism then draws that pupil tangentially into the lens's swirl. Both strengths
+        // at zero leave the plain disc walk.
+        float2 framePos = framePosition(pinholeDir);
+        float2 pupil = sampleLensPupil(worldPush.frameIndex, pixelSeed,
+                framePos, worldPush.dofCatEye);
+        float2 aperture = swirlLensPoint(pupil, framePos, worldPush.dofSwirl) * radius;
         float3 lensPoint = nearP + aperture.x * lensRight + aperture.y * lensUp;
         float3 focalPoint = nearP
                 + pinholeDir * (worldPush.dof.y / max(dot(pinholeDir, axis), 1.0e-4));

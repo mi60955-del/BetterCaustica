@@ -37,10 +37,14 @@ import org.lwjgl.vulkan.VK10;
 public final class RtGpuTiming {
     private static final boolean ENABLED = Boolean.getBoolean("caustica.rt.gpuTiming");
 
-    /** Ordered pass boundaries. Interval i is NAMES[i-1] -> NAMES[i]. */
+    /**
+     * Ordered pass boundaries. Interval i is NAMES[i-1] -> NAMES[i], so this list is exactly the sequence
+     * of {@link #mark} calls a frame records, prefixed by the unlabelled frame-start mark: entry 0 names
+     * the interval the frame's setup costs, and the last entry is the last mark the frame records.
+     */
     private static final String[] NAMES = {
-            "setup", "skyLut", "tracePrimary", "traceIndirect", "focusMeter", "dlss", "exposure", "bloom",
-            "lens", "display", "copy"
+            "setup", "skyLut", "tracePrimary", "traceIndirect", "focusMeter", "dlss", "rain", "exposure",
+            "bloom", "lens", "display", "dofPost", "copy"
     };
     private static final int MAX_MARKS = NAMES.length;
 

@@ -31,13 +31,15 @@ abstract class GenerateRtBindings extends DefaultTask {
                     TLAS: "topLevelAS", OUTPUT: "outImage", BLOCK_ALBEDO: "blockAlbedoAtlas",
                     G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth", G_MOTION: "gMotion",
                     G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
+                    G_SPEC_HIT_DIST: "gSpecHitDist",
                     CELESTIALS: "celestialsAtlas", SKY_VIEW: "skyViewLut", TRANSMITTANCE: "transmittanceLut",
                     SKY_IRRADIANCE_LUT: "skyIrradianceLut", END_SKY_TEX: "endSkyTex",
                     RESERVOIR_PREV: "reservoirPrev", RESERVOIR_CUR: "reservoirCur",
                     RESERVOIR_SAMPLE_PREV: "reservoirSamplePrev",
                     RESERVOIR_SAMPLE_CUR: "reservoirSampleCur", VOLUME_DEBUG: "volumeDebug",
-                    CLOUD_VOLUMES: "cloudVolumes",
+                    CLOUD_NOISE: "cloudNoise",
                     FOCUS_DEPTH_PREV: "focusDepthPrev", FOCUS_DEPTH_CUR: "focusDepthCur",
+                    INDIRECT_HALF: "indirectHalf", INDIRECT_HALF_DEPTH: "indirectHalfDepth",
                     ENTITY_ALBEDO: "entityAlbedoTex", MATERIAL_SURFACE0: "materialSurface0Tex",
                     MATERIAL_NORMAL_AO: "materialNormalAoTex", MATERIAL_SURFACE1: "materialSurface1Tex"]],
             [prefix: "DISPLAY", source: "pipelines/display/main.comp.slang", resources: [
@@ -49,6 +51,9 @@ abstract class GenerateRtBindings extends DefaultTask {
                     SOURCE: "sourceImage", HDR_SOURCE: "hdrSourceImage"]],
             [prefix: "STILL", source: "pipelines/still/main.comp.slang", resources: [
                     ACCUMULATOR: "accumulatorImage", SOURCE: "sourceImage", OUTPUT: "outputImage"]],
+            [prefix: "STILL_DENOISE", source: "pipelines/still_denoise/main.comp.slang", resources: [
+                    SOURCE: "sourceImage", GUIDE_NORMAL: "guideNormal", GUIDE_ALBEDO: "guideAlbedo",
+                    GUIDE_DEPTH: "guideDepth", OUTPUT: "outputImage"]],
             [prefix: "DEBUG_PRESENT", source: "pipelines/debug_present/main.comp.slang", resources: [
                     OUTPUT: "outputImage", G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth",
                     G_MOTION: "gMotion", G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
@@ -79,6 +84,10 @@ abstract class GenerateRtBindings extends DefaultTask {
                     MULTISCATTER_SAMPLER: "multiScatterLut", SKY_VIEW_SAMPLER: "skyViewLut"]],
             [prefix: "PRESENT", source: "pipelines/hdr_composite/main.comp.slang", resources: [
                     OUTPUT: "outputImage", SOURCE: "sourceImage"]],
+            // The rain-streak overlay samples the trace's depth guide and the sky-view LUT; both are
+            // combined image samplers in one set, since the pass owns no resources of its own.
+            [prefix: "RAIN", source: "pipelines/rain/rain.frag.slang", resources: [
+                    DEPTH: "depthImage", SKY_VIEW: "skyViewLut"]],
             [prefix: "OVERLAY_IMAGE", source: "pipelines/overlay_composite/glow.frag.slang", resources: [VALUE: "sourceImage"]],
             [prefix: "OVERLAY_SAMPLER", source: "pipelines/name_tag/fragment.frag.slang", resources: [VALUE: "fontAtlas"]],
             [prefix: "OVERLAY_TLAS", source: "pipelines/block_outline/fragment.frag.slang", resources: [VALUE: "tlas"]]
@@ -151,7 +160,8 @@ abstract class GenerateRtBindings extends DefaultTask {
                 // only ever loaded — so the descriptor pool has to count them with the other images.
                 def storageImages = guides + ordinary.findAll { suffix, ignored ->
                     suffix in ["OUTPUT", "SKY_IRRADIANCE_LUT", "RESERVOIR_PREV", "RESERVOIR_CUR",
-                               "RESERVOIR_SAMPLE_PREV", "RESERVOIR_SAMPLE_CUR", "VOLUME_DEBUG"]
+                               "RESERVOIR_SAMPLE_PREV", "RESERVOIR_SAMPLE_CUR", "VOLUME_DEBUG",
+                               "INDIRECT_HALF", "INDIRECT_HALF_DEPTH"]
                 }
                 def samplers = ordinary.findAll { suffix, ignored -> suffix != "TLAS" && !storageImages.containsKey(suffix) }
                 constants.WORLD_GUIDE_COUNT = guides.size()

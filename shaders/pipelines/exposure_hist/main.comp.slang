@@ -28,11 +28,29 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint groupIndex : SV_GroupInde
     uint w, h;
     colorImage.GetDimensions(w, h);
     if (pix.x < int(w) && pix.y < int(h)) {
-        float3 rgb = colorImage[pix].rgb;
+        // The histogram bins log2 luminance, and log is concave: Monte-Carlo noise makes the average
+        // log lower than the log of the average (Jensen), which biases the metered EV and with it the
+        // exposure. DLSS-RR normally hides that by supplying a denoised image; with RR off this pass
+        // sees the raw trace. Average a 4x4 block per sample first, which cuts the noise variance (and
+        // the bias) by sixteen while keeping the sample grid and the population weighting unchanged.
+        // Blocks overlap when stride < 4; that only smooths the metered distribution further.
+        const int BOX = 4;
+        int2 maxPix = int2(int(w), int(h)) - 1;
+        float3 rgb = float3(0.0);
+        uint valid = 0u;
+        for (int dy = 0; dy < BOX; dy++) {
+            for (int dx = 0; dx < BOX; dx++) {
+                float3 tap = colorImage[min(pix + int2(dx, dy), maxPix)].rgb;
+                if (all(isfinite(tap))) {
+                    rgb += max(tap, float3(0.0));
+                    valid++;
+                }
+            }
+        }
         // Invalid radiance is not a meaningful metering sample. Skipping it is safe because resolve
         // derives its population from the bins instead of assuming image area.
-        if (all(isfinite(rgb))) {
-            rgb = max(rgb, float3(0.0));
+        if (valid > 0u) {
+            rgb /= float(valid);
             // The reconstructed scene image is linear ACEScg; meter it in the transport basis.
             float lum = dot(rgb, ACESCG_LUMA);
             float logLum = clamp(log2(max(lum, 1.0e-5)), LOG_MIN, LOG_MAX);

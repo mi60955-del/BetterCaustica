@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,7 @@ import net.minecraft.network.chat.contents.TranslatableContents;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -143,6 +145,10 @@ class CausticaSodiumConfigTest {
             case HDR_PEAK -> List.of(option.nameKey() + ".nits");
             case FRAME_GENERATION_BACKEND -> CausticaConfig.Rt.Fg.BACKENDS.stream()
                     .map(backend -> option.nameKey() + "." + backend).toList();
+            case DOF_MODE -> CausticaConfig.Rt.DepthOfField.MODES.stream()
+                    .map(mode -> option.nameKey() + "." + mode).toList();
+            case PARALLAX_STYLE -> CausticaConfig.Rt.Materials.PARALLAX_STYLES.stream()
+                    .map(style -> option.nameKey() + "." + style).toList();
         };
     }
 
@@ -165,6 +171,20 @@ class CausticaSodiumConfigTest {
         for (int i = 0; i < peaks.length; i++) {
             assertEquals(CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS.get(i), peaks[i].value(),
                     "HdrPeak ordinal " + i);
+        }
+        CausticaSodiumConfig.DofMode[] modes = CausticaSodiumConfig.DofMode.values();
+        assertEquals(CausticaConfig.Rt.DepthOfField.MODES.size(), modes.length,
+                "DofMode and MODES disagree in length");
+        for (int i = 0; i < modes.length; i++) {
+            assertEquals(CausticaConfig.Rt.DepthOfField.MODES.get(i), modes[i].value(),
+                    "DofMode ordinal " + i);
+        }
+        CausticaSodiumConfig.ParallaxStyle[] styles = CausticaSodiumConfig.ParallaxStyle.values();
+        assertEquals(CausticaConfig.Rt.Materials.PARALLAX_STYLES.size(), styles.length,
+                "ParallaxStyle and PARALLAX_STYLES disagree in length");
+        for (int i = 0; i < styles.length; i++) {
+            assertEquals(CausticaConfig.Rt.Materials.PARALLAX_STYLES.get(i), styles[i].value(),
+                    "ParallaxStyle ordinal " + i);
         }
         CausticaSodiumConfig.FgBackend[] backends = CausticaSodiumConfig.FgBackend.values();
         assertEquals(CausticaConfig.Rt.Fg.BACKENDS.size(), backends.length,
@@ -190,7 +210,7 @@ class CausticaSodiumConfigTest {
                         .filter(option -> option.group().equals(group))
                         .mapToInt(option -> 1)
                         .sum();
-                assertEquals(expected, RtVideoOptions.groupOptions(page, group).length,
+                assertEquals(expected, RtVideoOptions.instances(page, group, () -> { }).size(),
                         page + "/" + group + " built a different number of rows than the catalog lists");
                 built += expected;
             }
@@ -199,10 +219,149 @@ class CausticaSodiumConfigTest {
         }
     }
 
+    /**
+     * The structure the pages are supposed to have: a page fits on one screen without becoming a wall,
+     * every gate points at a row that exists and sits above it, and only the two hardware capabilities
+     * are allowed to make a row vanish. These are the invariants a hand edit to the catalog breaks
+     * silently, because both screens simply draw whatever list they are handed.
+     */
+    @Test
+    void pageStructureHolds() {
+        List<String> problems = new ArrayList<>();
+        for (CausticaSettings.Page page : CausticaSettings.Page.values()) {
+            List<CausticaSettings.Option> options = CausticaSettings.options(page);
+            if (options.isEmpty()) {
+                problems.add(page + " has nothing to show");
+                continue;
+            }
+            int rows = CausticaSettings.groups(page).size();
+            for (String group : CausticaSettings.groups(page)) {
+                int count = (int) options.stream().filter(o -> o.group().equals(group)).count();
+                rows += (count + 1) / 2;
+            }
+            // A ceiling, not a target: 24 rows is about two screens of scroll, and past that a page
+            // stops being a place and becomes a list. Two pages run this long: the Volumetrics page,
+            // which holds four independent media, and the Sky page, where the cloud stack alone
+            // (its switches and dials across the clouds and cloud-detail groups) fills ten rows.
+            if (rows > 24) {
+                problems.add(page + " needs " + rows + " rows");
+            }
+            for (int i = 0; i < options.size(); i++) {
+                CausticaSettings.Option option = options.get(i);
+                CausticaSettings.Dependency dependency = option.gate().dependsOn();
+                if (dependency == null) {
+                    continue;
+                }
+                CausticaSettings.Option parent = CausticaSettings.byPath(dependency.parentPath());
+                if (parent == null) {
+                    problems.add(option.path() + " depends on unknown " + dependency.parentPath());
+                } else if (parent.page() != page) {
+                    // The exposure controller is the one choice later pages read: the night colour shift
+                    // has no signal without the meter, and moving that pair onto the Exposure page would
+                    // file a colour effect under exposure. Every other parent has to be on the same page,
+                    // because a greyed row with no switch in sight is what the split exists to prevent.
+                    if (!dependency.parentPath().equals("exposure.mode")) {
+                        problems.add(option.path() + " depends on a row on another page");
+                    }
+                } else if (options.indexOf(parent) >= i) {
+                    problems.add(option.path() + " sits above the switch that wakes it");
+                }
+            }
+        }
+        assertTrue(problems.isEmpty(), "page structure: " + problems);
+    }
+
+    /**
+     * A gate is one of two things, and mixing them up is what the split exists to prevent: a capability
+     * the machine either has or does not (the row is absent), and a parent switch (the row greys). Only
+     * the HDR swapchain today is the former.
+     */
+    @Test
+    void onlyHardwareGatesHideRows() {
+        for (CausticaSettings.Option option : CausticaSettings.ALL) {
+            boolean alwaysOn = option.gate().hardware() == null || option.gate().hardware().get();
+            if (!alwaysOn) {
+                assertTrue(option.path().startsWith("hdr."),
+                        option.path() + " hides itself for a reason other than the HDR swapchain");
+            }
+        }
+    }
+
+    /** Restart-bound options are all at the end of their group, so a group reads as "and then a reboot". */
+    @Test
+    void restartOptionsCloseTheirGroup() {
+        for (CausticaSettings.Page page : CausticaSettings.Page.values()) {
+            for (String group : CausticaSettings.groups(page)) {
+                List<CausticaSettings.Option> inGroup = CausticaSettings.options(page).stream()
+                        .filter(option -> option.group().equals(group)).toList();
+                boolean seenRestart = false;
+                for (CausticaSettings.Option option : inGroup) {
+                    if (option.restart()) {
+                        seenRestart = true;
+                    } else if (seenRestart) {
+                        fail(option.path() + " splits the restart block of " + page + "/" + group);
+                    }
+                }
+            }
+        }
+    }
+
+    /** Labels are what a player searches by eye, so one page cannot name two rows the same thing. */
+    @Test
+    void pageLabelsAreUnique() {
+        Map<String, String> locale = englishLocale();
+        for (CausticaSettings.Page page : CausticaSettings.Page.values()) {
+            Map<String, String> seen = new LinkedHashMap<>();
+            for (CausticaSettings.Option option : CausticaSettings.options(page)) {
+                String label = locale.get(option.nameKey());
+                String previous = seen.putIfAbsent(label, option.path());
+                if (previous != null) {
+                    fail(page + " names " + previous + " and " + option.path() + " both " + label);
+                }
+            }
+        }
+    }
+
+    /** Every page and group the catalog names has a heading, or the menu shows a raw key. */
+    @Test
+    void everyHeadingHasAnEnglishTranslation() {
+        Map<String, String> locale = englishLocale();
+        List<String> missing = new ArrayList<>();
+        for (CausticaSettings.Page page : CausticaSettings.Page.values()) {
+            if (!locale.containsKey(page.titleKey())) {
+                missing.add(page.titleKey());
+            }
+        }
+        for (CausticaSettings.Section section : CausticaSettings.Section.values()) {
+            if (!locale.containsKey(section.titleKey())) {
+                missing.add(section.titleKey());
+            }
+        }
+        for (CausticaSettings.Option option : CausticaSettings.ALL) {
+            if (!locale.containsKey(CausticaSettings.groupKey(option.group()))) {
+                missing.add(CausticaSettings.groupKey(option.group()));
+            }
+        }
+        assertTrue(missing.isEmpty(), "missing from en_us.json: " + missing);
+    }
+
+    /** The catalog covers every page it declares, and no option is orphaned outside the page list. */
+    @Test
+    void everyPageHasOptionsAndEveryOptionAPage() {
+        int total = 0;
+        for (CausticaSettings.Page page : CausticaSettings.Page.values()) {
+            int count = CausticaSettings.options(page).size();
+            assertTrue(count > 0, page + " is registered with nothing on it");
+            total += count;
+        }
+        assertEquals(CausticaSettings.ALL.stream().filter(CausticaSettings.Option::offeredNow).count(), total,
+                "an option is not reachable from any page");
+    }
+
     private static boolean cycles(CausticaSettings.Cycle cycle, Object setting) {
         return switch (cycle) {
             case EXPOSURE_MODE, FRAME_GENERATION_BACKEND -> setting instanceof CausticaConfig.StringSetting;
-            case DLSS_QUALITY, HDR_PEAK -> setting instanceof CausticaConfig.IntSetting;
+            case DLSS_QUALITY, HDR_PEAK, DOF_MODE, PARALLAX_STYLE -> setting instanceof CausticaConfig.IntSetting;
         };
     }
 

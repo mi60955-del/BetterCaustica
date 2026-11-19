@@ -3,6 +3,7 @@ package dev.comfyfluffy.caustica.mixin;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import dev.comfyfluffy.caustica.client.VanillaRenderController;
+import dev.comfyfluffy.caustica.client.XaeroMinimapHook;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
@@ -50,6 +51,9 @@ public abstract class LevelRendererMixin {
 		}
 
 		VanillaRenderController.INSTANCE.markWorldSkipped();
+		// The minimap copies this matrix at the head of the pass being skipped; publish the same value
+		// for it so its in-world waypoint markers keep their world positions on traced frames.
+		XaeroMinimapHook.publishWorldModelView(modelViewMatrix);
 		ci.cancel();
 	}
 

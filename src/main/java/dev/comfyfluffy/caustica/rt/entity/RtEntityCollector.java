@@ -192,6 +192,12 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (outlineColor != 0) {
             this.outlineColor = outlineColor;
         }
+        // The boat's water patch is a raster-only mask over the water buffer, so it contributes no
+        // geometry to the BLAS. Consume the pending order just as a captured submission would.
+        if (isWaterMask(renderType)) {
+            pendingOrder = 0;
+            return;
+        }
         // Vanilla gives the base-colour banner pass order 0 even though it is drawn after an uncoloured,
         // exactly coplanar cloth pass. Move every banner-pattern pass out one rank: base colour becomes 1,
         // and the explicitly ordered emblem layers become 2+. Otherwise the BVH can select white cloth.
@@ -554,6 +560,19 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         Object setup = ((RenderTypeAccessor) renderType).caustica$state();
         RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
         return "minecraft:pipeline/banner_pattern".equals(pipeline.getLocation().toString());
+    }
+
+    /** Vanilla's boat water patch writes a mask into the water buffer rather than drawing a surface:
+     *  its pipeline binds no texture and its shader emits a constant colour. Capturing it would resolve
+     *  to the reserved white texture and put an opaque quad over the boat's interior. */
+    private static boolean isWaterMask(RenderType renderType) {
+        if (renderType == null) {
+            return false;
+        }
+        if (renderType == RenderTypes.waterMask()) {
+            return true;
+        }
+        return "minecraft:pipeline/water_mask".equals(pipeline(renderType).getLocation().toString());
     }
 
     /** Resolve a quad's tint colour from its tint index + the submission's tint layers (white if untinted). */

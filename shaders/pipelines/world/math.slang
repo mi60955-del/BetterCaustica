@@ -142,22 +142,112 @@ public void sensorFrame(out float3 axis, out float3 right, out float3 up) {
     up = cross(axis, right);
 }
 
-// One point of a circular aperture, in units of its radius. Successive frames of one pixel walk the
-// plastic-number lattice, which covers the aperture evenly instead of clumping — that is the difference
-// between a temporal filter averaging a bokeh disc and one averaging a few scattered dots inside it. The
-// lattice is rotated by a phase drawn from the pixel's own stream, because one shared point across the
-// whole screen translates the image rather than defocusing it; the frame index is masked because fp32
-// stops resolving a fraction of it long before a session ends, and a wrapped walk is still an even one.
-public float2 sampleLensDisk(uint frameIndex, uint pixelSeed) {
+// The frame position of a pinhole direction, the [-1, +1] the frame spans on each of the sensor's
+// axes. The numerator is the direction's tangent offset along the sensor frame's right and up; the
+// half-span it divides by is the unprojected NDC edge's own offset along the same axes, divided back
+// by the near plane's own distance so span and numerator are both tangents -- the near plane sits a
+// fraction of a block out, and keeping its distance in the span would inflate the frame position by
+// that fraction's reciprocal. Numerator and span flip together wherever the host's projection flips
+// an axis, so the ratio stays on the screen's orientation without anyone having to declare which way
+// the projection's y runs.
+public float2 framePosition(float3 pinholeDir) {
+    float3 axis;
+    float3 right;
+    float3 up;
+    sensorFrame(axis, right, up);
+    float2 lateral = float2(dot(pinholeDir, right), dot(pinholeDir, up))
+            / max(dot(pinholeDir, axis), 1.0e-4);
+    float4 centreH = mul(worldPush.invViewProj, float4(0.0, 0.0, 1.0, 1.0));
+    float3 centre = centreH.xyz / centreH.w;
+    float4 xEdgeH = mul(worldPush.invViewProj, float4(1.0, 0.0, 1.0, 1.0));
+    float4 yEdgeH = mul(worldPush.invViewProj, float4(0.0, 1.0, 1.0, 1.0));
+    float2 halfSpan = float2(dot(xEdgeH.xyz / xEdgeH.w - centre, right),
+            dot(yEdgeH.xyz / yEdgeH.w - centre, up))
+            / max(length(centre), 1.0e-4);
+    return lateral / halfSpan;
+}
+
+// One point of the aperture walk's plastic-number lattice, `step` places along the sequence from the
+// frame's own, with the phase the pixel's own stream draws -- one shared point across the whole screen
+// translates the image rather than defocusing it, so the walk is rotated per pixel. The frame index is
+// masked because fp32 stops resolving a fraction of it long before a session ends; a wrapped walk is
+// still an even one, and so is the walk of any contiguous run of steps.
+float2 lensLatticePoint(uint frameIndex, uint pixelSeed, uint step) {
     uint phaseSeed = pcg(pixelSeed);
     float phaseX = rndf(phaseSeed);
     float phaseY = rndf(phaseSeed);
-    float2 u = frac(float(frameIndex & 1023u) * LENS_LATTICE_STEPS + float2(phaseX, phaseY));
-    // Area-preserving map of the unit square onto the unit disk: sqrt on the radius, so the samples hold a
-    // constant density per unit of area instead of crowding the centre.
-    float r = sqrt(u.x);
-    float phi = 2.0 * PI * u.y;
+    return frac(float((frameIndex + step) & 1023u) * LENS_LATTICE_STEPS + float2(phaseX, phaseY));
+}
+
+// The area-preserving map of the unit square onto the unit disk the lens walk uses: sqrt on the
+// radius, so the samples hold a constant density per unit of area instead of crowding the centre.
+float2 lensDiskMap(float2 lattice) {
+    float r = sqrt(lattice.x);
+    float phi = 2.0 * PI * lattice.y;
     return r * float2(cos(phi), sin(phi));
+}
+
+// One point of a circular aperture, in units of its radius. Successive frames of one pixel walk the
+// plastic-number lattice, which covers the aperture evenly instead of clumping — that is the difference
+// between a temporal filter averaging a bokeh disc and one averaging a few scattered dots inside it.
+public float2 sampleLensDisk(uint frameIndex, uint pixelSeed) {
+    return lensDiskMap(lensLatticePoint(frameIndex, pixelSeed, 0u));
+}
+
+// One point of the lens opening for a bundle arriving at the frame position `framePos` (the [-1, +1]
+// the frame spans on each of its axes, from `framePosition`), in units of the aperture's radius. Off
+// the axis the barrel eclipses the opening: the entrance pupil is the aperture and the barrel's
+// opening drawn over each other, the opening displaced toward the frame's centre, and the walk steps
+// the plastic-number lattice forward until a point lands inside that overlap. The lattice covers the
+// disc evenly, so the points it holds inside the overlap cover the overlap evenly too, and one point
+// per frame still averages into the eclipsed pupil's cat-eye -- the aperture's own round arc on the
+// centre-facing side, the outer side bitten into by the barrel. The displacement is bound where the
+// overlap keeps about a quarter of the opening, because a wide dial at the frame's corner cannot be
+// allowed to walk the lattice forever; the fallback after the bound's steps still lands inside the
+// aperture, so a frame that misses the overlap only leans that corner's bokeh toward the plain disc,
+// never outside the lens. Zero strength answers the first lattice point, the plain disc walk itself.
+public float2 sampleLensPupil(uint frameIndex, uint pixelSeed, float2 framePos, float strength) {
+    float2 shift = framePos * strength;
+    float mag = length(shift);
+    // The aperture disc and the barrel's copy displaced 1.3 overlap in about a quarter of their
+    // area; past it the walk would starve, and the shape it is drawing is already a full crescent.
+    if (mag > 1.3) {
+        shift *= 1.3 / mag;
+    }
+    for (uint t = 0u; t < 16u; ++t) {
+        float2 p = lensDiskMap(lensLatticePoint(frameIndex, pixelSeed, t));
+        if (dot(p, p) <= 1.0 && dot(p + shift, p + shift) <= 1.0) {
+            return p;
+        }
+    }
+    return lensDiskMap(lensLatticePoint(frameIndex, pixelSeed, 16u));
+}
+
+// The traced lens's field swirl: off-axis astigmatism compresses an aperture point's radial component,
+// so the disc a run of frames averages into is an ellipse whose long axis runs tangentially around the
+// frame's centre. The blur grows with the square of the field angle -- round on the axis, strongest at
+// the corners -- and the map only ever shrinks a point, so a sample can never leave the aperture.
+// Zero strength is the identity, the plain pupil walk.
+public float2 swirlLensPoint(float2 p, float2 framePos, float strength) {
+    // `framePosition` names its axes the way the projection's own NDC does, which runs opposite to the
+    // sensor basis `p` lives in along y. An ellipse survives a half turn but not a mirror, so the field
+    // position is flipped into `p`'s basis here: without it every corner's long axis lands on the
+    // radial diagonal instead of the tangential one. The post gather reads its field position from uv,
+    // which already runs with the screen, so this is the traced lens's own convention fix.
+    float2 fieldPos = float2(framePos.x, -framePos.y);
+    // The frame's corner is the largest field angle the [-1, +1] axes can name; clamping the square
+    // there keeps a mis-scaled frame position from squeezing the pupil into a hairline.
+    float stretch = 1.0 + strength * 1.2 * min(dot(fieldPos, fieldPos), 2.0);
+    if (stretch <= 1.0) {
+        return p;
+    }
+    float r = length(fieldPos);
+    if (r < 1.0e-4) {
+        return p;
+    }
+    float2 radial = fieldPos / r;
+    float2 tangential = float2(-radial.y, radial.x);
+    return radial * (dot(p, radial) / stretch) + tangential * dot(p, tangential);
 }
 
 // Cosine-weighted hemisphere sample about n (Malley's method). For a Lambertian BRDF this is the

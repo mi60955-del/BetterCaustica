@@ -18,6 +18,13 @@ The release package carries its own identity, and the merge must not erode it:
 Copying code in from another checkout? Do not bring `caustica` paths, `caustica.toml`, or
 `/caustica/shaders/` string literals with it — they resolve to nothing in this package.
 
+## Terminology
+
+In this repository, "RR" means **DLSS Ray Reconstruction** (NVIDIA's denoiser/supersampling pass,
+see the `DLSS-RR feature created` log line), not Russian Roulette (the path-termination
+technique). Only call something RR when it refers to the DLSS feature; use "Russian roulette"
+spelled out when discussing stochastic ray termination.
+
 ## Code rules
 
 - Keep planning documents and `todos.md` local-only. Do not add `docs/*PLAN*.md` or `todos.md` to Git.
@@ -51,6 +58,13 @@ Copying code in from another checkout? Do not bring `caustica` paths, `caustica.
 `-DCAUSTICA_NO_VOLUME_PATH`. They exist so a frame with every volumetric switch off can trace a raygen
 that carries no fog/water code — that code costs registers, and registers cost about 5 ms of the frame
 on a 6 GB laptop. Keep them compiling when the world shaders change.
+
+Each tier also has a no-march twin (`primary_no_march.rgen.spv` / `indirect_no_march.rgen.spv`, the
+no-cloud and shadow-only twins, and the SER variants) from `-DCAUSTICA_NO_MARCH_PATH`: the fog's
+heterogeneous integrator compiled out. The renderer dispatches them whenever `volume.fog-march` is off,
+so a closed-form fog frame does not pay the marched tier's registers (~5 ms at 1080p in the reference
+scene). The dispatch pairing lives in `RtComposite` next to the `RAYGEN_*` constants — keep the record
+order and both sides in step.
 
 `RtGpuTiming` (`-Dcaustica.rt.gpuTiming=true`) writes per-pass GPU timestamps to
 `rt-frame-stats/gpu.csv`. The CPU-side stages in `frame.csv` say nothing about a GPU-bound pass.

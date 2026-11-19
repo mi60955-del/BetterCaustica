@@ -10,6 +10,7 @@ import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.terrain.RtDhLodScene;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
@@ -86,6 +87,7 @@ public final class CausticaClient implements ClientModInitializer {
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
 		InvalidateRenderStateCallback.EVENT.register(() -> {
 			RtTerrain.requestFullClear();
+			RtDhLodScene.requestFullClear();
 			RtComposite.INSTANCE.resetExposureHistory();
 			// The world the accumulated samples were traced through is gone, so the run has nothing left to
 			// average; a saved run is already past this point and lands on its own tick.

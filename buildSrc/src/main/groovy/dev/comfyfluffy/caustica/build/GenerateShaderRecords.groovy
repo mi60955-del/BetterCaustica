@@ -235,6 +235,7 @@ abstract class GenerateShaderRecords extends DefaultTask {
             ["displayPushProbe", "DisplayPush", "DisplayPushData"],
             ["sharpenPushProbe", "SharpenPush", "SharpenPushData"],
             ["stillPushProbe", "StillPush", "StillPushData"],
+            ["stillDenoisePushProbe", "StillDenoisePush", "StillDenoisePushData"],
             ["dofFocusPushProbe", "DofFocusPush", "DofFocusPushData"],
             ["debugPresentPushProbe", "DebugPresentPush", "DebugPresentPushData"],
             ["bloomPushProbe", "BloomPush", "BloomPushData"],
@@ -242,6 +243,7 @@ abstract class GenerateShaderRecords extends DefaultTask {
             ["lensFlarePushProbe", "LensFlarePush", "LensFlarePushData"],
             ["dofPostGatherPushProbe", "DofPostGatherPush", "DofPostGatherPushData"],
             ["dofPostRecombinePushProbe", "DofPostRecombinePush", "DofPostRecombinePushData"],
+            ["rainPushProbe", "RainPush", "RainPushData"],
             ["pushAddrLayoutProbe", "PushAddr", "PushAddrData"],
     ]
 

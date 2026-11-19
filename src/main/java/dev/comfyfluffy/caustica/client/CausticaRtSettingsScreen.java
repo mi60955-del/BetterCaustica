@@ -7,15 +7,15 @@ import net.minecraft.client.gui.screens.options.OptionsSubScreen;
 import net.minecraft.network.chat.Component;
 
 /**
- * Caustica's settings landing screen, opened from Mod Menu. It carries the same Ray Tracing controls the
- * vanilla Video Settings screen shows, so a player who never opens the vanilla menus still has a route to
- * them.
+ * Caustica's settings hub, opened from Mod Menu and from the Ray Tracing section of Video Settings. It
+ * carries one button per page, banded by {@link CausticaSettings.Section}, so the twelve subsystems are
+ * three groups a player can scan instead of one column of buttons.
  *
- * <p>Reached through {@link CausticaModMenu} rather than a mixin, so nothing here depends on which screen
- * the host mod replaces.
+ * <p>Reached through {@link CausticaModMenu} or the hub button rather than a mixin, so nothing here depends
+ * on which screen the host mod replaces.
  */
 public final class CausticaRtSettingsScreen extends OptionsSubScreen {
-    private static final Component TITLE = Component.translatable("caustica.options.rt.header");
+    private static final Component TITLE = Component.translatable("caustica.options.rt.hub");
 
     public CausticaRtSettingsScreen(Screen lastScreen, Options options) {
         super(lastScreen, options, TITLE);
@@ -23,7 +23,6 @@ public final class CausticaRtSettingsScreen extends OptionsSubScreen {
 
     @Override
     protected void addOptions() {
-        // No section header: the screen title already names it.
         RtVideoOptions.addRuntimeControls(this.list);
     }
 

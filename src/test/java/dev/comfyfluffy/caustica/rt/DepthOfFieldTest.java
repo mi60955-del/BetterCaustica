@@ -90,14 +90,54 @@ final class DepthOfFieldTest {
     }
 
     @Test
-    void aLongerFocusTimeEasesThePlaneIn() {
-        // The dial is the glide's time constant: after it elapses the plane has covered about 63% of the
-        // distance, and a slower dial must arrive later, never earlier.
-        float tau = RtDepthOfField.rackFocus(8.0f, 2.0f, 0.2f, 0.2f);
-        assertEquals(8.0f - 6.0f * (1.0f - (float) Math.exp(-1.0)), tau, 1.0e-5);
+    void theDialIsTheTimeThePlaneArrives() {
+        // The dial names a duration, so one dial of time has to leave the plane on target rather than a
+        // time constant's 63% of the way: half of it is already nine tenths of the defocus, and the whole
+        // of it is within a percent — which is what a number a player reads in seconds has to mean.
+        float dial = 0.2f;
+        float half = RtDepthOfField.rackFocus(8.0f, 2.0f, dial * 0.5f, dial);
+        assertTrue(half < 2.2f, "half the dial left " + half + " blocks to go");
+        assertEquals(2.0f, RtDepthOfField.rackFocus(8.0f, 2.0f, dial, dial), 0.02f);
         float quick = RtDepthOfField.rackFocus(8.0f, 2.0f, 1.0f / 60.0f, 0.05f);
         float slow = RtDepthOfField.rackFocus(8.0f, 2.0f, 1.0f / 60.0f, 0.8f);
         assertTrue(slow > quick && quick > 2.0f,
                 "a slower dial moved the plane further: " + quick + " vs " + slow);
+    }
+
+    @Test
+    void theRackOnlyEverSlowsDown() {
+        // What a pull cannot do is hang at the far end, rush through the middle and crawl into the near
+        // end: the defocus it covers per frame has to fall from the first frame on, whatever the range.
+        float current = 64.0f;
+        float previous = Float.MAX_VALUE;
+        for (int frame = 0; frame < 90; frame++) {
+            float next = RtDepthOfField.rackFocus(current, 3.0f, 1.0f / 60.0f, RACK_SECONDS);
+            float step = Math.abs(1.0f / next - 1.0f / current);
+            assertTrue(step <= previous + 1.0e-6f, "the rack sped up on frame " + frame);
+            previous = step;
+            current = next;
+        }
+    }
+
+    @Test
+    void theRackTakesTheSameTimeInBothDirections() {
+        // Dioptres are symmetric where blocks are not: a dial that answered in a hundredth of a second
+        // racking out and a second racking in would be the same pull read two ways.
+        assertEquals(framesToCover(64.0f, 3.0f), framesToCover(3.0f, 64.0f),
+                "the rack is not symmetric between the two directions");
+    }
+
+    /** The frame on which the plane has covered 95% of the move in dioptres, or -1 if it never does. */
+    private static int framesToCover(float from, float to) {
+        float start = 1.0f / from;
+        float goal = Math.abs(1.0f / to - start);
+        float current = from;
+        for (int frame = 1; frame <= 600; frame++) {
+            current = RtDepthOfField.rackFocus(current, to, 1.0f / 60.0f, RACK_SECONDS);
+            if (Math.abs(1.0f / current - start) >= 0.95f * goal) {
+                return frame;
+            }
+        }
+        return -1;
     }
 }

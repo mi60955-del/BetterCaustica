@@ -14,6 +14,7 @@ import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkDeviceCreateInfo;
 import org.lwjgl.vulkan.VkDeviceQueueCreateInfo;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructureFeaturesKHR;
+import org.lwjgl.vulkan.VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
@@ -52,6 +53,8 @@ import static org.lwjgl.vulkan.KHRPresentId.VK_KHR_PRESENT_ID_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRPresentId.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
 import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+import static org.lwjgl.vulkan.KHRPipelineExecutableProperties.VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+import static org.lwjgl.vulkan.KHRPipelineExecutableProperties.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
 
 /**
  * RT device bring-up. Enables the hardware ray-tracing device extensions and their
@@ -121,6 +124,7 @@ public final class RtDeviceBringup {
     private static volatile float maxLineWidth = 1.0f; // device's lineWidthRange[1]; 1.0 unless wideLinesEnabled
     private static volatile int overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT; // capped to the device's framebufferColorSampleCounts
     private static volatile int maxOpacity4StateSubdivisionLevel;
+    private static volatile boolean pipelineExecutableInfo; // VK_KHR_pipeline_executable_properties actually enabled
     private static volatile int computeQueueFamilyIndex = -1;
     private static volatile int computeQueueIndex = -1;
     private static boolean loggedUnavailable;
@@ -146,6 +150,9 @@ public final class RtDeviceBringup {
     private static final VulkanPNextStruct PRESENT_ID_FEATURES_STRUCT = new VulkanPNextStruct(
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
             VkPhysicalDevicePresentIdFeaturesKHR.SIZEOF);
+    private static final VulkanPNextStruct PIPELINE_EXEC_INFO_FEATURES_STRUCT = new VulkanPNextStruct(
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR,
+            VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR.SIZEOF);
 
     private static final VulkanFeature BUFFER_DEVICE_ADDRESS_FEATURE = new VulkanFeature(
             VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
@@ -182,6 +189,9 @@ public final class RtDeviceBringup {
             OMM_FEATURES_STRUCT, "micromap", VkPhysicalDeviceOpacityMicromapFeaturesEXT.MICROMAP);
     private static final VulkanFeature PRESENT_ID_FEATURE = new VulkanFeature(
             PRESENT_ID_FEATURES_STRUCT, "presentId", VkPhysicalDevicePresentIdFeaturesKHR.PRESENTID);
+    private static final VulkanFeature PIPELINE_EXEC_INFO_FEATURE = new VulkanFeature(
+            PIPELINE_EXEC_INFO_FEATURES_STRUCT, "pipelineExecutableInfo",
+            VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR.PIPELINEEXECUTABLEINFO);
     private static final VulkanFeature WIDE_LINES_FEATURE = new VulkanFeature(
             VulkanBackend.VK10_FEATURES_STRUCT, "wideLines", VkPhysicalDeviceFeatures.WIDELINES);
 
@@ -199,33 +209,83 @@ public final class RtDeviceBringup {
 
     private enum SerBackend {
         NONE("none", null, "primary.rgen.spv", "indirect.rgen.spv",
-                "primary_lean.rgen.spv", "indirect_lean.rgen.spv"),
+                "primary_lean.rgen.spv", "indirect_lean.rgen.spv",
+                "indirect_lean_noprobe.rgen.spv", "indirect_lean_fast.rgen.spv",
+                "primary_no_cloud.rgen.spv", "indirect_no_cloud.rgen.spv",
+                "primary_shadow_only.rgen.spv", "indirect_shadow_only.rgen.spv",
+                "primary_no_march.rgen.spv", "indirect_no_march.rgen.spv",
+                "primary_no_cloud_no_march.rgen.spv", "indirect_no_cloud_no_march.rgen.spv",
+                "primary_shadow_only_no_march.rgen.spv", "indirect_shadow_only_no_march.rgen.spv"),
         EXT("EXT", VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
                 "primary.rgen.spv", "indirect_ser.rgen.spv",
-                "primary_lean.rgen.spv", "indirect_lean_ser.rgen.spv");
+                "primary_lean.rgen.spv", "indirect_lean_ser.rgen.spv",
+                "indirect_lean_noprobe_ser.rgen.spv", "indirect_lean_fast_ser.rgen.spv",
+                "primary_no_cloud.rgen.spv", "indirect_no_cloud_ser.rgen.spv",
+                "primary_shadow_only.rgen.spv", "indirect_shadow_only_ser.rgen.spv",
+                "primary_no_march.rgen.spv", "indirect_no_march_ser.rgen.spv",
+                "primary_no_cloud_no_march.rgen.spv", "indirect_no_cloud_no_march_ser.rgen.spv",
+                "primary_shadow_only_no_march.rgen.spv", "indirect_shadow_only_no_march_ser.rgen.spv");
 
         final String label;
         final String extensionName;
         final String worldPrimaryRaygenShader;
         final String worldRaygenShader;
-        /** The same two passes with the volumetric scatter compiled out. */
+        /** Every volume path compiled out. */
         final String worldPrimaryLeanRaygenShader;
         final String worldLeanRaygenShader;
+        /** The lean twin with the radiance-probe grid compiled out; the pass A module is shared. */
+        final String worldLeanNoProbeRaygenShader;
+        /** The lean twin with both the probe grid and the ReSTIR reservoir code compiled out. */
+        final String worldLeanFastRaygenShader;
+        /** Fog/shaft/edge paths retained, every cloud path compiled out. */
+        final String worldPrimaryNoCloudRaygenShader;
+        final String worldNoCloudRaygenShader;
+        /** Visible cloud layer compiled out, cloud shadow field retained. */
+        final String worldPrimaryShadowOnlyRaygenShader;
+        final String worldShadowOnlyRaygenShader;
+        /** Same tiers with the heterogeneous fog integrator compiled out. */
+        final String worldPrimaryNoMarchRaygenShader;
+        final String worldNoMarchRaygenShader;
+        final String worldPrimaryNoCloudNoMarchRaygenShader;
+        final String worldNoCloudNoMarchRaygenShader;
+        final String worldPrimaryShadowOnlyNoMarchRaygenShader;
+        final String worldShadowOnlyNoMarchRaygenShader;
 
         SerBackend(String label, String extensionName, String worldPrimaryRaygenShader,
                    String worldRaygenShader, String worldPrimaryLeanRaygenShader,
-                   String worldLeanRaygenShader) {
+                   String worldLeanRaygenShader, String worldLeanNoProbeRaygenShader,
+                   String worldLeanFastRaygenShader,
+                   String worldPrimaryNoCloudRaygenShader,
+                   String worldNoCloudRaygenShader, String worldPrimaryShadowOnlyRaygenShader,
+                   String worldShadowOnlyRaygenShader, String worldPrimaryNoMarchRaygenShader,
+                   String worldNoMarchRaygenShader, String worldPrimaryNoCloudNoMarchRaygenShader,
+                   String worldNoCloudNoMarchRaygenShader,
+                   String worldPrimaryShadowOnlyNoMarchRaygenShader,
+                   String worldShadowOnlyNoMarchRaygenShader) {
             this.label = label;
             this.extensionName = extensionName;
             this.worldPrimaryRaygenShader = worldPrimaryRaygenShader;
             this.worldRaygenShader = worldRaygenShader;
             this.worldPrimaryLeanRaygenShader = worldPrimaryLeanRaygenShader;
             this.worldLeanRaygenShader = worldLeanRaygenShader;
+            this.worldLeanNoProbeRaygenShader = worldLeanNoProbeRaygenShader;
+            this.worldLeanFastRaygenShader = worldLeanFastRaygenShader;
+            this.worldPrimaryNoCloudRaygenShader = worldPrimaryNoCloudRaygenShader;
+            this.worldNoCloudRaygenShader = worldNoCloudRaygenShader;
+            this.worldPrimaryShadowOnlyRaygenShader = worldPrimaryShadowOnlyRaygenShader;
+            this.worldShadowOnlyRaygenShader = worldShadowOnlyRaygenShader;
+            this.worldPrimaryNoMarchRaygenShader = worldPrimaryNoMarchRaygenShader;
+            this.worldNoMarchRaygenShader = worldNoMarchRaygenShader;
+            this.worldPrimaryNoCloudNoMarchRaygenShader = worldPrimaryNoCloudNoMarchRaygenShader;
+            this.worldNoCloudNoMarchRaygenShader = worldNoCloudNoMarchRaygenShader;
+            this.worldPrimaryShadowOnlyNoMarchRaygenShader = worldPrimaryShadowOnlyNoMarchRaygenShader;
+            this.worldShadowOnlyNoMarchRaygenShader = worldShadowOnlyNoMarchRaygenShader;
         }
     }
 
     private record FeatureSupport(List<String> missingRequired, SerBackend serBackend,
-                                  boolean omm, boolean presentId, boolean wideLines) {
+                                  boolean omm, boolean presentId, boolean wideLines,
+                                  boolean pipelineExecutableInfo) {
         boolean supportsRt() {
             return missingRequired.isEmpty();
         }
@@ -243,23 +303,104 @@ public final class RtDeviceBringup {
         return serBackend.worldRaygenShader;
     }
 
+    /** Upsample pass that rebuilds a full-resolution indirect image from the half-resolution trace. */
+    public static String worldUpsampleRaygenShader() {
+        return "indirect_upsample.rgen.spv";
+    }
+
     public static String worldPrimaryRaygenShader() {
         return serBackend.worldPrimaryRaygenShader;
     }
 
-    /** Pass A raygen with the volumetric paths compiled out, for frames with every volume switch off. */
+    /** Pass A raygen with every volume path compiled out. */
     public static String worldPrimaryLeanRaygenShader() {
         return serBackend.worldPrimaryLeanRaygenShader;
     }
 
-    /** Pass B raygen with the volumetric paths compiled out, matching the pass A twin. */
+    /** Pass B raygen with every volume path compiled out, matching the pass A twin. */
     public static String worldLeanRaygenShader() {
         return serBackend.worldLeanRaygenShader;
+    }
+
+    /**
+     * Pass B lean raygen with the radiance-probe grid compiled out, dispatched while Radiance Cache is
+     * off: the probe reads are inert then, but their gather code still occupies raygen registers.
+     */
+    public static String worldLeanNoProbeRaygenShader() {
+        return serBackend.worldLeanNoProbeRaygenShader;
+    }
+
+    /**
+     * Pass B lean raygen with the probe grid and the ReSTIR reservoir code compiled out, dispatched
+     * while Radiance Cache and Ris Candidates are both off: both paths are inert then, but their
+     * inlined bodies still occupy the raygen's live state around every shadow ray.
+     */
+    public static String worldLeanFastRaygenShader() {
+        return serBackend.worldLeanFastRaygenShader;
+    }
+
+    /** Pass A raygen with the cloud visible layer and shadow field compiled out. */
+    public static String worldPrimaryNoCloudRaygenShader() {
+        return serBackend.worldPrimaryNoCloudRaygenShader;
+    }
+
+    /** Pass B raygen with the cloud visible layer and shadow field compiled out. */
+    public static String worldNoCloudRaygenShader() {
+        return serBackend.worldNoCloudRaygenShader;
+    }
+
+    /** Pass A raygen with only the visible cloud layer compiled out. */
+    public static String worldPrimaryShadowOnlyRaygenShader() {
+        return serBackend.worldPrimaryShadowOnlyRaygenShader;
+    }
+
+    /** Pass B raygen with only the visible cloud layer compiled out. */
+    public static String worldShadowOnlyRaygenShader() {
+        return serBackend.worldShadowOnlyRaygenShader;
+    }
+
+    /** Pass A raygen with fog/shafts/edge fade but the heterogeneous fog integrator compiled out. */
+    public static String worldPrimaryNoMarchRaygenShader() {
+        return serBackend.worldPrimaryNoMarchRaygenShader;
+    }
+
+    /** Pass B raygen with fog/shafts/edge fade but the heterogeneous fog integrator compiled out. */
+    public static String worldNoMarchRaygenShader() {
+        return serBackend.worldNoMarchRaygenShader;
+    }
+
+    /** Pass A no-cloud twin with the heterogeneous fog integrator compiled out. */
+    public static String worldPrimaryNoCloudNoMarchRaygenShader() {
+        return serBackend.worldPrimaryNoCloudNoMarchRaygenShader;
+    }
+
+    /** Pass B no-cloud twin with the heterogeneous fog integrator compiled out. */
+    public static String worldNoCloudNoMarchRaygenShader() {
+        return serBackend.worldNoCloudNoMarchRaygenShader;
+    }
+
+    /** Pass A shadow-only twin with the heterogeneous fog integrator compiled out. */
+    public static String worldPrimaryShadowOnlyNoMarchRaygenShader() {
+        return serBackend.worldPrimaryShadowOnlyNoMarchRaygenShader;
+    }
+
+    /** Pass B shadow-only twin with the heterogeneous fog integrator compiled out. */
+    public static String worldShadowOnlyNoMarchRaygenShader() {
+        return serBackend.worldShadowOnlyNoMarchRaygenShader;
     }
 
     /** True if {@code VK_EXT_opacity_micromap} was enabled on the device (gate on + device support). */
     public static boolean ommEnabled() {
         return ommEnabled;
+    }
+
+    /**
+     * True if {@code VK_KHR_pipeline_executable_properties} was enabled on the device. Only ever set
+     * while {@code -Dcaustica.rt.pipelineStats=true}, which is what makes the world pipelines ask the
+     * driver to keep their executable statistics and internal representation alive.
+     */
+    public static boolean pipelineExecutableInfoEnabled() {
+        return pipelineExecutableInfo;
     }
 
     /** True if {@code VK_NV_low_latency2} (Reflex) was enabled on the device (gate on + device support). */
@@ -428,6 +569,9 @@ public final class RtDeviceBringup {
         if (support.omm) {
             supported.add(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
         }
+        if (support.pipelineExecutableInfo()) {
+            supported.add(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+        }
         if (reflexRequested() && physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
             supported.add(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
             if (support.presentId) {
@@ -437,12 +581,13 @@ public final class RtDeviceBringup {
         return supported;
     }
 
-    private static boolean ommRequested() {
-        return CausticaConfig.Rt.Omm.ENABLED.value();
-    }
-
     private static boolean reflexRequested() {
         return CausticaConfig.Rt.Reflex.ENABLED.value();
+    }
+
+    /** Diagnostic switch: ask the driver for each pipeline's register/statistics dump at creation. */
+    private static boolean pipelineStatsRequested() {
+        return Boolean.getBoolean("caustica.rt.pipelineStats");
     }
 
     /** Query every feature boolean Caustica might enable in one complete Features2 chain. */
@@ -459,8 +604,11 @@ public final class RtDeviceBringup {
                 SER_EXT_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
             }
 
-            boolean queryOmm = ommRequested()
-                    && physicalDevice.hasDeviceExtension(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+            // Opacity micromaps are not requested: the cutout triangulation still produces artefacts with
+            // them, so the renderer never takes the micromap path. Every consumer keys off the device
+            // actually having the feature enabled (ommEnabled), so not requesting it here is the whole
+            // gate — the fallback below is the any-hit shader's own cutout test.
+            boolean queryOmm = false;
             if (queryOmm) {
                 OMM_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
             }
@@ -471,6 +619,15 @@ public final class RtDeviceBringup {
                 PRESENT_ID_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
             }
             WIDE_LINES_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
+            // Pipeline executable statistics (shader register counts, spills, SASS) are a diagnostic:
+            // the feature is only queried, and the pipelines only ask to capture, while the property
+            // is on, so an ordinary run never pays for the driver keeping its internal form alive.
+            boolean queryPipelineExec =
+                    pipelineStatsRequested() && physicalDevice.hasDeviceExtension(
+                            VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+            if (queryPipelineExec) {
+                PIPELINE_EXEC_INFO_FEATURES_STRUCT.findOrCreateStructInPNextChain(available, stack);
+            }
 
             VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), available);
 
@@ -485,7 +642,8 @@ public final class RtDeviceBringup {
             return new FeatureSupport(missing, supportedSer,
                     queryOmm && OMM_FEATURE.get(available),
                     queryPresentId && PRESENT_ID_FEATURE.get(available),
-                    WIDE_LINES_FEATURE.get(available));
+                    WIDE_LINES_FEATURE.get(available),
+                    queryPipelineExec && PIPELINE_EXEC_INFO_FEATURE.get(available));
         }
     }
 
@@ -588,6 +746,14 @@ public final class RtDeviceBringup {
             overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_2_BIT;
         } else {
             overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT;
+        }
+
+        // Optional diagnostics: pipeline executable statistics. Same rule as every optional feature —
+        // its absence never disables RT, and the flag below is what the world pipeline reads to decide
+        // whether it may ask for the capture bits.
+        pipelineExecutableInfo = support.pipelineExecutableInfo();
+        if (pipelineExecutableInfo) {
+            features.add(PIPELINE_EXEC_INFO_FEATURE);
         }
 
         // Optional: opacity micromaps (any-hit opt). Only when the gate is on AND the device advertises the

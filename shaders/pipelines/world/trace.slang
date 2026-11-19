@@ -19,8 +19,15 @@ public static const uint TERRAIN_BUCKETS = 4u;
 public static const uint SBT_RADIANCE = 0u;
 public static const uint SBT_SHADOW = TERRAIN_BUCKETS;
 public static const uint SBT_STRIDE_BUCKET = 1u;
-public static const uint MISS_RADIANCE = 0u;
 public static const uint MISS_GUIDE = 1u;
+public static const uint MISS_NO_CLOUD_RADIANCE = 2u;
+// Raygens that compile the visible cloud layer out use the no-cloud sky miss record. Keeping the
+// choice in a compile-time constant removes both the cloud miss shader's code and its register cost.
+#ifdef CAUSTICA_NO_VISIBLE_CLOUD_PATH
+public static const uint MISS_RADIANCE = MISS_NO_CLOUD_RADIANCE;
+#else
+public static const uint MISS_RADIANCE = 0u;
+#endif
 
 public RayDesc makeRay(float3 origin, float tmin, float3 dir, float tmax) {
     RayDesc r;
@@ -109,6 +116,7 @@ public Payload makeShadowPayload() {
 }
 
 public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
+    VisibilityResult result;
     // Vulkan requires an identical payload structure for every stage reachable by this trace. The shadow
     // path uses only the albedo view as accumulated transmittance and hitT as the nearest-water crossing.
     Payload shadowPayload = makeShadowPayload();
@@ -120,7 +128,6 @@ public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
             CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
-    VisibilityResult result;
     result.transmittance = shadowPayload.flags == 0u
             ? unpackAlbedo(shadowPayload) : float3(0.0, 0.0, 0.0);
     result.waterHitT = shadowPayload.hitT;

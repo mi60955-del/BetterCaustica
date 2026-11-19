@@ -145,12 +145,17 @@ final class RtSectionTable {
         if (geom.instanceIndex >= 0) {
             int removeIndex = geom.instanceIndex;
             int lastIndex = instanceList.size() - 1;
-            if (removeIndex != lastIndex) {
-                RtAccel.Instance moved = instanceList.get(lastIndex);
-                instanceList.set(removeIndex, moved);
-                slots.get(moved.customIndex()).instanceIndex = removeIndex;
+            // A table reset (transient-empty rebuild, or a world teardown that empties the instance list
+            // before its owners are cleared) leaves indices that no longer name an entry. The geometry is
+            // not in the list any more, so dropping the index is all that remains to do.
+            if (removeIndex <= lastIndex) {
+                if (removeIndex != lastIndex) {
+                    RtAccel.Instance moved = instanceList.get(lastIndex);
+                    instanceList.set(removeIndex, moved);
+                    slots.get(moved.customIndex()).instanceIndex = removeIndex;
+                }
+                instanceList.remove(lastIndex);
             }
-            instanceList.remove(lastIndex);
             geom.instanceIndex = -1;
         }
         if (geom.slot >= 0) {

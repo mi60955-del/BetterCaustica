@@ -13,11 +13,11 @@ Two questions, both answered without launching the game:
                                silenced, is shadow structure, not air.
 
   What does it cost?           One shaft call casts SHAFT_STRATA = 8 shadow rays and evaluates the
-                               cloud-shadow field 8 times, at the same call sites and under the same
-                               gating as the analytic fog's FOG_SUN_BANDS = 4. The tool counts the
-                               rays it actually casts, re-counts them at the reach and density
-                               extremes to show the count is per-pixel constant, and audits the
-                               source: every shaft call sits behind CAUSTICA_VOLUME_PATH, and the
+                               cloud-shadow field once for the whole stretch, at the same call sites
+                               and under the same gating as the analytic fog's FOG_SUN_BANDS = 4. The
+                               tool counts the rays it actually casts, re-counts them at the reach and
+                               density extremes to show the count is per-pixel constant, and audits
+                               the source: every shaft call sits behind CAUSTICA_VOLUME_PATH, and the
                                volume-free raygen is only selected while shafts are off.
 
 Constants prefixed `SHADER_` are parsed and pinned against the shader source by test_shaft_preview.py,
@@ -64,7 +64,7 @@ SHADER_SHAFT_PHASE_ENERGY = 0.7             # :1263
 SHADER_WATER_SHAFT_STRUCTURE_FLOOR = 0.45   # :1271
 SHADER_FOG_SUN_BANDS = 4                    # :1076; the analytic fog tier's probes per segment
 SHADER_FOG_MARCH_PROBE_STRATA = 8           # :895; the marched fog tier's probe budget per segment
-SHADER_CLOUD_EXTINCTION = 0.22              # :257, 1/block at unit density
+STAND_IN_CLOUD_TAU = 0.55                   # the stand-in deck's optical depth at full coverage
 SHADER_PHASE_ENERGY = 0.7                   # the `* 0.7` in both integrators' phase
 SHADER_JITTER_STEP = 0.6180339887           # the golden-ratio frame walk
 SHADER_RAY_TMIN = 1.0e-3                    # trace.slang; a shorter segment integrates nothing
@@ -278,7 +278,7 @@ def cloud_shadow(points, sun_dir, frame_index=0):
     cov = saturate(cov) ** 1.5
     # Thin-slab optical scale: the stand-in is meant to read as a light modulation (a few tens of
     # percent), not as an opaque deck, and only the evaluation count is being measured here.
-    tau = cov * F32(SHADER_CLOUD_EXTINCTION) * F32(2.5) / max(float(sun_dir[1]), 0.05)
+    tau = cov * F32(STAND_IN_CLOUD_TAU) / max(float(sun_dir[1]), 0.05)
     return np.where(t_plane > 0.0, np.exp(-tau), 1.0).astype(F32)
 
 
@@ -321,21 +321,56 @@ def fog_transmittance(sigma0, base_y, height_h, y0, dir_y, t):
     return np.exp(-fog_optical_depth(sigma0, base_y, height_h, y0, dir_y, t))
 
 
-def fog_depth_at_weight(sigma0, base_y, height_h, y0, dir_y, t, weight):
-    """volume.slang:1097: 18-step bisection on the closed-form optical depth."""
+def fog_exp_depth_at_tau(sigma0, base_y, height_h, y0, dir_y, tau):
+    """volume.slang's fogExpDepthAtTau, vectorized: the exponential stretches solved for length."""
+    sigma0, base_y, height_h, y0, dir_y, tau = np.broadcast_arrays(
+        *[np.asarray(v, dtype=F32) for v in (sigma0, base_y, height_h, y0, dir_y, tau)])
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        h = np.maximum(height_h, F32(1.0e-4))
+        above = y0 - base_y
+        slope = np.where(np.abs(dir_y) < 1.0e-6, F32(1.0), dir_y)
+        rho = sigma0 * np.exp(-np.maximum(above, 0.0) / h)
+        level = tau / np.maximum(rho, F32(1.0e-30))
+        # Rising: the flat stretch below the base is consumed first, then the exponential.
+        s_base_up = -above / slope
+        column_up = rho * h / slope
+        rise_exp = -h / slope * np.log(np.maximum(1.0 - tau / np.maximum(column_up, F32(1.0e-30)),
+                                                  F32(1.0e-20)))
+        column_flat = sigma0 * h / slope
+        rise_late = s_base_up - h / slope * np.log(np.maximum(
+            1.0 - (tau - sigma0 * s_base_up) / np.maximum(column_flat, F32(1.0e-30)), F32(1.0e-20)))
+        rising = np.where(above >= 0.0, rise_exp,
+                          np.where(tau <= sigma0 * s_base_up, level, rise_late))
+        # Falling: the exponential stretch down to baseY, then the flat column under it.
+        s_base_down = above / (-slope)
+        e_base = sigma0 * h * (1.0 - np.exp(-np.maximum(above, 0.0) / h)) / (-slope)
+        column_down = rho * h / slope
+        fall_exp = -h / slope * np.log(np.maximum(1.0 - tau / np.minimum(column_down, F32(-1.0e-30)),
+                                                  F32(1.0e-20)))
+        falling = np.where(above <= 0.0, level,
+                           np.where(tau <= e_base, fall_exp,
+                                    s_base_down + (tau - e_base) / np.maximum(sigma0, F32(1.0e-30))))
+        out = np.where(np.abs(dir_y) < 1.0e-6, level, np.where(dir_y > 0.0, rising, falling))
+        out = np.where((sigma0 <= 0.0) | (tau <= 0.0), 0.0, out)
+    return out.astype(F32)
+
+
+def fog_depth_at_weight(sigma0, base_y, height_h, y0, dir_y, t, weight, sigma_flat=0.0):
+    """volume.slang's fogDepthAtWeight: the exponential's inverse, then Newton for the flat haze."""
     weight = np.asarray(weight, dtype=F32)
     tau_target = -np.log(np.maximum(1.0 - weight, 1.0e-4))
-    full = fog_optical_depth(sigma0, base_y, height_h, y0, dir_y, t)
-    lo = np.zeros_like(full, dtype=F32)
-    hi = np.ones_like(full, dtype=F32) * np.asarray(t, dtype=F32)
-    for _ in range(18):
-        mid = 0.5 * (lo + hi)
-        reached = fog_optical_depth(sigma0, base_y, height_h, y0, dir_y, mid) < tau_target
-        lo = np.where(reached, mid, lo)
-        hi = np.where(reached, hi, mid)
+    full = fog_optical_depth(sigma0, base_y, height_h, y0, dir_y, t) + sigma_flat * t
+    depth = fog_exp_depth_at_tau(sigma0, base_y, height_h, y0, dir_y, tau_target)
+    if np.any(np.asarray(sigma_flat) > 0.0):
+        depth = np.minimum(depth, tau_target / np.maximum(sigma_flat, F32(1.0e-30)))
+    depth = np.clip(depth, 0.0, t)
+    for _ in range(3):
+        tau = fog_optical_depth(sigma0, base_y, height_h, y0, dir_y, depth) + sigma_flat * depth
+        slope = (sigma0 * np.exp(-np.maximum(y0 + dir_y * depth - base_y, 0.0) / height_h)
+                 + sigma_flat)
+        depth = np.clip(depth - (tau - tau_target) / np.maximum(slope, F32(1.0e-20)), 0.0, t)
     return np.where(weight <= 0.0, 0.0,
-                    np.where(full <= tau_target, np.asarray(t, dtype=F32),
-                             0.5 * (lo + hi))).astype(F32)
+                    np.where(full <= tau_target, np.asarray(t, dtype=F32), depth)).astype(F32)
 
 
 def interleave_gradient_noise(pix):
@@ -389,7 +424,7 @@ def fog_segment_inscatter(scene, ro, rd, t, pix, med, sun_dir, log, allow_shadow
     shadow_cull = bool(allow_shadow_cull and med.fog_shadow and float(sun_dir[1]) > 0.0)
     noise = stratum_noise(pix, frame_index)
     vis = np.ones((1,) + shape, dtype=F32)
-    cloud_bands = np.ones((1,) + shape, dtype=F32)
+    cloud = np.ones(shape, dtype=F32)
     stratum_depth = np.zeros((1,) + shape, dtype=F32)
     if shadow_cull:
         scatter_full = 1.0 - fog_transmittance(sigma0, med.fog_base_y, med.fog_height,
@@ -402,11 +437,15 @@ def fog_segment_inscatter(scene, ro, rd, t, pix, med, sun_dir, log, allow_shadow
                 start + scatter_full * F32(0.5) / F32(SHADER_FOG_SUN_BANDS)))
         stratum_depth = np.stack(depths, axis=0)
         probe = ro[None, None, None, :] + rd[None] * stratum_depth[..., None]
-        # All four strata ride one array here; in the shader each is its own shadow ray and its own
-        # cloud-field evaluation, so bill four per call site pixel.
-        vis, _, cloud_bands = sun_visibility(scene, probe, sun_dir, log, clouds=True,
-                                             count=None if count is None
-                                             else int(count) * SHADER_FOG_SUN_BANDS)
+        # One shadow ray per band, but ONE cloud-field evaluation for the whole segment, at the
+        # half-weight depth: the deck above the segment does not vary faster than the field itself.
+        vis, _, _ = sun_visibility(scene, probe, sun_dir, log, clouds=False,
+                                   count=None if count is None
+                                   else int(count) * SHADER_FOG_SUN_BANDS)
+        mid = fog_depth_at_weight(sigma0, med.fog_base_y, med.fog_height, F32(ro[1]), rd[..., 1],
+                                  t, F32(0.5))
+        log.cloud(int(count) if count is not None else int(t.size))
+        cloud = cloud_shadow(np.broadcast_to(ro + rd * mid[..., None], shape + (3,)), sun_dir)
         detail["probes"] = SHADER_FOG_SUN_BANDS
 
     fog_t = fog_transmittance(sigma0, med.fog_base_y, med.fog_height, F32(ro[1]), rd[..., 1], t)
@@ -428,7 +467,7 @@ def fog_segment_inscatter(scene, ro, rd, t, pix, med, sun_dir, log, allow_shadow
             probe = ro[None, None, :] + rd * stratum_depth[k][..., None]
             to_sun = fog_transmittance(sigma0, med.fog_base_y, med.fog_height, probe[..., 1],
                                        F32(sun_dir[1]), F32(SHADOW_RAY_LENGTH))
-            sun_part = sun_part + (leg[k] * to_sun * cloud_bands[k])[..., None] * SUN_ILLUMINANCE
+            sun_part = sun_part + (leg[k] * to_sun * cloud)[..., None] * SUN_ILLUMINANCE
     radiance = albedo * (sun_part + scatter_weight[..., None] * ambient)
     return radiance.astype(F32), fog_t, detail
 
@@ -483,28 +522,34 @@ def shaft_inscatter(scene, ro, rd, t, pix, med, sun_dir, log, underwater=False, 
     noise = stratum_noise(pix, frame_index)
     weight = total / F32(SHAFT_STRATA)
     active_count = int(np.count_nonzero(active))
+    # One cloud-field evaluation for the stretch, at its middle stratum: the shader samples the deck
+    # above the beam once and multiplies the whole term by it.
+    mid = shaft_depth_at_weight(sigma, reach, SHAFT_STRATA // 2)
+    log.cloud(active_count)
+    cloud = cloud_shadow(np.broadcast_to(ro + rd * np.asarray(mid)[..., None], shape + (3,)),
+                         sun_dir, frame_index)
     sun = np.zeros(shape + (3,), dtype=F32)
     lit = np.zeros(shape, dtype=F32)
     for k in range(SHAFT_STRATA):
         a = shaft_depth_at_weight(sigma, reach, k)
         b = shaft_depth_at_weight(sigma, reach, k + 1)
         p = ro[None, None, :] + rd * (a + (b - a) * noise)[..., None]
-        vis, water_hit_t, cloud = sun_visibility(scene, p, sun_dir, log, clouds=True,
-                                                 count=active_count,
-                                                 force_visible=control_visible)
+        vis, water_hit_t, _ = sun_visibility(scene, p, sun_dir, log, clouds=False,
+                                             count=active_count,
+                                             force_visible=control_visible)
         if underwater:
             # The probe crossed the water surface on its way to the sun: the shadow ray reports how
             # much water stands between the sample and the surface, and the caustic rides on it.
             vis = vis * np.exp(-sigma * water_hit_t)
         lit = lit + vis / F32(SHAFT_STRATA)
-        sun = sun + (vis * (weight * cloud))[..., None] * SUN_ILLUMINANCE
+        sun = sun + (vis * weight)[..., None]
     structure = saturate(1.0 - lit)
     if underwater:
         # Water keeps a floor on the gate: what reads underwater is the occluder's shadow in the
         # body, not a band a few pixels wide where the path straddles a shadow boundary.
         structure = lerp(F32(SHADER_WATER_SHAFT_STRUCTURE_FLOOR), F32(1.0), structure)
     share = shaft_weight * structure
-    radiance = sun * (phase * (strength * fog_t * structure))[..., None]
+    radiance = sun * (phase * cloud * (strength * fog_t * structure))[..., None] * SUN_ILLUMINANCE
     detail = {"probes": 0 if control_visible else SHAFT_STRATA,
               "structure": structure, "lit": lit, "phase": phase}
     return radiance.astype(F32), share.astype(F32), detail
@@ -562,9 +607,10 @@ def render(scene, width, height, med, sun_dir, camera, fog_on, shafts_on, frames
     fog_color = np.zeros_like(base)
     fog_t = np.ones(t.shape, dtype=F32)
     if fog_on:
-        # Geometry in front: 4 shadow probes. Sky-facing stretch: the closed form without probes. The
-        # sky pixels take the second call, so the first one is handed a finite dummy segment length —
-        # an infinite t would make the stratum bisection 0/0 and only the discarded pixels would see it.
+        # Geometry in front: 4 shadow probes and one cloud-field sample for the segment. Sky-facing
+        # stretch: the closed form without probes. The sky pixels take the second call, so the first one
+        # is handed a finite dummy segment length — an infinite t would push the stratum depths past
+        # every root, and only the discarded pixels would see it.
         t_probe = np.where(hit, t, F32(1.0))
         c_hit, t_hit, _ = fog_segment_inscatter(scene, pos, dirs, t_probe, pix, med, sun_dir, fog_log,
                                                 allow_shadow_cull=True, count=hit_count)
@@ -645,12 +691,15 @@ def contact_sheet(panels, path, columns=3, label_height=18):
 
 # --- cost model ---------------------------------------------------------------------------------------
 def probe_budget():
-    """What one call spends, per pixel, straight from the shader constants."""
+    """What one call spends, per pixel, straight from the shader constants.
+
+    The rays are one per stratum; the cloud field is one evaluation for the whole segment, sampled at
+    the stratum whose weight is the medium's midpoint.
+    """
     return [
-        ("analytic fog", SHADER_FOG_SUN_BANDS, SHADER_FOG_SUN_BANDS),
-        ("sun shafts", SHADER_SHAFT_STRATA, SHADER_SHAFT_STRATA),
-        ("marched fog", min(SHADER_FOG_MARCH_PROBE_STRATA, DEFAULT_FOG_MARCH_STEPS),
-         min(SHADER_FOG_MARCH_PROBE_STRATA, DEFAULT_FOG_MARCH_STEPS)),
+        ("analytic fog", SHADER_FOG_SUN_BANDS, 1),
+        ("sun shafts", SHADER_SHAFT_STRATA, 1),
+        ("marched fog", min(SHADER_FOG_MARCH_PROBE_STRATA, DEFAULT_FOG_MARCH_STEPS), 1),
     ]
 
 
@@ -668,11 +717,11 @@ CALL_PATTERN = re.compile("|".join(name + "[ 	]*[(]" for name in
 
 
 def _statement_head(lines, index):
-    """Text of the gate that owns the call on `lines[index]`, from the block head to the call.
+    """Text of the statement that owns the call on `lines[index]`, from its block head to the call.
 
     Call statements wrap across lines and may open with a local declaration, so the gate cannot be
-    read off the call line alone: walk up to the `if (...) {` that opens the enclosing block and stop
-    when the indentation leaves it.
+    read off the call line alone: this walks up to the `if (...) {` that opens the enclosing block and
+    stops when the indentation leaves it.
     """
     depth = len(lines[index]) - len(lines[index].lstrip())
     first = index
@@ -691,6 +740,24 @@ def _statement_head(lines, index):
     return " ".join(line.strip() for line in lines[first:index + 1]
                     if not line.strip().startswith("//"))
 
+
+def _enclosing_heads(lines, index):
+    """The block heads that enclose `lines[index]`, innermost first.
+
+    A call may sit one block below the switch that owns it (a `shaftOn` branch inside the water
+    branch, say), so the guard is a property of the enclosing blocks rather than of the immediate
+    statement. Brace depth is tracked from the top of the file because a sibling block's closing brace
+    says nothing about this one.
+    """
+    stack = []
+    for i in range(index):
+        code = lines[i].split("//", 1)[0]
+        for char in code:
+            if char == "{":
+                stack.append(i)
+            elif char == "}" and stack:
+                stack.pop()
+    return [lines[head].split("//", 1)[0].strip() for head in reversed(stack)]
 
 
 def gating_audit():
@@ -713,19 +780,24 @@ def gating_audit():
                 continue
             calls += 1
             gate = _statement_head(lines, index)
+            guards = _enclosing_heads(lines, index)
+            context = gate + " " + " ".join(guards)
+            # A guard clause (`if (!CAUSTICA_VOLUME_PATH) return;`) is not an enclosing block, so it
+            # is checked separately from the blocks around the call.
             behind_volume_path = ("CAUSTICA_VOLUME_PATH" in gate
+                                  or any("CAUSTICA_VOLUME_PATH" in guard for guard in guards)
                                   or _guarded_by_volume_path(lines, index))
             checks.append((f"{name}:{index + 1} {match.group(0)} stays behind CAUSTICA_VOLUME_PATH",
-                           behind_volume_path, gate[-90:]))
+                           behind_volume_path, context[-90:]))
             if not match.group(0).startswith("shaftInScatter"):
                 continue
-            if "waterShaft" in gate or "medium.current.water" in gate:
+            if "waterShaft" in context or "medium.current.water" in context:
                 water += 1
                 checks.append((f"{name}:{index + 1} water shaft is gated by the water shaft switch",
-                               "shaftOn" in gate, gate[-90:]))
+                               any("shaftOn" in guard for guard in guards), context[-90:]))
             else:
                 checks.append((f"{name}:{index + 1} air shaft is gated by the shaft switch only",
-                               "fogOn" not in gate, gate[-90:]))
+                               "fogOn" not in gate, context[-90:]))
 
         checks.append((f"{name}: shafts and fog share the same call sites", calls >= 2,
                        f"{calls} calls, {water} of them in water"))
@@ -747,9 +819,10 @@ def gating_audit():
     else:
         defines = gradle.count("-DCAUSTICA_NO_VOLUME_PATH")
         twins = re.findall(r"world/(?:primary|indirect)_lean(?:_ser)?\.rgen\.spv", gradle)
-        checks.append(("build.gradle: three volume-free raygen twins",
-                       defines == 3 and len(twins) == 3,
-                       f"defines={defines} twins={len(twins)}"))
+        shared = 'leanDefines = ["-DCAUSTICA_NO_VOLUME_PATH"]' in gradle
+        checks.append(("build.gradle: volume-free raygen twins carry the define",
+                       defines == 1 and shared and len(twins) == 3,
+                       f"defines={defines} shared={shared} twins={len(twins)}"))
     return checks
 
 

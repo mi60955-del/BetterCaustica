@@ -16,19 +16,19 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Surfaces the runtime-tunable RT settings inside the vanilla Video Settings screen when the RT renderer is
- * enabled. Two changes, both gated on {@link CausticaConfig.Rt#ENABLED}:
+ * Surfaces the runtime-tunable RT settings inside the vanilla Video Settings screen. Two changes:
  *
  * <ul>
  *   <li>The Quality section drops the vanilla options the path tracer supersedes (Ambient Occlusion and
- *       Entity Shadows are computed by RT global illumination / RT shadows).</li>
- *   <li>A "Ray Tracing" section adds the controls from {@link RtVideoOptions#addRuntimeSection}, which is
- *       the same section the Mod Menu landing screen shows.</li>
+ *       Entity Shadows are computed by RT global illumination / RT shadows). Gated on
+ *       {@link CausticaConfig.Rt#ENABLED}, because with the renderer off those controls do work.</li>
+ *   <li>A "Ray Tracing" section adds the master switch and the way into the settings hub, from
+ *       {@link RtVideoOptions#addRuntimeSection}. Always present: the section is the only route back to
+ *       the renderer from this screen.</li>
  * </ul>
  *
- * When RT is disabled the screen is left exactly as vanilla built it. When Sodium is installed it replaces
- * this screen entirely and nothing here runs; Caustica's Sodium integration publishes the same settings
- * through Sodium's own config API instead.
+ * When Sodium is installed it replaces this screen entirely and nothing here runs; Caustica's Sodium
+ * integration publishes the same settings through Sodium's own config API instead.
  */
 @Mixin(VideoSettingsScreen.class)
 public abstract class VideoSettingsScreenMixin {
@@ -60,9 +60,9 @@ public abstract class VideoSettingsScreenMixin {
 
     @Inject(method = "addOptions", at = @At("HEAD"))
     private void caustica$addRtOptions(CallbackInfo ci) {
-        if (!CausticaConfig.Rt.ENABLED.value()) {
-            return;
-        }
+        // The section stays whether or not ray tracing is on: it carries the master switch, and an entry
+        // that disappears with the feature it configures leaves a player who turned it off with no way
+        // back from this screen.
         OptionsList list = ((OptionsSubScreenAccessor) (Object) this).getList();
         if (list == null) {
             return;

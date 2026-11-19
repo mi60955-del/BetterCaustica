@@ -14,9 +14,12 @@ import world_common;
 [[vk::binding(6, 0)]] [format("rg16f")] public RWTexture2D<float2> gMotion;
 [[vk::binding(7, 0)]] [format("rgba16f")] public RWTexture2D<float4> gSpecAlbedo;
 [[vk::binding(8, 0)]] [format("rg16f")] public RWTexture2D<float2> gSpecMotion;
+[[vk::binding(9, 0)]] [format("r32f")] public RWTexture2D<float> gSpecHitDist;
 
 [[vk::binding(2, 0)]] public Sampler2D blockAlbedoAtlas;
-[[vk::binding(9, 0)]] public Sampler2D celestialsAtlas;
+// Kept at 22 so the G_* guides stay contiguous at 3..9: RtPipeline maps guide slots onto consecutive
+// binding numbers, and 10..21 already hold the LUTs, reservoirs, cloud volumes and lens history.
+[[vk::binding(22, 0)]] public Sampler2D celestialsAtlas;
 [[vk::binding(10, 0)]] public Sampler2D skyViewLut;
 [[vk::binding(11, 0)]] public Sampler2D transmittanceLut;
 // Order-2 SH of this frame's sky dome with the Lambert transfer applied, 9 texels of RGB. Written by
@@ -56,11 +59,12 @@ import world_common;
 // present pass. Render resolution, matching the guides.
 [[vk::binding(18, 0)]][format("rgba16f")] public RWTexture2D<float4> volumeDebug;
 
-// The baked cloud-density volumes, one 2D-array atlas for every shape the cloud layer can place
-// (RtCloudVolumes): RES layers per shape, layer = shape * RES + volume z. The cloud integrators in
-// volume.slang fetch slices through it and lerp between adjacent layers themselves (2D-array filtering
-// is nearest along the layer axis).
-[[vk::binding(19, 0)]] public Sampler2DArray cloudVolumes;
+// The cloud shape field: one 512-square RGBA noise atlas (RtCloudNoise), sampled in tile-relative
+// units by every deck of the procedural cloud stack. Red carries fine detail, green and blue the two
+// vertical corners of the cell field volume.slang reads through a fixed row offset (see
+// cloudCellNoise), and alpha a spare octave. Wrapping and mips are the sampler's: the tile repeats
+// across the sky, and the mip chain is what keeps a distant deck from crawling.
+[[vk::binding(19, 0)]] public Sampler2D cloudNoise;
 
 // The lens ceiling's per-pixel history: the last frame's pinhole view depth, which the next frame's
 // primary raygen reads before it builds its ray. Render resolution like the guides it sits beside, but it
@@ -69,3 +73,11 @@ import world_common;
 // one: a thread reads a texel another frame's trace wrote, so the two sides must never be the same image.
 [[vk::binding(20, 0)]][format("r32f")] public RWTexture2D<float> focusDepthPrev;
 [[vk::binding(21, 0)]][format("r32f")] public RWTexture2D<float> focusDepthCur;
+
+// Half-resolution indirect: when the frame asks for it, the indirect raygen traces only the even/even
+// pixel of every 2x2 block and stores the pre-exposed radiance here; the upsample raygen reconstructs the
+// full-resolution outImage from these texels plus indirectHalfDepth, using the full-resolution depth guide
+// to keep a foreground texel from bleeding across a silhouette. Alpha is 1 where the texel was traced.
+// Both are allocated and bound on every frame so the descriptor layout does not change with the setting.
+[[vk::binding(23, 0)]][format("rgba16f")] public RWTexture2D<float4> indirectHalf;
+[[vk::binding(24, 0)]][format("r32f")] public RWTexture2D<float> indirectHalfDepth;

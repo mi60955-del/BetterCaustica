@@ -169,6 +169,10 @@ public final class RtTerrain {
     private long dirtyGroupSeq;
     private final RtSectionTable table = new RtSectionTable();
     private boolean ready;
+    /** Vertical span of sections in the current level; LOD masking asks which columns hold geometry. */
+    private int minSectionY = -4;
+    private int maxSectionY = 19;
+    private int tracedGeneration;
     // Full-residency invalidation requested off the render thread. Wired to Fabric's
     // InvalidateRenderStateCallback = vanilla LevelExtractor.allChanged() (dimension change via setLevel,
     // render-distance change, F3+A). Consumed in tick(), where the RT context is available.
@@ -223,6 +227,36 @@ public final class RtTerrain {
     }
 
     /**
+     * Whether the traced terrain owns any published section in this block column. The distant LOD
+     * masks its cells by this instead of by the render-distance square, because the square is larger
+     * than the ground the tracer actually built: masking the whole square would cut a hole wherever
+     * the loaded chunks hold nothing to trace.
+     */
+    public static boolean hasTracedColumn(int blockX, int blockZ) {
+        if (!INSTANCE.ready) {
+            return false;
+        }
+        int scx = SectionPos.blockToSectionCoord(blockX);
+        int scz = SectionPos.blockToSectionCoord(blockZ);
+        for (int scy = INSTANCE.minSectionY; scy <= INSTANCE.maxSectionY; scy++) {
+            long key = sectionKey(scx, scy, scz);
+            if (INSTANCE.resident.containsKey(key) && INSTANCE.published.contains(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Bumped whenever a traced section becomes resident or stops being so. The distant LOD bakes the
+     * traced footprint into its near-ring meshes, so it needs to know when that footprint changed and
+     * the baked masks are stale.
+     */
+    public static int tracedGeneration() {
+        return INSTANCE.tracedGeneration;
+    }
+
+    /**
      * The static section instances to put in this frame's TLAS (BLAS address + sectionOrigin−rebase
      * transform). {@code instanceCustomIndex} is the list position, which {@link RtAccel#prepareTlas}
      * assigns and which the hit shaders use to index the section table. The list is stable between
@@ -230,6 +264,24 @@ public final class RtTerrain {
      */
     public List<RtAccel.Instance> staticInstances() {
         return table.instances;
+    }
+
+    /** The shared section table; {@link RtDhLodScene} publishes its LOD regions into it. */
+    static RtSectionTable accessSectionTable() {
+        return INSTANCE.table;
+    }
+
+    /** Current rebase origin, for instance transforms built outside {@link #applyBuildChanges}. */
+    static int instanceBlockX() {
+        return INSTANCE.blockX;
+    }
+
+    static int instanceBlockY() {
+        return INSTANCE.blockY;
+    }
+
+    static int instanceBlockZ() {
+        return INSTANCE.blockZ;
     }
 
     /** Section table device address: {@code {u64 primAddr, u64 uvAddr, u32 triBase[4]}} per section, indexed by gl_InstanceCustomIndexEXT. */
@@ -343,6 +395,7 @@ public final class RtTerrain {
     }
 
     public static void shutdown(RtContext ctx) {
+        RtDhLodScene.shutdownNow(ctx);
         INSTANCE.clear(ctx, true);
     }
 
@@ -398,6 +451,10 @@ public final class RtTerrain {
         ClientLevel level = mc.level;
         if (level == null || mc.player == null) {
             if (!noWorldClearApplied) {
+                // LOD residency shares this table, and the world-exit clear drops the table's instance and
+                // slot lists wholesale. Unpublish the LOD regions first so their removal still walks a
+                // consistent list.
+                RtDhLodScene.clearNow(ctx);
                 clear(ctx, false);
                 noWorldClearApplied = true;
             }
@@ -416,6 +473,7 @@ public final class RtTerrain {
         if (fullClearRequested) {
             fullClearRequested = false;
             clear(ctx, false);
+            RtDhLodScene.clearNow(ctx);
         }
 
         int pbx = mc.player.getBlockX();
@@ -426,6 +484,8 @@ public final class RtTerrain {
         ClientChunkCache chunkSource = level.getChunkSource();
         int minSecY = level.getMinY() >> 4;
         int maxSecY = (level.getMinY() + level.getHeight() - 1) >> 4;
+        this.minSectionY = minSecY;
+        this.maxSectionY = maxSecY;
         int loY = minSecY;
         int hiY = maxSecY;
 
@@ -664,6 +724,7 @@ public final class RtTerrain {
             SectionGeom g = resident.remove(key);
             if (g != null) {
                 removed.add(g);
+                tracedGeneration++;
             }
         }
     }
@@ -673,6 +734,7 @@ public final class RtTerrain {
             Long2ObjectMap.Entry<SectionGeom> e = it.next();
             if (!desired.contains(e.getLongKey())) {
                 removed.add(e.getValue());
+                tracedGeneration++;
                 it.remove();
             }
         }
@@ -1555,10 +1617,13 @@ public final class RtTerrain {
             }
             if (sectionLightsChanged || prev == null) updateLightSection(g);
             published.add(ps.key());
+            tracedGeneration++;
         }
         table.flushWrites();
 
-        if (resident.isEmpty()) {
+        // LOD residency shares this table; its regions must survive this transient-empty reset, so the
+        // reset only runs when BOTH pipelines are empty (the reset zeroes slot/instance indices).
+        if (resident.isEmpty() && !RtDhLodScene.hasResidentGeometry()) {
             Generation emptyGeneration = table.detachGeneration();
             if (emptyGeneration != null) {
                 retireGeneration(ctx, lastGraphicsUse, emptyGeneration);
